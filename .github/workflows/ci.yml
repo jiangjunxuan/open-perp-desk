@@ -53,8 +53,12 @@ jobs:
           node <<'NODE'
           const fs = require("fs");
           const html = fs.readFileSync("apps/web/index.html", "utf8");
+          const app = fs.readFileSync("apps/web/app.js", "utf8");
           for (const marker of ["price-chart", "status-ribbon", "ribbon-worker", "admin-token"]) {
             if (!html.includes(marker)) throw new Error(`missing web marker: ${marker}`);
+          }
+          if (!app.includes('status.risk_engine_ready ? "就绪" : "已锁定"')) {
+            throw new Error("risk state must render a user-facing lock label");
           }
           console.log("web smoke markers passed");
           NODE

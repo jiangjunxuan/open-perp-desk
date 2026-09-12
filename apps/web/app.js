@@ -543,7 +543,7 @@ function applyStatus(status) {
   setText("#execute-signal", mode === "LIVE" ? "提交实盘订单" : "执行 Demo");
   setText("#state-mode", modeLabel);
   setState("#state-market", marketLabel, status.market_data_connected ? "good" : "warning");
-  setState("#state-risk", status.risk_engine_ready ? "就绪" : "danger", status.risk_engine_ready ? "good" : "danger");
+  setState("#state-risk", status.risk_engine_ready ? "就绪" : "已锁定", status.risk_engine_ready ? "good" : "danger");
   setText(
     "#state-exposure-limit",
     `${formatNumber(status.risk_limits?.max_total_notional_pct, 2)}% 权益`,
