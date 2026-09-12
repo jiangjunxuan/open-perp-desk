@@ -8,6 +8,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
 from .okx_account import OkxAccountClient, OkxAccountError
+from .okx_account_stream import OkxAccountStream
 from .okx_market import OkxMarketClient, OkxMarketError
 from .okx_market_stream import OkxMarketStream
 from .pushplus import PushPlusClient
@@ -21,13 +22,16 @@ def _symbols() -> list[str]:
 market_client = OkxMarketClient()
 market_stream = OkxMarketStream(_symbols())
 account_client = OkxAccountClient()
+account_stream = OkxAccountStream()
 pushplus_client = PushPlusClient()
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await market_stream.start()
+    await account_stream.start()
     yield
+    await account_stream.stop()
     await market_stream.stop()
 
 
@@ -82,12 +86,19 @@ def system_status() -> dict[str, object]:
             "outbound_proxy_configured": market_stream.proxy_url is not None,
             "pushplus_configured": pushplus_client.configured,
             "account_readonly_configured": account_client.configured,
+            "account_stream_configured": account_stream.configured,
         },
         "market_stream": {
             "connected": market_stream.connected,
             "fresh": market_stream.fresh,
             "last_message_at": market_stream.last_message_at,
             "last_error": market_stream.last_error,
+        },
+        "account_stream": {
+            "connected": account_stream.connected,
+            "authenticated": account_stream.authenticated,
+            "last_message_at": account_stream.last_message_at,
+            "last_error": account_stream.last_error,
         },
         "safety": {
             "live_orders_allowed": False,
@@ -178,6 +189,11 @@ async def account_overview(
         }
     except OkxAccountError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/account/stream")
+def account_stream_snapshot() -> dict[str, object]:
+    return account_stream.snapshot()
 
 
 @app.get("/api/v1/notifications/status")
