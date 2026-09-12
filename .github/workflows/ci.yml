@@ -47,6 +47,8 @@ jobs:
         with:
           node-version: "22"
       - run: node --check apps/web/app.js
+      - run: bash -n infra/openperpdesk.sh
+      - run: ./infra/openperpdesk.sh --help
       - run: |
           node <<'NODE'
           const fs = require("fs");
