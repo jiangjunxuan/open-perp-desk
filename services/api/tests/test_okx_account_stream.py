@@ -87,6 +87,72 @@ class OkxAccountStreamTests(unittest.TestCase):
         self.assertEqual(snapshot["positions"][0]["instId"], "BTC-USDT-SWAP")
         self.assertEqual(snapshot["orders"][0]["ordId"], "123")
 
+    def test_incremental_events_preserve_other_balances_and_positions(self) -> None:
+        stream = OkxAccountStream()
+        stream.consume(
+            json.dumps(
+                {
+                    "arg": {"channel": "account"},
+                    "data": [
+                        {"ccy": "USDT", "cashBal": "1000"},
+                        {"ccy": "BTC", "cashBal": "0.1"},
+                    ],
+                }
+            )
+        )
+        stream.consume(
+            json.dumps(
+                {
+                    "arg": {"channel": "positions"},
+                    "data": [
+                        {
+                            "instId": "BTC-USDT-SWAP",
+                            "posSide": "long",
+                            "mgnMode": "isolated",
+                            "pos": "1",
+                        },
+                        {
+                            "instId": "ETH-USDT-SWAP",
+                            "posSide": "long",
+                            "mgnMode": "isolated",
+                            "pos": "2",
+                        },
+                    ],
+                }
+            )
+        )
+        stream.consume(
+            json.dumps(
+                {
+                    "arg": {
+                        "channel": "positions",
+                        "instId": "BTC-USDT-SWAP",
+                    },
+                    "data": [
+                        {
+                            "instId": "BTC-USDT-SWAP",
+                            "posSide": "long",
+                            "mgnMode": "isolated",
+                            "pos": "0",
+                        }
+                    ],
+                }
+            )
+        )
+
+        snapshot = stream.snapshot()
+        self.assertEqual(
+            {item["ccy"] for item in snapshot["balance"]},
+            {"USDT", "BTC"},
+        )
+        self.assertEqual(len(snapshot["positions"]), 2)
+        btc = next(
+            item
+            for item in snapshot["positions"]
+            if item["instId"] == "BTC-USDT-SWAP"
+        )
+        self.assertEqual(btc["pos"], "0")
+
     def test_unconfigured_stream_does_not_start(self) -> None:
         with patch.dict(
             os.environ,

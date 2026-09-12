@@ -3,152 +3,388 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>OpenPerpDesk | 永续合约交易后台</title>
+    <meta name="theme-color" content="#070a0f">
+    <meta name="description" content="OpenPerpDesk 永续合约交易控制台">
+    <title>OpenPerpDesk | 交易控制台</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
+
     <header class="topbar">
       <div class="brand">
-        <span class="brand-mark">OP</span>
+        <span class="brand-mark" aria-hidden="true">OPD</span>
         <div>
           <strong>OpenPerpDesk</strong>
-          <span class="subtle">Perpetual trading control plane</span>
+          <span class="brand-caption">永续合约交易控制台</span>
         </div>
       </div>
-      <div class="topbar-meta">
-        <span id="connection-status" class="status-dot status-neutral">API 检查中</span>
-        <span id="clock" class="mono"></span>
+      <div class="topbar-context" aria-label="运行上下文">
+        <span id="connection-status" class="status-dot status-neutral" role="status" aria-live="polite">API 检查中</span>
+        <span class="context-divider" aria-hidden="true"></span>
+        <span class="context-label">环境</span>
+        <strong id="top-environment">DEVELOPMENT</strong>
+        <span class="context-divider" aria-hidden="true"></span>
+        <span class="context-label">时间</span>
+        <span id="clock" class="mono">--</span>
+      </div>
+      <div class="topbar-actions">
+        <span id="trading-mode" class="mode-pill">模拟盘</span>
+        <span id="top-execution" class="execution-chip">执行已锁定</span>
       </div>
     </header>
 
-    <main class="layout">
+    <div class="app-shell">
       <aside class="sidebar">
-        <nav aria-label="Primary">
-          <a class="nav-item active" href="#overview">总览</a>
-          <a class="nav-item" href="#markets">行情</a>
-          <a class="nav-item" href="#positions">持仓</a>
-          <a class="nav-item" href="#orders">订单</a>
-          <a class="nav-item" href="#strategies">策略</a>
-          <a class="nav-item" href="#risk">风控</a>
-          <a class="nav-item" href="#activity">运行日志</a>
-        </nav>
+        <div class="sidebar-main">
+          <div class="sidebar-heading">
+            <span>工作区</span>
+            <span class="sidebar-heading-code mono">01</span>
+          </div>
+          <nav aria-label="主导航">
+            <a class="nav-item active" aria-current="page" data-section="overview" href="#overview"><span>总览</span><span class="nav-index mono">01</span></a>
+            <a class="nav-item" data-section="markets" href="#markets"><span>行情</span><span class="nav-index mono">02</span></a>
+            <a class="nav-item" data-section="positions" href="#positions"><span>持仓</span><span class="nav-index mono">03</span></a>
+            <a class="nav-item" data-section="orders" href="#orders"><span>订单</span><span class="nav-index mono">04</span></a>
+            <a class="nav-item" data-section="fills" href="#fills"><span>成交</span><span class="nav-index mono">05</span></a>
+            <a class="nav-item" data-section="strategies" href="#strategies"><span>策略</span><span class="nav-index mono">06</span></a>
+            <a class="nav-item" data-section="performance" href="#performance"><span>绩效</span><span class="nav-index mono">07</span></a>
+            <a class="nav-item" data-section="risk" href="#risk"><span>风控</span><span class="nav-index mono">08</span></a>
+            <a class="nav-item" data-section="activity" href="#activity"><span>运行日志</span><span class="nav-index mono">09</span></a>
+          </nav>
+          <div class="sidebar-pulse" aria-label="系统脉搏">
+            <div class="sidebar-pulse-heading">
+              <span>系统脉搏</span>
+              <i aria-hidden="true"></i>
+            </div>
+            <div class="pulse-row"><span>市场流</span><strong id="sidebar-market" class="status-text">检查中</strong></div>
+            <div class="pulse-row"><span>风险引擎</span><strong id="sidebar-risk" class="status-text">就绪</strong></div>
+            <div class="pulse-row"><span>Worker</span><strong id="sidebar-worker" class="status-text">待命</strong></div>
+          </div>
+        </div>
         <div class="sidebar-footer">
-          <span class="subtle">交易执行</span>
-          <strong id="execution-state">未连接</strong>
-          <span class="subtle">安全骨架模式</span>
+          <div class="sidebar-footer-label">执行状态</div>
+          <strong id="execution-state">已锁定</strong>
+          <span id="execution-note" class="subtle">等待 Demo 配置</span>
+          <div class="sidebar-footer-rule"></div>
+          <span class="subtle mono">OPENPERPDESK / 0.1.0</span>
         </div>
       </aside>
 
-      <section class="content" id="overview">
-        <div class="page-heading">
-          <div>
-            <span class="eyebrow">运行控制</span>
-            <h1>交易总览</h1>
-            <p class="subtle">查看行情状态、交易决策和执行健康度。</p>
+      <main class="content" id="main-content" tabindex="-1">
+        <section class="workspace" id="overview" aria-labelledby="page-title">
+          <div class="page-heading">
+            <div class="page-title">
+              <span class="kicker">OPD / CONTROL ROOM</span>
+              <h1 id="page-title">交易控制台</h1>
+              <p class="subtle">在一个工作区里查看行情、策略、风险和 Demo 执行状态。</p>
+            </div>
+            <div class="heading-context">
+              <span class="heading-context-label">当前观察</span>
+              <strong id="heading-symbol" class="mono">BTC-USDT-SWAP</strong>
+              <span class="heading-context-note">公共行情 · 只读</span>
+            </div>
+            <div class="auth-box">
+              <label for="admin-token">管理员令牌
+                <input id="admin-token" type="password" autocomplete="current-password" placeholder="仅保存在当前页面内存">
+              </label>
+              <button class="button secondary" id="save-token" type="button">解锁私有数据</button>
+            </div>
           </div>
-          <div class="mode-pill" id="trading-mode">模拟盘</div>
-        </div>
 
-        <section class="metric-grid" aria-label="Account summary">
-          <article class="metric">
-            <span class="label">账户权益</span>
-            <strong>--</strong>
-            <span class="subtle">等待账户适配器</span>
-          </article>
-          <article class="metric">
-            <span class="label">未实现盈亏</span>
-            <strong>--</strong>
-            <span class="subtle">暂无持仓数据流</span>
-          </article>
-          <article class="metric">
-            <span class="label">当前持仓</span>
-            <strong>0</strong>
-            <span class="subtle">交易执行未启用</span>
-          </article>
-          <article class="metric">
-            <span class="label">风控状态</span>
-            <strong class="text-warning">已锁定</strong>
-            <span class="subtle">交易 Worker 未连接</span>
-          </article>
-        </section>
+          <section class="control-bar" aria-label="市场与分析控制">
+            <div class="control-group">
+              <label for="symbol">合约</label>
+              <select id="symbol">
+                <option>BTC-USDT-SWAP</option>
+                <option>ETH-USDT-SWAP</option>
+              </select>
+            </div>
+            <div class="control-group">
+              <label for="bar">周期</label>
+              <select id="bar">
+                <option>1m</option>
+                <option selected>15m</option>
+                <option>1H</option>
+                <option>4H</option>
+              </select>
+            </div>
+            <div class="control-divider" aria-hidden="true"></div>
+            <div class="control-action-group">
+              <span class="control-group-label">行情与研究</span>
+              <div class="control-action-row">
+                <button class="button primary" id="refresh-market" type="button">刷新行情</button>
+                <button class="button" id="run-analysis" type="button" disabled>生成策略分析</button>
+                <button class="button secondary" id="run-backtest" type="button" disabled>历史回放</button>
+                <button class="button secondary" id="run-ai-analysis" type="button" disabled>TradingAgents 分析</button>
+              </div>
+            </div>
+            <div class="control-action-group">
+              <span class="control-group-label">自动化</span>
+              <div class="control-action-row">
+                <button class="button secondary" id="run-worker" type="button" disabled>运行一次 Worker</button>
+                <button class="button secondary" id="test-notification" type="button" disabled>测试 PushPlus</button>
+              </div>
+            </div>
+            <div class="control-spacer"></div>
+            <div class="control-action-group control-action-group-danger">
+              <span class="control-group-label">人工接管</span>
+              <div class="control-action-row">
+                <button class="button danger" id="emergency-stop" type="button" disabled>急停</button>
+                <button class="button secondary" id="resume-trading" type="button" disabled>恢复执行</button>
+              </div>
+            </div>
+            <span id="action-message" class="action-message" role="status" aria-live="polite"></span>
+          </section>
 
-        <section class="main-grid">
-          <article class="panel chart-panel" id="markets">
+          <section class="metric-grid" aria-label="账户摘要">
+            <article class="metric">
+              <span class="metric-label">账户权益</span>
+              <strong id="metric-equity">--</strong>
+              <span id="metric-equity-note" class="metric-note">输入令牌后同步</span>
+            </article>
+            <article class="metric">
+              <span class="metric-label">未实现盈亏</span>
+              <strong id="metric-pnl">--</strong>
+              <span class="metric-note">以 OKX 账户快照为准</span>
+            </article>
+            <article class="metric">
+              <span class="metric-label">活动持仓</span>
+              <strong id="metric-positions">0</strong>
+              <span class="metric-note">本地执行状态</span>
+            </article>
+            <article class="metric metric-risk">
+              <span class="metric-label">风控闸门</span>
+              <strong id="metric-risk" class="text-warning">锁定</strong>
+              <span id="metric-risk-note" class="metric-note">实盘默认禁止</span>
+            </article>
+          </section>
+
+          <section class="status-ribbon" aria-label="系统运行摘要">
+            <div class="status-ribbon-main">
+              <span class="kicker">OPERATIONS / POSTURE</span>
+              <strong id="operation-summary">模拟盘 · 执行已锁定</strong>
+            </div>
+            <div class="status-ribbon-item"><span>市场数据</span><strong id="ribbon-market">检查中</strong></div>
+            <div class="status-ribbon-item"><span>自动 Worker</span><strong id="ribbon-worker">待命</strong></div>
+            <div class="status-ribbon-item"><span>最近同步</span><strong id="ribbon-sync" class="mono">--</strong></div>
+          </section>
+
+          <section class="main-grid">
+            <article class="panel chart-panel" id="markets" aria-labelledby="markets-title">
+              <div class="panel-heading chart-heading">
+                <div>
+                  <span class="kicker">MARKET DATA</span>
+                  <div class="title-line">
+                    <h2 id="markets-title">实时行情</h2>
+                    <span class="instrument-code mono" id="chart-symbol">BTC-USDT-SWAP</span>
+                  </div>
+                </div>
+                <div class="quote-block">
+                  <strong id="market-price" class="quote-price">--</strong>
+                  <span id="market-tag" class="tag">读取中</span>
+                </div>
+              </div>
+              <div class="market-stats" aria-label="市场摘要">
+                <div><span>日内变化</span><strong id="market-summary">--</strong></div>
+                <div><span>24H 高点</span><strong id="market-high">--</strong></div>
+                <div><span>24H 低点</span><strong id="market-low">--</strong></div>
+                <div><span>资金费率</span><strong id="market-funding">--</strong></div>
+                <div><span>持仓量</span><strong id="market-oi">--</strong></div>
+                <div><span>盘口价差</span><strong id="market-spread">--</strong></div>
+              </div>
+              <div class="chart-toolbar">
+                <span class="chart-legend"><i class="legend-swatch up" aria-hidden="true"></i>上涨</span>
+                <span class="chart-legend"><i class="legend-swatch down" aria-hidden="true"></i>下跌</span>
+                <span id="market-updated" class="mono subtle">--</span>
+              </div>
+              <div class="chart-wrap">
+                <canvas id="price-chart" aria-label="合约 OHLC K 线图"></canvas>
+                <div class="chart-empty" id="chart-empty" role="status" aria-live="polite">正在读取 OKX 公共行情...</div>
+              </div>
+              <p class="sr-only" id="chart-a11y">合约价格图表，数据来自 OKX 公共行情。</p>
+            </article>
+
+            <article class="panel safety-panel" id="risk" aria-labelledby="risk-title">
+              <div class="panel-heading">
+                <div>
+                  <span class="kicker">RISK CONTROL</span>
+                  <h2 id="risk-title">安全闸门</h2>
+                </div>
+                <span class="state-indicator"><i aria-hidden="true"></i>守护中</span>
+              </div>
+              <div class="safety-summary">
+                <span class="safety-summary-label">当前执行域</span>
+                <strong id="state-mode">模拟盘</strong>
+                <span id="state-stop" class="safety-summary-note">急停未触发</span>
+              </div>
+              <div class="state-list">
+                <div class="state-row"><span>行情连接</span><strong id="state-market">检查中</strong></div>
+                <div class="state-row"><span>风控引擎</span><strong id="state-risk">就绪</strong></div>
+                <div class="state-row"><span>总名义敞口上限</span><strong id="state-exposure-limit">30% 权益</strong></div>
+                <div class="state-row"><span>出站代理</span><strong id="state-proxy">未配置</strong></div>
+                <div class="state-row"><span>PushPlus</span><strong id="state-pushplus">未配置</strong></div>
+                <div class="state-row"><span>TradingAgents</span><strong id="state-ai">未启用</strong></div>
+                <div class="state-row"><span>止盈止损事件流</span><strong id="state-algo-stream">未配置</strong></div>
+              </div>
+              <div class="panel-note">实盘需要独立安全闸门、管理员令牌和进程内人工解锁。</div>
+              <details class="live-safety-settings">
+                <summary>实盘安全闸门</summary>
+                <p class="settings-helper">默认关闭。只有服务器配置、管理员令牌和人工解锁同时满足时，实盘订单才会被允许。</p>
+                <label for="live-unlock-phrase">人工解锁短语
+                  <input id="live-unlock-phrase" type="password" autocomplete="off" placeholder="仅发送到当前 API">
+                </label>
+                <div class="live-safety-actions">
+                  <button class="button danger" id="unlock-live" type="button" disabled>解锁实盘</button>
+                  <button class="button secondary" id="lock-live" type="button" disabled>锁定实盘</button>
+                </div>
+                <span id="live-safety-message" class="settings-message" role="status" aria-live="polite"></span>
+              </details>
+            </article>
+          </section>
+
+          <section class="split-grid">
+            <article class="panel table-panel" id="positions" aria-labelledby="positions-title">
+              <div class="panel-heading">
+                <div>
+                  <span class="kicker">EXPOSURE</span>
+                  <h2 id="positions-title">持仓</h2>
+                </div>
+                <span class="tag" id="positions-tag">需要令牌</span>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <caption class="sr-only">当前活动持仓</caption>
+                  <thead><tr><th>合约</th><th>方向</th><th>数量</th><th>入场价</th><th>名义敞口</th><th>止盈 / 止损</th><th>状态</th></tr></thead>
+                  <tbody id="positions-body"><tr><td colspan="7" class="table-empty">输入管理员令牌后同步</td></tr></tbody>
+                </table>
+              </div>
+            </article>
+
+            <article class="panel analysis-panel" id="strategies" aria-labelledby="strategies-title">
+              <div class="panel-heading">
+                <div>
+                  <span class="kicker">DECISION LAYER</span>
+                  <h2 id="strategies-title">最新分析</h2>
+                </div>
+                <span class="tag" id="analysis-source">暂无</span>
+              </div>
+              <div class="analysis-body">
+                <div class="analysis-head">
+                  <div>
+                    <span class="analysis-label">结构化策略</span>
+                    <strong id="analysis-bias">等待分析</strong>
+                  </div>
+                  <span id="analysis-action" class="signal hold">HOLD</span>
+                </div>
+                <p id="analysis-summary" class="analysis-summary">点击“生成策略分析”获取结构化信号。</p>
+                <div class="indicator-grid">
+                  <div><span id="indicator-rsi-label">RSI 14</span><strong id="indicator-rsi">--</strong></div>
+                  <div><span id="indicator-fast-label">SMA 9</span><strong id="indicator-fast">--</strong></div>
+                  <div><span id="indicator-slow-label">SMA 21</span><strong id="indicator-slow">--</strong></div>
+                  <div><span>置信度</span><strong id="indicator-confidence">--</strong></div>
+                </div>
+                <div class="analysis-actions">
+                  <label for="equity-input">权益<input id="equity-input" type="number" min="1" step="1" value="1000"></label>
+                  <label for="size-input">数量<input id="size-input" type="number" min="0.01" step="0.01" value="1"></label>
+                  <button class="button" id="preview-signal" type="button" disabled>风控预览</button>
+                  <button class="button danger" id="execute-signal" type="button" disabled>提交订单</button>
+                </div>
+                <details class="strategy-settings">
+                  <summary>策略参数与自动运行</summary>
+                  <div class="settings-grid">
+                    <label class="toggle-field" for="strategy-enabled">
+                      <span>允许自动策略</span>
+                      <input id="strategy-enabled" type="checkbox">
+                    </label>
+                    <label class="toggle-field" for="worker-dry-run">
+                      <span>Worker 仅运行 Dry Run</span>
+                      <input id="worker-dry-run" type="checkbox" checked>
+                    </label>
+                    <label for="fast-period">快线周期<input id="fast-period" type="number" min="2" max="100" value="9"></label>
+                    <label for="slow-period">慢线周期<input id="slow-period" type="number" min="3" max="200" value="21"></label>
+                    <label for="rsi-period">RSI 周期<input id="rsi-period" type="number" min="2" max="100" value="14"></label>
+                    <label for="strategy-leverage">杠杆<input id="strategy-leverage" type="number" min="1" max="125" step="0.1" value="2"></label>
+                    <label for="strategy-position-pct">仓位比例<input id="strategy-position-pct" type="number" min="0" max="100" step="0.1" value="5"></label>
+                    <button class="button secondary" id="save-strategy" type="button" disabled>保存策略</button>
+                    <button class="button secondary" id="toggle-worker" type="button" disabled>启用 Demo Worker</button>
+                  </div>
+                  <span id="strategy-message" class="settings-message" role="status" aria-live="polite"></span>
+                </details>
+              </div>
+            </article>
+          </section>
+
+          <section class="panel table-panel" id="orders" aria-labelledby="orders-title">
             <div class="panel-heading">
               <div>
-                <span class="eyebrow">行情监控</span>
-                <h2>BTC-USDT-SWAP</h2>
+                <span class="kicker">EXECUTION LEDGER</span>
+                <h2 id="orders-title">订单</h2>
               </div>
-              <span class="tag" id="market-tag">读取中</span>
+              <button class="button secondary" id="refresh-private" type="button" disabled>同步账户与订单</button>
             </div>
-            <div class="chart-placeholder" aria-label="Chart awaiting market data">
-              <div class="chart-grid"></div>
-              <div class="chart-copy">
-                <strong id="market-price">--</strong>
-                <span id="market-summary">正在读取 OKX 公共行情...</span>
-              </div>
+            <div class="table-wrap">
+              <table>
+                <caption class="sr-only">本地订单记录</caption>
+                <thead><tr><th>时间</th><th>合约</th><th>方向</th><th>数量</th><th>状态</th><th>客户端 ID</th><th>操作</th></tr></thead>
+                <tbody id="orders-body"><tr><td colspan="7" class="table-empty">暂无本地订单</td></tr></tbody>
+              </table>
             </div>
-          </article>
+          </section>
 
-          <article class="panel" id="risk">
+          <section class="panel table-panel" id="fills" aria-labelledby="fills-title">
             <div class="panel-heading">
               <div>
-                <span class="eyebrow">系统状态</span>
-                <h2>安全闸门</h2>
+                <span class="kicker">FILL HISTORY</span>
+                <h2 id="fills-title">成交</h2>
               </div>
+              <span class="tag" id="pnl-summary">净 PnL --</span>
             </div>
-            <div class="state-list">
-              <div class="state-row"><span>交易模式</span><strong id="state-mode">模拟盘</strong></div>
-              <div class="state-row"><span>行情连接</span><strong id="state-market">检查中</strong></div>
-              <div class="state-row"><span>风控引擎</span><strong id="state-risk">已锁定</strong></div>
-              <div class="state-row"><span>出站代理</span><strong id="state-proxy">未配置</strong></div>
-              <div class="state-row"><span>PushPlus</span><strong id="state-pushplus">未配置</strong></div>
+            <div class="table-wrap">
+              <table>
+                <caption class="sr-only">成交历史和已实现盈亏</caption>
+                <thead><tr><th>时间</th><th>合约</th><th>方向</th><th>成交价</th><th>数量</th><th>已实现 PnL</th><th>手续费</th></tr></thead>
+                <tbody id="fills-body"><tr><td colspan="7" class="table-empty">输入管理员令牌后同步成交</td></tr></tbody>
+              </table>
             </div>
-          </article>
-        </section>
+          </section>
 
-        <section class="panel table-panel" id="positions">
-          <div class="panel-heading">
-            <div>
-              <span class="eyebrow">风险敞口</span>
-              <h2>持仓</h2>
+          <section class="panel performance-panel" id="performance" aria-labelledby="performance-title">
+            <div class="panel-heading">
+              <div>
+                <span class="kicker">PERFORMANCE</span>
+                <h2 id="performance-title">绩效报告</h2>
+              </div>
+              <span class="tag" id="performance-return">收益 --</span>
             </div>
-            <button class="button secondary" type="button" disabled>交易已锁定</button>
-          </div>
-          <div class="empty-state">
-            <strong>暂无持仓</strong>
-            <span>只读账户适配器接入后，持仓会显示在这里。</span>
-          </div>
-        </section>
-
-        <section class="panel table-panel" id="markets-watchlist">
-          <div class="panel-heading">
-            <div>
-              <span class="eyebrow">市场监控</span>
-              <h2>永续合约自选</h2>
+            <div class="performance-summary-grid">
+              <div><span>结束权益</span><strong id="performance-equity">--</strong></div>
+              <div><span>净 PnL</span><strong id="performance-net-pnl">--</strong></div>
+              <div><span>峰值回撤</span><strong id="performance-drawdown">--</strong></div>
+              <div><span>成交笔数</span><strong id="performance-fills">--</strong></div>
             </div>
-            <span class="tag">只读</span>
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>合约</th>
-                  <th>最新价</th>
-                  <th>买一 / 卖一</th>
-                  <th>日内变化</th>
-                  <th>更新时间</th>
-                </tr>
-              </thead>
-              <tbody id="watchlist-body">
-                <tr><td colspan="5" class="table-empty">等待公共行情...</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </section>
-      </section>
-    </main>
+            <div class="performance-chart-wrap">
+              <canvas id="equity-chart" aria-label="权益曲线"></canvas>
+              <div class="chart-empty" id="performance-empty" role="status" aria-live="polite">输入管理员令牌后读取绩效</div>
+            </div>
+            <div id="strategy-performance" class="strategy-performance">
+              <span class="subtle">策略分项会显示在这里</span>
+            </div>
+          </section>
 
+          <section class="panel table-panel" id="activity" aria-labelledby="activity-title">
+            <div class="panel-heading">
+              <div>
+                <span class="kicker">AUDIT TRAIL</span>
+                <h2 id="activity-title">运行日志</h2>
+              </div>
+              <span class="tag">本地落盘</span>
+            </div>
+            <div id="activity-list" class="activity-list"><div class="table-empty">输入管理员令牌后读取审计事件</div></div>
+          </section>
+        </section>
+      </main>
+    </div>
     <script src="/app.js"></script>
   </body>
 </html>

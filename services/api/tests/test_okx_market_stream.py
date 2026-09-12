@@ -1,4 +1,5 @@
 import json
+import time
 import unittest
 
 from app.okx_market_stream import OkxMarketStream
@@ -55,7 +56,22 @@ class OkxMarketStreamTests(unittest.TestCase):
         self.assertEqual(self.stream.candles, {})
         self.assertFalse(self.stream.fresh)
 
+    def test_disconnect_invalidates_freshness_even_after_recent_tick(self) -> None:
+        self.stream.consume(
+            json.dumps(
+                {
+                    "arg": {"channel": "tickers", "instId": "BTC-USDT-SWAP"},
+                    "data": [{"last": "62000"}],
+                }
+            )
+        )
+        self.stream.connected = True
+        self.stream._last_message_epoch = time.monotonic()
+        self.assertTrue(self.stream.fresh)
+
+        self.stream.connected = False
+        self.assertFalse(self.stream.fresh)
+
 
 if __name__ == "__main__":
     unittest.main()
-

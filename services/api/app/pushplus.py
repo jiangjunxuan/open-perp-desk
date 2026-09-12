@@ -9,13 +9,14 @@ class PushPlusError(RuntimeError):
 
 
 class PushPlusClient:
-    def __init__(self) -> None:
+    def __init__(self, transport: httpx.AsyncBaseTransport | None = None) -> None:
         self.base_url = os.getenv(
             "PUSHPLUS_BASE_URL",
             "https://www.pushplus.plus/send",
         )
         self.token = os.getenv("PUSHPLUS_TOKEN", "").strip()
         self.proxy_url = os.getenv("PUSHPLUS_PROXY_URL", "").strip() or None
+        self.transport = transport
 
     @property
     def configured(self) -> bool:
@@ -42,6 +43,7 @@ class PushPlusClient:
         try:
             async with httpx.AsyncClient(
                 proxy=self.proxy_url,
+                transport=self.transport,
                 timeout=httpx.Timeout(10.0, connect=5.0),
             ) as client:
                 response = await client.post(self.base_url, json=payload)
@@ -53,4 +55,3 @@ class PushPlusClient:
         if str(result.get("code")) != "200":
             raise PushPlusError(result.get("msg") or "PushPlus returned an unknown error")
         return {"code": result.get("code"), "msg": result.get("msg", "")}
-

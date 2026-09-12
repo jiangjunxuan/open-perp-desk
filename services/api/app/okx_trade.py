@@ -9,6 +9,8 @@ from typing import Any, Literal
 import httpx
 from pydantic import BaseModel, Field, model_validator
 
+from .live_safety import LiveSafetyGate
+
 
 class OkxTradeError(RuntimeError):
     """Raised when a guarded OKX demo order cannot be completed."""
@@ -25,6 +27,8 @@ class OrderRequest(BaseModel):
     sz: float = Field(gt=0.0)
     px: float | None = Field(default=None, gt=0.0)
     reduce_only: bool = False
+    stop_loss: float | None = Field(default=None, gt=0.0)
+    take_profit: float | None = Field(default=None, gt=0.0)
     cl_ord_id: str | None = Field(
         default=None,
         min_length=1,
@@ -57,6 +61,28 @@ class OrderRequest(BaseModel):
             payload["px"] = self._number(self.px)
         if self.reduce_only:
             payload["reduceOnly"] = True
+        if self.stop_loss is not None or self.take_profit is not None:
+            attached: dict[str, Any] = {
+                "attachAlgoClOrdId": f"{self.cl_ord_id or 'opd'}-protect",
+                "tpOrdKind": "condition",
+            }
+            if self.take_profit is not None:
+                attached.update(
+                    {
+                        "tpTriggerPx": self._number(self.take_profit),
+                        "tpTriggerPxType": "mark",
+                        "tpOrdPx": "-1",
+                    }
+                )
+            if self.stop_loss is not None:
+                attached.update(
+                    {
+                        "slTriggerPx": self._number(self.stop_loss),
+                        "slTriggerPxType": "mark",
+                        "slOrdPx": "-1",
+                    }
+                )
+            payload["attachAlgoOrds"] = [attached]
         if self.cl_ord_id:
             payload["clOrdId"] = self.cl_ord_id
         return payload
@@ -67,9 +93,13 @@ class OrderRequest(BaseModel):
 
 
 class OkxTradeClient:
-    """Guarded OKX demo order client. Live order execution is intentionally blocked."""
+    """Guarded OKX order client with a separate live safety gate."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        live_gate: LiveSafetyGate | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
         self.base_url = os.getenv("OKX_REST_BASE_URL", "https://www.okx.com").rstrip("/")
         self.api_key = os.getenv("OKX_API_KEY", "").strip()
         self.secret_key = os.getenv("OKX_SECRET_KEY", "").strip()
@@ -80,6 +110,8 @@ class OkxTradeClient:
         self.execution_enabled = (
             os.getenv("EXECUTION_ENABLED", "false").lower() == "true"
         )
+        self.live_gate = live_gate or LiveSafetyGate()
+        self.transport = transport
 
     @property
     def configured(self) -> bool:
@@ -87,12 +119,18 @@ class OkxTradeClient:
 
     @property
     def enabled(self) -> bool:
-        return (
+        demo_enabled = (
             self.execution_enabled
             and self.configured
             and self.demo
             and self.trading_mode == "demo"
         )
+        live_enabled = (
+            self.execution_enabled
+            and self.configured
+            and self.live_gate.allowed
+        )
+        return demo_enabled or live_enabled
 
     @staticmethod
     def timestamp() -> str:
@@ -140,6 +178,7 @@ class OkxTradeClient:
         try:
             async with httpx.AsyncClient(
                 proxy=self.proxy_url,
+                transport=self.transport,
                 timeout=httpx.Timeout(10.0, connect=5.0),
                 headers=self._headers(timestamp, path, body),
             ) as client:
@@ -151,6 +190,7 @@ class OkxTradeClient:
 
         if payload.get("code") != "0":
             raise OkxTradeError(payload.get("msg") or "OKX returned an unknown error")
+        self._raise_for_order_row_error(payload)
         return payload
 
     async def cancel_order(self, inst_id: str, ord_id: str) -> dict[str, Any]:
@@ -164,6 +204,7 @@ class OkxTradeClient:
         try:
             async with httpx.AsyncClient(
                 proxy=self.proxy_url,
+                transport=self.transport,
                 timeout=httpx.Timeout(10.0, connect=5.0),
                 headers=self._headers(timestamp, path, body),
             ) as client:
@@ -177,13 +218,32 @@ class OkxTradeClient:
             raise OkxTradeError(payload.get("msg") or "OKX returned an unknown error")
         return payload
 
-    def _assert_enabled(self) -> None:
-        if not self.demo or self.trading_mode != "demo":
+    @staticmethod
+    def _raise_for_order_row_error(payload: dict[str, Any]) -> None:
+        """Reject a batch response when OKX rejected the individual order."""
+        rows = payload.get("data") or []
+        if not rows:
+            raise OkxTradeError("OKX order response did not contain an order result")
+        row = rows[0] or {}
+        if str(row.get("sCode", "0")) != "0":
             raise OkxTradeError(
-                "Live order execution is blocked; only OKX demo mode is supported."
+                row.get("sMsg")
+                or row.get("msg")
+                or f"OKX order rejected with sCode={row.get('sCode')}"
             )
-        if not self.execution_enabled:
-            raise OkxTradeError("Execution is disabled by EXECUTION_ENABLED.")
+        if not row.get("ordId"):
+            raise OkxTradeError("OKX order response did not contain ordId")
+
+    def _assert_enabled(self) -> None:
+        if self.demo and self.trading_mode == "demo":
+            if not self.execution_enabled:
+                raise OkxTradeError("Execution is disabled by EXECUTION_ENABLED.")
+            if not self.configured:
+                raise OkxTradeError("OKX credentials are not configured.")
+            return
+        if not self.live_gate.allowed:
+            raise OkxTradeError(
+                "Live order execution is blocked by the independent safety gate."
+            )
         if not self.configured:
             raise OkxTradeError("OKX credentials are not configured.")
-

@@ -1,0 +1,10 @@
+.git
+.venv
+venv
+node_modules
+work
+outputs
+data
+*.sqlite3
+__pycache__
+*.py[cod]

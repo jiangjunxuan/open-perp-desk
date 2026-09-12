@@ -10,6 +10,7 @@ from .trading_signal import TradeSignal
 class RiskLimits:
     max_leverage: float = 3.0
     max_position_pct: float = 10.0
+    max_total_notional_pct: float = 30.0
     min_confidence: float = 0.65
     max_daily_loss_pct: float = 3.0
     max_stop_distance_pct: float = 5.0
@@ -19,6 +20,9 @@ class RiskLimits:
         return cls(
             max_leverage=float(os.getenv("RISK_MAX_LEVERAGE", "3")),
             max_position_pct=float(os.getenv("RISK_MAX_POSITION_PCT", "10")),
+            max_total_notional_pct=float(
+                os.getenv("RISK_MAX_TOTAL_NOTIONAL_PCT", "30")
+            ),
             min_confidence=float(os.getenv("RISK_MIN_CONFIDENCE", "0.65")),
             max_daily_loss_pct=float(os.getenv("RISK_MAX_DAILY_LOSS_PCT", "3")),
             max_stop_distance_pct=float(
@@ -46,9 +50,12 @@ class RiskEngine:
         account_equity: float,
         daily_pnl_pct: float,
         current_notional: float = 0.0,
+        market_data_fresh: bool = True,
     ) -> RiskDecision:
         reasons: list[str] = []
         now = datetime.now(timezone.utc)
+        if not market_data_fresh:
+            reasons.append("market_data_stale")
         if signal.action == "hold":
             reasons.append("hold_signal")
         if signal.expires_at and signal.expires_at <= now:
@@ -64,6 +71,14 @@ class RiskEngine:
         if signal.action in {"open_long", "open_short"}:
             if signal.position_pct > self.limits.max_position_pct:
                 reasons.append("position_size_above_limit")
+            proposed_notional = (
+                account_equity * signal.position_pct / 100 * signal.leverage
+            )
+            max_total_notional = (
+                account_equity * self.limits.max_total_notional_pct / 100
+            )
+            if current_notional + proposed_notional > max_total_notional:
+                reasons.append("total_exposure_above_limit")
             if signal.entry_price and signal.stop_loss:
                 distance_pct = (
                     abs(signal.entry_price - signal.stop_loss)

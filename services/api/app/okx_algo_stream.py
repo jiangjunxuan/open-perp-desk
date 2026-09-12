@@ -13,8 +13,8 @@ import certifi
 from websockets.asyncio.client import connect
 
 
-class OkxAccountStream:
-    """Authenticated, read-only OKX account stream."""
+class OkxAlgoOrderStream:
+    """Authenticated, read-only OKX business stream for algo orders."""
 
     def __init__(self) -> None:
         self.api_key = os.getenv("OKX_API_KEY", "").strip()
@@ -22,18 +22,16 @@ class OkxAccountStream:
         self.passphrase = os.getenv("OKX_PASSPHRASE", "").strip()
         self.demo = os.getenv("OKX_DEMO", "true").lower() == "true"
         default_url = (
-            "wss://wspap.okx.com:8443/ws/v5/private"
+            "wss://wspap.okx.com:8443/ws/v5/business"
             if self.demo
-            else "wss://ws.okx.com:8443/ws/v5/private"
+            else "wss://ws.okx.com:8443/ws/v5/business"
         )
-        self.url = os.getenv("OKX_WS_PRIVATE_URL", "").strip() or default_url
+        self.url = os.getenv("OKX_WS_BUSINESS_URL", "").strip() or default_url
         self.proxy_url = os.getenv("OKX_PROXY_URL", "").strip() or None
         self.connected = False
         self.authenticated = False
         self.last_message_at: str | None = None
         self.last_error: str | None = None
-        self.balance: list[dict[str, Any]] = []
-        self.positions: dict[str, dict[str, Any]] = {}
         self.orders: dict[str, dict[str, Any]] = {}
         self._task: asyncio.Task[None] | None = None
 
@@ -45,7 +43,7 @@ class OkxAccountStream:
         if self._task is None and self.configured:
             self._task = asyncio.create_task(
                 self._run(),
-                name="okx-private-account-stream",
+                name="okx-algo-order-stream",
             )
 
     async def stop(self) -> None:
@@ -81,11 +79,7 @@ class OkxAccountStream:
     def subscription_message() -> dict[str, Any]:
         return {
             "op": "subscribe",
-            "args": [
-                {"channel": "account"},
-                {"channel": "positions", "instType": "SWAP"},
-                {"channel": "orders", "instType": "SWAP"},
-            ],
+            "args": [{"channel": "orders-algo", "instType": "SWAP"}],
         }
 
     async def _run(self) -> None:
@@ -116,6 +110,7 @@ class OkxAccountStream:
                             message.get("event") == "login"
                             and str(message.get("code", "")) == "0"
                         ):
+                            self.authenticated = True
                             await socket.send(
                                 json.dumps(self.subscription_message())
                             )
@@ -134,51 +129,29 @@ class OkxAccountStream:
         except (TypeError, json.JSONDecodeError):
             return
 
+        if message.get("event") in {"subscribe", "channel-conn-count"}:
+            return
         if message.get("event") == "login":
-            if str(message.get("code", "")) == "0":
-                self.authenticated = True
-                self.last_error = None
-            else:
-                self.authenticated = False
+            self.authenticated = str(message.get("code", "")) == "0"
+            if not self.authenticated:
                 self.last_error = "login_failed"
             return
 
-        if message.get("event") in {"subscribe", "channel-conn-count"}:
-            return
-
         argument = message.get("arg") or {}
-        data = message.get("data") or []
-        channel = argument.get("channel")
-        if not channel or not data:
+        if argument.get("channel") != "orders-algo":
             return
-
-        self.last_message_at = datetime.now(timezone.utc).isoformat()
-        if channel == "account":
-            balances = {
-                str(item.get("ccy") or index): item
-                for index, item in enumerate(self.balance)
-            }
-            for index, item in enumerate(data):
-                balances[str(item.get("ccy") or index)] = item
-            self.balance = list(balances.values())
-        elif channel == "positions":
-            for item in data:
-                self.positions[self._position_key(item)] = item
-        elif channel == "orders":
-            for item in data:
-                order_id = str(item.get("ordId") or item.get("clOrdId") or "")
-                if order_id:
-                    self.orders[order_id] = item
-
-    @staticmethod
-    def _position_key(position: dict[str, Any]) -> str:
-        return ":".join(
-            (
-                str(position.get("instId", "")),
-                str(position.get("posSide", "")),
-                str(position.get("mgnMode", "")),
+        for item in message.get("data") or []:
+            order_id = str(
+                item.get("algoId")
+                or item.get("ordId")
+                or item.get("algoClOrdId")
+                or item.get("clOrdId")
+                or ""
             )
-        )
+            if order_id:
+                self.orders[order_id] = item
+        if message.get("data"):
+            self.last_message_at = datetime.now(timezone.utc).isoformat()
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -189,7 +162,5 @@ class OkxAccountStream:
             "proxy_configured": self.proxy_url is not None,
             "last_message_at": self.last_message_at,
             "last_error": self.last_error,
-            "balance": list(self.balance),
-            "positions": list(self.positions.values()),
             "orders": list(self.orders.values()),
         }

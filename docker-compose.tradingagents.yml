@@ -1,0 +1,11 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile.tradingagents
+      args:
+        TRADINGAGENTS_REPOSITORY: ${TRADINGAGENTS_REPOSITORY:-https://github.com/TauricResearch/TradingAgents.git}
+        TRADINGAGENTS_REF: ${TRADINGAGENTS_REF:-main}
+    environment:
+      TRADINGAGENTS_ENABLED: ${TRADINGAGENTS_ENABLED:-true}
+      TRADINGAGENTS_PATH: ${TRADINGAGENTS_PATH:-/opt/tradingagents}

@@ -98,3 +98,69 @@ class OkxAccountClient:
     async def config(self) -> list[dict[str, Any]]:
         return await self._get("/api/v5/account/config")
 
+    async def pending_orders(self) -> list[dict[str, Any]]:
+        return await self._get(
+            "/api/v5/trade/orders-pending",
+            {"instType": "SWAP"},
+        )
+
+    async def orders_history(
+        self,
+        inst_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        params = {
+            "instType": "SWAP",
+            "limit": str(max(1, min(limit, 100))),
+        }
+        if inst_id:
+            params["instId"] = inst_id
+        return await self._get(
+            "/api/v5/trade/orders-history-archive",
+            params,
+        )
+
+    async def fills_history(
+        self,
+        inst_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        params = {
+            "instType": "SWAP",
+            "limit": str(max(1, min(limit, 100))),
+        }
+        if inst_id:
+            params["instId"] = inst_id
+        return await self._get("/api/v5/trade/fills-history", params)
+
+    async def pending_algo_orders(
+        self,
+        inst_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        params = {
+            "instType": "SWAP",
+            "limit": str(max(1, min(limit, 100))),
+        }
+        if inst_id:
+            params["instId"] = inst_id
+        return await self._get(
+            "/api/v5/trade/orders-algo-pending",
+            params,
+        )
+
+    async def algo_orders_history(
+        self,
+        inst_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        params = {
+            "instType": "SWAP",
+            "limit": str(max(1, min(limit, 100))),
+        }
+        if inst_id:
+            params["instId"] = inst_id
+        return await self._get(
+            "/api/v5/trade/orders-algo-history",
+            params,
+        )

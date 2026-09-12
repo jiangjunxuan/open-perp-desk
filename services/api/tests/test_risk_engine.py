@@ -53,6 +53,26 @@ class RiskEngineTests(unittest.TestCase):
         self.assertTrue(decision.approved)
         self.assertEqual(decision.reasons, ())
 
+    def test_stale_market_data_blocks_evaluation(self) -> None:
+        signal = TradeSignal(
+            inst_id="BTC-USDT-SWAP",
+            action="open_long",
+            confidence=0.9,
+            leverage=2,
+            position_pct=5,
+            entry_price=100,
+            stop_loss=95,
+            take_profit=110,
+        )
+        decision = RiskEngine().evaluate(
+            signal,
+            account_equity=1000,
+            daily_pnl_pct=0,
+            market_data_fresh=False,
+        )
+        self.assertFalse(decision.approved)
+        self.assertIn("market_data_stale", decision.reasons)
+
     def test_risk_limits_accumulate_rejection_reasons(self) -> None:
         decision = self.engine.evaluate(
             valid_signal(confidence=0.4, leverage=5, position_pct=20),
@@ -64,6 +84,16 @@ class RiskEngineTests(unittest.TestCase):
         self.assertIn("leverage_above_limit", decision.reasons)
         self.assertIn("position_size_above_limit", decision.reasons)
         self.assertIn("daily_loss_limit_reached", decision.reasons)
+
+    def test_total_exposure_limit_includes_new_order_notional(self) -> None:
+        decision = self.engine.evaluate(
+            valid_signal(position_pct=5, leverage=2),
+            account_equity=1000,
+            daily_pnl_pct=0,
+            current_notional=250,
+        )
+        self.assertFalse(decision.approved)
+        self.assertIn("total_exposure_above_limit", decision.reasons)
 
     def test_hold_is_never_an_opening_signal(self) -> None:
         decision = self.engine.evaluate(
