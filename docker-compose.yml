@@ -1,0 +1,62 @@
+services:
+  web:
+    build:
+      context: ./apps/web
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./services/api
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      TRADING_MODE: ${TRADING_MODE:-demo}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://openperpdesk:change-this-local-password@postgres:5432/openperpdesk}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      OKX_DEMO: ${OKX_DEMO:-true}
+      OKX_PROXY_URL: ${OKX_PROXY_URL:-}
+      PUSHPLUS_TOKEN: ${PUSHPLUS_TOKEN:-}
+    expose:
+      - "8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-openperpdesk}
+      POSTGRES_USER: ${POSTGRES_USER:-openperpdesk}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-this-local-password}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+

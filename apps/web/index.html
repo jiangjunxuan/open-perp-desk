@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>OpenPerpDesk</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">OP</span>
+        <div>
+          <strong>OpenPerpDesk</strong>
+          <span class="subtle">Perpetual trading control plane</span>
+        </div>
+      </div>
+      <div class="topbar-meta">
+        <span id="connection-status" class="status-dot status-neutral">API CHECKING</span>
+        <span id="clock" class="mono"></span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="sidebar">
+        <nav aria-label="Primary">
+          <a class="nav-item active" href="#overview">Overview</a>
+          <a class="nav-item" href="#markets">Markets</a>
+          <a class="nav-item" href="#positions">Positions</a>
+          <a class="nav-item" href="#orders">Orders</a>
+          <a class="nav-item" href="#strategies">Strategies</a>
+          <a class="nav-item" href="#risk">Risk controls</a>
+          <a class="nav-item" href="#activity">Activity log</a>
+        </nav>
+        <div class="sidebar-footer">
+          <span class="subtle">Execution</span>
+          <strong id="execution-state">Disconnected</strong>
+          <span class="subtle">Safe skeleton mode</span>
+        </div>
+      </aside>
+
+      <section class="content" id="overview">
+        <div class="page-heading">
+          <div>
+            <span class="eyebrow">Operations</span>
+            <h1>Trading overview</h1>
+            <p class="subtle">A neutral control surface for market state, decisions and execution health.</p>
+          </div>
+          <div class="mode-pill" id="trading-mode">DEMO MODE</div>
+        </div>
+
+        <section class="metric-grid" aria-label="Account summary">
+          <article class="metric">
+            <span class="label">Account equity</span>
+            <strong>--</strong>
+            <span class="subtle">Awaiting account adapter</span>
+          </article>
+          <article class="metric">
+            <span class="label">Unrealized PnL</span>
+            <strong>--</strong>
+            <span class="subtle">No position stream</span>
+          </article>
+          <article class="metric">
+            <span class="label">Open positions</span>
+            <strong>0</strong>
+            <span class="subtle">Execution disabled</span>
+          </article>
+          <article class="metric">
+            <span class="label">Risk state</span>
+            <strong class="text-warning">LOCKED</strong>
+            <span class="subtle">Worker not connected</span>
+          </article>
+        </section>
+
+        <section class="main-grid">
+          <article class="panel chart-panel" id="markets">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">Market watch</span>
+                <h2>BTC-USDT-SWAP</h2>
+              </div>
+              <span class="tag">NO DATA</span>
+            </div>
+            <div class="chart-placeholder" aria-label="Chart awaiting market data">
+              <div class="chart-grid"></div>
+              <div class="chart-copy">
+                <strong>Market adapter pending</strong>
+                <span>Live candles will appear here after the OKX demo connection is implemented.</span>
+              </div>
+            </div>
+          </article>
+
+          <article class="panel" id="risk">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">System state</span>
+                <h2>Safety gates</h2>
+              </div>
+            </div>
+            <div class="state-list">
+              <div class="state-row"><span>Trading mode</span><strong id="state-mode">DEMO</strong></div>
+              <div class="state-row"><span>Market data</span><strong id="state-market">OFFLINE</strong></div>
+              <div class="state-row"><span>Risk engine</span><strong id="state-risk">LOCKED</strong></div>
+              <div class="state-row"><span>Outbound proxy</span><strong id="state-proxy">NOT SET</strong></div>
+              <div class="state-row"><span>PushPlus</span><strong id="state-pushplus">NOT SET</strong></div>
+            </div>
+          </article>
+        </section>
+
+        <section class="panel table-panel" id="positions">
+          <div class="panel-heading">
+            <div>
+              <span class="eyebrow">Exposure</span>
+              <h2>Positions</h2>
+            </div>
+            <button class="button secondary" type="button" disabled>Execution locked</button>
+          </div>
+          <div class="empty-state">
+            <strong>No positions</strong>
+            <span>Positions will be shown after the read-only account adapter is connected.</span>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
+
