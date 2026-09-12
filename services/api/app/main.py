@@ -939,7 +939,12 @@ async def notification_test(
     return {"sent": True, "result": result}
 
 
-_web_directory = Path(__file__).resolve().parents[3] / "apps" / "web"
+_module_path = Path(__file__).resolve()
+_web_directory = (
+    _module_path.parents[3] / "apps" / "web"
+    if len(_module_path.parents) > 3
+    else Path("/nonexistent/openperpdesk-web")
+)
 if _web_directory.is_dir():
     app.mount(
         "/",
