@@ -26,6 +26,7 @@ services:
       OKX_SECRET_KEY: ${OKX_SECRET_KEY:-}
       OKX_PASSPHRASE: ${OKX_PASSPHRASE:-}
       OKX_DEMO: ${OKX_DEMO:-true}
+      EXECUTION_ENABLED: ${EXECUTION_ENABLED:-false}
       OKX_PROXY_URL: ${OKX_PROXY_URL:-}
       PUSHPLUS_BASE_URL: ${PUSHPLUS_BASE_URL:-https://www.pushplus.plus/send}
       PUSHPLUS_TOKEN: ${PUSHPLUS_TOKEN:-}

@@ -12,6 +12,7 @@ from .okx_account import OkxAccountClient, OkxAccountError
 from .okx_account_stream import OkxAccountStream
 from .okx_market import OkxMarketClient, OkxMarketError
 from .okx_market_stream import OkxMarketStream
+from .okx_trade import OkxTradeClient, OkxTradeError, OrderRequest
 from .pushplus import PushPlusClient
 from .risk_engine import RiskEngine
 from .trading_signal import TradeSignal
@@ -28,6 +29,7 @@ account_client = OkxAccountClient()
 account_stream = OkxAccountStream()
 pushplus_client = PushPlusClient()
 risk_engine = RiskEngine()
+trade_client = OkxTradeClient()
 
 
 @asynccontextmanager
@@ -79,7 +81,7 @@ def system_status() -> dict[str, object]:
         "service": "OpenPerpDesk",
         "environment": os.getenv("APP_ENV", "development"),
         "trading_mode": trading_mode,
-        "execution_enabled": False,
+        "execution_enabled": trade_client.enabled,
         "market_data_connected": market_stream.fresh,
         "risk_engine_ready": False,
         "integrations": {
@@ -106,7 +108,10 @@ def system_status() -> dict[str, object]:
         },
         "safety": {
             "live_orders_allowed": False,
-            "reason": "Execution worker is not connected in the initial read-only phase.",
+            "reason": (
+                "Demo execution is disabled until EXECUTION_ENABLED and guarded "
+                "credentials are configured."
+            ),
         },
     }
 
@@ -200,6 +205,18 @@ def account_stream_snapshot() -> dict[str, object]:
     return account_stream.snapshot()
 
 
+@app.get("/api/v1/execution/status")
+def execution_status() -> dict[str, object]:
+    return {
+        "configured": trade_client.configured,
+        "demo": trade_client.demo,
+        "trading_mode": trade_client.trading_mode,
+        "execution_enabled": trade_client.enabled,
+        "live_execution_allowed": False,
+        "proxy_configured": trade_client.proxy_url is not None,
+    }
+
+
 class RiskEvaluateRequest(BaseModel):
     signal: TradeSignal
     account_equity: float = Field(gt=0.0)
@@ -225,6 +242,37 @@ def evaluate_risk(
         "execution_enabled": False,
         "note": "Risk evaluation only; no order was submitted.",
         "signal": decision.signal,
+    }
+
+
+@app.post("/api/v1/execution/orders/preview")
+def preview_order(
+    order: OrderRequest,
+    _: None = Depends(require_admin_token),
+) -> dict[str, object]:
+    return {
+        "accepted": True,
+        "execution_enabled": trade_client.enabled,
+        "live_execution_allowed": False,
+        "order": order.okx_payload(),
+        "note": "Preview only; no order was submitted.",
+    }
+
+
+@app.post("/api/v1/execution/orders")
+async def place_demo_order(
+    order: OrderRequest,
+    _: None = Depends(require_admin_token),
+) -> dict[str, object]:
+    try:
+        payload = await trade_client.place_order(order)
+    except OkxTradeError as exc:
+        raise HTTPException(status_code=423, detail=str(exc)) from exc
+    return {
+        "submitted": True,
+        "demo": True,
+        "live_execution_allowed": False,
+        "data": payload.get("data", []),
     }
 
 
