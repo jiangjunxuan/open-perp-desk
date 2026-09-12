@@ -1,12 +1,16 @@
+import asyncio
 import os
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
+from .okx_account import OkxAccountClient, OkxAccountError
 from .okx_market import OkxMarketClient, OkxMarketError
 from .okx_market_stream import OkxMarketStream
+from .pushplus import PushPlusClient
 
 
 def _symbols() -> list[str]:
@@ -16,6 +20,8 @@ def _symbols() -> list[str]:
 
 market_client = OkxMarketClient()
 market_stream = OkxMarketStream(_symbols())
+account_client = OkxAccountClient()
+pushplus_client = PushPlusClient()
 
 
 @asynccontextmanager
@@ -36,6 +42,17 @@ app = FastAPI(
 
 def _is_configured(name: str) -> bool:
     return bool(os.getenv(name, "").strip())
+
+
+def require_admin_token(x_admin_token: str | None = Header(default=None)) -> None:
+    expected = os.getenv("ADMIN_API_TOKEN", "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="Private account API is locked until ADMIN_API_TOKEN is configured.",
+        )
+    if not x_admin_token or not secrets.compare_digest(x_admin_token, expected):
+        raise HTTPException(status_code=401, detail="Invalid admin token.")
 
 
 @app.get("/api/v1/health")
@@ -63,7 +80,8 @@ def system_status() -> dict[str, object]:
                 for name in ("OKX_API_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE")
             ),
             "outbound_proxy_configured": market_stream.proxy_url is not None,
-            "pushplus_configured": _is_configured("PUSHPLUS_TOKEN"),
+            "pushplus_configured": pushplus_client.configured,
+            "account_readonly_configured": account_client.configured,
         },
         "market_stream": {
             "connected": market_stream.connected,
@@ -130,3 +148,41 @@ async def market_overview(
 @app.get("/api/v1/market/stream")
 def market_stream_snapshot() -> dict[str, Any]:
     return market_stream.snapshot()
+
+
+@app.get("/api/v1/account/overview")
+async def account_overview(
+    _: None = Depends(require_admin_token),
+) -> dict[str, object]:
+    if not account_client.configured:
+        return {
+            "configured": False,
+            "demo": account_client.demo,
+            "balance": [],
+            "positions": [],
+            "config": [],
+            "reason": "OKX read-only credentials are not configured.",
+        }
+    try:
+        balance, positions, config = await asyncio.gather(
+            account_client.balance(),
+            account_client.positions(),
+            account_client.config(),
+        )
+        return {
+            "configured": True,
+            "demo": account_client.demo,
+            "balance": balance,
+            "positions": positions,
+            "config": config,
+        }
+    except OkxAccountError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/notifications/status")
+def notifications_status() -> dict[str, object]:
+    return {
+        "pushplus_configured": pushplus_client.configured,
+        "send_enabled": pushplus_client.configured,
+    }

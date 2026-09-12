@@ -18,7 +18,8 @@ OpenPerpDesk 是一个开源的 AI 辅助永续合约交易后台。它运行在
 - 默认模式为 `demo` 模拟盘
 - 尚未启用实盘下单
 - 仓库不保存任何 API 密钥
-- Web 页面只读取不敏感的系统状态
+- Web 页面可读取公开行情和不敏感的系统状态
+- 私有账户总览需要 `X-Admin-Token`；账户适配器已实现但默认未配置密钥
 - 自动交易 Worker 暂未连接交易所
 
 在交易执行、持仓校验、风险控制和异常场景测试完成前，不要使用真实资金。
@@ -33,6 +34,10 @@ docker compose up --build
 浏览器打开 `http://localhost:8080`。
 
 API 健康检查地址为 `/api/v1/health`。
+
+只读市场接口包括 `/api/v1/market/ticker`、`/api/v1/market/candles`、
+`/api/v1/market/overview` 和 `/api/v1/market/stream`。私有账户总览为
+`/api/v1/account/overview`，需要 `X-Admin-Token`。
 
 ## 计划实现的功能
 

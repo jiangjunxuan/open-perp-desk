@@ -15,13 +15,20 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-development}
       TRADING_MODE: ${TRADING_MODE:-demo}
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-}
       MARKET_SYMBOLS: ${MARKET_SYMBOLS:-BTC-USDT-SWAP,ETH-USDT-SWAP}
+      OKX_REST_BASE_URL: ${OKX_REST_BASE_URL:-https://www.okx.com}
       OKX_WS_PUBLIC_URL: ${OKX_WS_PUBLIC_URL:-wss://ws.okx.com:8443/ws/v5/public}
       DATABASE_URL: ${DATABASE_URL:-postgresql://openperpdesk:change-this-local-password@postgres:5432/openperpdesk}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      OKX_API_KEY: ${OKX_API_KEY:-}
+      OKX_SECRET_KEY: ${OKX_SECRET_KEY:-}
+      OKX_PASSPHRASE: ${OKX_PASSPHRASE:-}
       OKX_DEMO: ${OKX_DEMO:-true}
       OKX_PROXY_URL: ${OKX_PROXY_URL:-}
+      PUSHPLUS_BASE_URL: ${PUSHPLUS_BASE_URL:-https://www.pushplus.plus/send}
       PUSHPLUS_TOKEN: ${PUSHPLUS_TOKEN:-}
+      PUSHPLUS_PROXY_URL: ${PUSHPLUS_PROXY_URL:-}
     expose:
       - "8000"
     depends_on:

@@ -17,8 +17,10 @@
 - [x] REST 客户端支持 SOCKS5/HTTP 出站代理
 - [x] 只读行情后台入口
 - [x] OKX 公共行情 WebSocket 适配器
-- [ ] 私有账户 REST/WebSocket 适配器
-- [ ] PushPlus 连通性测试
+- [x] OKX 签名私有 REST 只读适配器（余额、持仓、账户配置）
+- [ ] OKX 私有 WebSocket 适配器
+- [x] PushPlus 通知客户端和配置状态
+- [ ] PushPlus 真实发送连通性测试
 
 ## 阶段 2：模拟盘执行
 
