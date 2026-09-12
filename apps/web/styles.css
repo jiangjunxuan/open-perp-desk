@@ -624,6 +624,13 @@ td.mono-cell { font-family: var(--mono); }
 .analysis-label { color: var(--muted); font-size: 10px; }
 .analysis-head strong { font-size: 16px; }
 .analysis-summary { min-height: 44px; margin-top: 12px; color: var(--muted); font-size: 12px; line-height: 1.55; }
+.analysis-context {
+  min-height: 20px;
+  margin-top: 7px;
+  color: #718293;
+  font: 10px var(--mono);
+  line-height: 1.5;
+}
 .signal { border-radius: 4px; padding: 7px 9px; font: 600 10px var(--mono); white-space: nowrap; }
 .signal.long { background: var(--accent-soft); color: var(--accent); }
 .signal.short { background: var(--danger-soft); color: #ffabab; }

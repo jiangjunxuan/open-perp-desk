@@ -338,7 +338,7 @@ async def account_overview(
     }
     errors: dict[str, str] = {}
     for name, result in zip(names, results):
-        if isinstance(result, BaseException):
+        if isinstance(result, Exception):
             response[name] = []
             errors[name] = type(result).__name__
         else:
@@ -648,6 +648,42 @@ def analysis_status() -> dict[str, object]:
     }
 
 
+async def _ai_market_context(
+    inst_id: str,
+    bar: str,
+    limit: int,
+) -> dict[str, object]:
+    """Capture public OKX evidence alongside an optional AI research run."""
+    results = await asyncio.gather(
+        market_client.ticker(inst_id),
+        market_client.candles(inst_id, bar, limit),
+        market_client.funding_rate(inst_id),
+        market_client.open_interest(inst_id),
+        return_exceptions=True,
+    )
+    names = ("ticker", "candles", "funding_rate", "open_interest")
+    context_errors: list[str] = []
+    context: dict[str, object] = {
+        "inst_id": inst_id,
+        "bar": bar,
+        "requested_limit": limit,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "stream": {
+            "connected": market_stream.connected,
+            "fresh": market_stream.fresh,
+            "last_message_at": market_stream.last_message_at,
+        },
+        "errors": context_errors,
+    }
+    for name, result in zip(names, results):
+        if isinstance(result, BaseException):
+            context_errors.append(name)
+            continue
+        context[name] = result
+    context["candle_count"] = len(context.get("candles") or [])
+    return context
+
+
 @app.post("/api/v1/backtest")
 async def run_backtest(
     request: BacktestRequest,
@@ -714,7 +750,15 @@ async def run_ai_analysis(
     _: None = Depends(require_admin_token),
 ) -> dict[str, object]:
     try:
-        analysis = await tradingagents.analyze(request.inst_id)
+        market_context = await _ai_market_context(
+            request.inst_id,
+            request.bar,
+            request.limit,
+        )
+        analysis = await tradingagents.analyze(
+            request.inst_id,
+            market_context=market_context,
+        )
     except AIAnalysisError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     state_store.save_analysis(

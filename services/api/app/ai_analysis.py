@@ -37,7 +37,11 @@ class TradingAgentsAdapter:
     def configured(self) -> bool:
         return self.enabled and bool(self.path) and Path(self.path).is_dir()
 
-    def _run_sync(self, inst_id: str) -> dict[str, Any]:
+    def _run_sync(
+        self,
+        inst_id: str,
+        market_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if not self.configured:
             raise AIAnalysisError(
                 "TradingAgents is disabled; configure TRADINGAGENTS_ENABLED and "
@@ -87,9 +91,14 @@ class TradingAgentsAdapter:
             "source": "TradingAgents",
             "bias": "research",
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            "market_context": _json_safe(market_context or {}),
             "decision": _json_safe(decision),
             "state": _json_safe(state),
         }
 
-    async def analyze(self, inst_id: str) -> dict[str, Any]:
-        return await asyncio.to_thread(self._run_sync, inst_id)
+    async def analyze(
+        self,
+        inst_id: str,
+        market_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(self._run_sync, inst_id, market_context)

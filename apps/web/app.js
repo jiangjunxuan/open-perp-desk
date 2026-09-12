@@ -230,6 +230,7 @@ function renderAnalysis(analysis) {
   setText("#analysis-source", analysis?.source || "暂无");
   setText("#analysis-bias", analysis?.bias || "等待分析");
   setText("#analysis-summary", analysis?.report?.summary || "AI 研究结果会显示在这里。");
+  setText("#analysis-context", "研究证据：结构化策略使用当前 OKX K 线数据。");
   setText("#indicator-rsi-label", `RSI ${config.rsi_period || 14}`);
   setText("#indicator-fast-label", `SMA ${config.fast_period || 9}`);
   setText("#indicator-slow-label", `SMA ${config.slow_period || 21}`);
@@ -813,9 +814,17 @@ async function runAiAnalysis() {
       method: "POST",
       body: JSON.stringify({ inst_id: state.symbol, bar: state.bar, limit: 100 }),
     });
+    const marketContext = payload.data?.market_context || {};
+    const contextErrors = marketContext.errors?.length
+      ? ` · ${marketContext.errors.join("、")}读取失败`
+      : "";
     setText("#analysis-source", "TradingAgents");
     setText("#analysis-bias", "AI 研究");
     setText("#analysis-summary", JSON.stringify(payload.data.decision || payload.data).slice(0, 300));
+    setText(
+      "#analysis-context",
+      `研究证据：OKX ${marketContext.bar || state.bar} · ${marketContext.candle_count || 0} 根 K 线 · 采集于 ${formatTime(marketContext.captured_at)}${contextErrors}`,
+    );
     setMessage("TradingAgents 分析完成", "good");
   } catch (error) {
     setMessage(`TradingAgents 未运行：${error.message}`, "error");
