@@ -20,12 +20,14 @@ class OkxAccountStream:
         self.api_key = os.getenv("OKX_API_KEY", "").strip()
         self.secret_key = os.getenv("OKX_SECRET_KEY", "").strip()
         self.passphrase = os.getenv("OKX_PASSPHRASE", "").strip()
-        self.url = os.getenv(
-            "OKX_WS_PRIVATE_URL",
-            "wss://ws.okx.com:8443/ws/v5/private",
-        )
-        self.proxy_url = os.getenv("OKX_PROXY_URL", "").strip() or None
         self.demo = os.getenv("OKX_DEMO", "true").lower() == "true"
+        default_url = (
+            "wss://wspap.okx.com:8443/ws/v5/private"
+            if self.demo
+            else "wss://ws.okx.com:8443/ws/v5/private"
+        )
+        self.url = os.getenv("OKX_WS_PRIVATE_URL", "").strip() or default_url
+        self.proxy_url = os.getenv("OKX_PROXY_URL", "").strip() or None
         self.connected = False
         self.authenticated = False
         self.last_message_at: str | None = None
@@ -176,4 +178,3 @@ class OkxAccountStream:
             "positions": list(self.positions.values()),
             "orders": list(self.orders.values()),
         }
-

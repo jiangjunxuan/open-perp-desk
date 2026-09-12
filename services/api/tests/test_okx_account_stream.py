@@ -101,7 +101,19 @@ class OkxAccountStreamTests(unittest.TestCase):
 
         self.assertFalse(stream.configured)
 
+    def test_demo_stream_defaults_to_demo_private_endpoint(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "OKX_DEMO": "true",
+                "OKX_WS_PRIVATE_URL": "",
+            },
+            clear=False,
+        ):
+            stream = OkxAccountStream()
+
+        self.assertEqual(stream.url, "wss://wspap.okx.com:8443/ws/v5/private")
+
 
 if __name__ == "__main__":
     unittest.main()
-
