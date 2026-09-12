@@ -15,6 +15,8 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-development}
       TRADING_MODE: ${TRADING_MODE:-demo}
+      MARKET_SYMBOLS: ${MARKET_SYMBOLS:-BTC-USDT-SWAP,ETH-USDT-SWAP}
+      OKX_WS_PUBLIC_URL: ${OKX_WS_PUBLIC_URL:-wss://ws.okx.com:8443/ws/v5/public}
       DATABASE_URL: ${DATABASE_URL:-postgresql://openperpdesk:change-this-local-password@postgres:5432/openperpdesk}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       OKX_DEMO: ${OKX_DEMO:-true}
@@ -59,4 +61,3 @@ services:
 volumes:
   postgres-data:
   redis-data:
-

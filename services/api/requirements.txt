@@ -1,4 +1,6 @@
 fastapi==0.115.12
 httpx[socks]==0.28.1
+certifi>=2024.12.14,<2027
+python-socks[asyncio]==2.7.2
 uvicorn[standard]==0.34.0
 websockets==15.0.1

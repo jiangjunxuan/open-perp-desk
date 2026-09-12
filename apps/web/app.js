@@ -41,18 +41,18 @@ async function loadStatus() {
 
 async function loadMarket() {
   try {
-    const response = await fetch("/api/v1/market/ticker?inst_id=BTC-USDT-SWAP", { cache: "no-store" });
+    const response = await fetch("/api/v1/market/stream", { cache: "no-store" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const payload = await response.json();
-    const ticker = payload.data || {};
+    const ticker = payload.tickers?.["BTC-USDT-SWAP"]?.data || {};
     const last = ticker.last ? Number(ticker.last).toLocaleString("en-US", { maximumFractionDigits: 2 }) : "--";
     const change = ticker.sodUtc8
       ? `${(Number(ticker.last) - Number(ticker.sodUtc8)).toFixed(2)}`
       : "--";
     setText("#market-price", last);
     setText("#market-summary", `最新价 ${last} · 日内变化 ${change} · 数据来自 OKX 公共行情`);
-    setText("#market-tag", "实时只读");
-    setText("#state-market", "在线");
+    setText("#market-tag", payload.fresh ? "实时只读" : "数据过期");
+    setText("#state-market", payload.fresh ? "在线" : "数据过期");
   } catch {
     setText("#market-price", "--");
     setText("#market-summary", "行情暂时不可用，交易执行仍保持锁定");

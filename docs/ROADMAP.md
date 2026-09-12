@@ -16,7 +16,7 @@
 - [x] 合约元数据统一接口
 - [x] REST 客户端支持 SOCKS5/HTTP 出站代理
 - [x] 只读行情后台入口
-- [ ] OKX 模拟盘行情 WebSocket 适配器
+- [x] OKX 公共行情 WebSocket 适配器
 - [ ] 私有账户 REST/WebSocket 适配器
 - [ ] PushPlus 连通性测试
 
