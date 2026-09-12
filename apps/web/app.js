@@ -16,6 +16,53 @@ function setConnection(online) {
   connectionStatus.classList.toggle("status-neutral", !online);
 }
 
+function formatPrice(value) {
+  if (value === undefined || value === null || value === "") return "--";
+  const number = Number(value);
+  return Number.isFinite(number)
+    ? number.toLocaleString("en-US", { maximumFractionDigits: 4 })
+    : "--";
+}
+
+function formatChange(last, open) {
+  const lastNumber = Number(last);
+  const openNumber = Number(open);
+  if (!Number.isFinite(lastNumber) || !Number.isFinite(openNumber) || openNumber === 0) {
+    return { label: "--", className: "" };
+  }
+  const change = ((lastNumber - openNumber) / openNumber) * 100;
+  return {
+    label: `${change >= 0 ? "+" : ""}${change.toFixed(2)}%`,
+    className: change >= 0 ? "change-positive" : "change-negative",
+  };
+}
+
+function renderWatchlist(tickers) {
+  const body = document.querySelector("#watchlist-body");
+  if (!body) return;
+  const rows = Object.values(tickers || {});
+  body.replaceChildren();
+  if (!rows.length) {
+    const empty = document.createElement("tr");
+    empty.innerHTML = '<td colspan="5" class="table-empty">等待公共行情...</td>';
+    body.append(empty);
+    return;
+  }
+  for (const record of rows) {
+    const data = record.data || {};
+    const change = formatChange(data.last, data.sodUtc8);
+    const row = document.createElement("tr");
+    row.innerHTML = `
+      <td class="mono-cell">${data.instId || "--"}</td>
+      <td class="mono-cell">${formatPrice(data.last)}</td>
+      <td class="mono-cell">${formatPrice(data.bidPx)} / ${formatPrice(data.askPx)}</td>
+      <td class="mono-cell ${change.className}">${change.label}</td>
+      <td class="mono-cell">${record.received_at ? record.received_at.slice(11, 19) + " UTC" : "--"}</td>
+    `;
+    body.append(row);
+  }
+}
+
 function applyStatus(status) {
   const mode = String(status.trading_mode || "demo").toUpperCase();
   const modeLabel = mode === "LIVE" ? "实盘" : "模拟盘";
@@ -53,11 +100,13 @@ async function loadMarket() {
     setText("#market-summary", `最新价 ${last} · 日内变化 ${change} · 数据来自 OKX 公共行情`);
     setText("#market-tag", payload.fresh ? "实时只读" : "数据过期");
     setText("#state-market", payload.fresh ? "在线" : "数据过期");
+    renderWatchlist(payload.tickers);
   } catch {
     setText("#market-price", "--");
     setText("#market-summary", "行情暂时不可用，交易执行仍保持锁定");
     setText("#market-tag", "连接失败");
     setText("#state-market", "离线");
+    renderWatchlist({});
   }
 }
 
