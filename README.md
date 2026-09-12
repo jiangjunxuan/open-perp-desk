@@ -1,67 +1,62 @@
 # OpenPerpDesk
 
-OpenPerpDesk is an open-source web control plane for AI-assisted perpetual
-contract trading. It is designed to run on a server with Docker and be used
-from a browser.
+OpenPerpDesk 是一个开源的 AI 辅助永续合约交易后台。它运行在服务器上，
+通过浏览器访问，并使用 Docker 部署。
 
-The planned system combines:
+计划整合：
 
-- TradingAgents for research and multi-agent market analysis
-- OKX official agent skills or API adapters for market data and execution
-- A separate risk engine that must approve every order
-- PushPlus for WeChat notifications
-- A dense, professional trading-terminal web interface
+- TradingAgents：研究分析和多智能体市场研判
+- OKX 官方 agent skills 或 API 适配层：行情和交易能力
+- 独立风控引擎：每一笔订单都必须经过审核
+- PushPlus：微信通知
+- 高信息密度、专业交易终端风格的 Web 界面
 
-## Safety status
+## 当前安全状态
 
-The repository currently contains a safe initial skeleton only:
+当前仓库是安全的初始骨架：
 
-- The default mode is `demo`.
-- No live order execution is enabled.
-- No API credentials are stored in the repository.
-- The web shell reads non-secret status from the API.
-- The execution worker is intentionally not connected yet.
+- 默认模式为 `demo` 模拟盘
+- 尚未启用实盘下单
+- 仓库不保存任何 API 密钥
+- Web 页面只读取不敏感的系统状态
+- 自动交易 Worker 暂未连接交易所
 
-Do not use this project with live funds until the execution, reconciliation,
-risk, and failure-mode tests are complete.
+在交易执行、持仓校验、风险控制和异常场景测试完成前，不要使用真实资金。
 
-## Start locally
+## 本地启动
 
 ```bash
 cp .env.example .env
 docker compose up --build
 ```
 
-Open `http://localhost:8080`.
+浏览器打开 `http://localhost:8080`。
 
-The API health endpoint is available through the web proxy at
-`/api/v1/health`.
+API 健康检查地址为 `/api/v1/health`。
 
-## Planned capabilities
+## 计划实现的功能
 
-- Real-time market watchlists and charts
-- Perpetual contract positions, orders, margin, leverage, and PnL
-- AI research reports and structured trade signals
-- Backtesting and strategy comparison
-- Risk limits, take-profit, stop-loss, and emergency stop
-- Demo trading before any live mode
-- OKX REST/WebSocket connectivity with optional outbound SOCKS5/HTTP proxy
-- PushPlus alerts for signals, fills, risk events, and system failures
-- Audit logs, account permissions, and Docker-based deployment
+- 实时行情、自选列表和图表
+- 永续合约持仓、订单、保证金、杠杆和盈亏
+- AI 研究报告和结构化交易信号
+- 回测和策略对比
+- 风控限额、止盈、止损和紧急停止
+- 实盘前先运行模拟盘
+- OKX REST/WebSocket 连接，以及可选的 SOCKS5/HTTP 出站代理
+- 信号、成交、风险事件和系统故障的 PushPlus 通知
+- 审计日志、账户权限和 Docker 部署
 
-## Repository layout
+## 目录结构
 
 ```text
-apps/web/       Browser-facing web shell
-services/api/   FastAPI control-plane API
-docs/           Architecture, security, and delivery notes
+apps/web/       浏览器 Web 页面
+services/api/   FastAPI 后台接口
+docs/           架构、安全和交付说明
 docker-compose.yml
 ```
 
-## License
+## 开源协议
 
-MIT. See `LICENSE`.
+MIT，详见 `LICENSE`。
 
-This software is for research and automation engineering. It is not financial
-advice and does not promise profits.
-
+本软件用于研究和自动化工程，不构成投资建议，也不承诺任何收益。

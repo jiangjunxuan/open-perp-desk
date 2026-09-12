@@ -1,47 +1,48 @@
-# Roadmap
+# 开发路线图
 
-## Phase 0: Safe skeleton
+## 阶段 0：安全骨架
 
-- [x] Public GitHub repository
-- [x] Browser-facing web shell
-- [x] API health and non-secret configuration status
-- [x] Docker Compose services
-- [x] Environment and secret-handling baseline
-- [x] Architecture and security notes
+- [x] 公开 GitHub 仓库
+- [x] 浏览器 Web 页面
+- [x] API 健康检查和不敏感配置状态
+- [x] Docker Compose 服务
+- [x] 环境变量和密钥处理基础
+- [x] 架构和安全说明
 
-## Phase 1: Read-only demo connectivity
+## 阶段 1：只读模拟盘连接
 
-- [ ] OKX demo market WebSocket adapter
-- [ ] REST account and instrument adapter
-- [ ] Contract metadata normalization
-- [ ] Proxy-aware REST and WebSocket clients
-- [ ] Read-only dashboard data
-- [ ] PushPlus connectivity test
+- [x] OKX 公共行情 REST 适配器
+- [x] 永续合约元数据 REST 适配器
+- [x] 合约元数据统一接口
+- [x] REST 客户端支持 SOCKS5/HTTP 出站代理
+- [x] 只读行情后台入口
+- [ ] OKX 模拟盘行情 WebSocket 适配器
+- [ ] 私有账户 REST/WebSocket 适配器
+- [ ] PushPlus 连通性测试
 
-## Phase 2: Simulated execution
+## 阶段 2：模拟盘执行
 
-- [ ] Structured strategy signal schema
-- [ ] Risk engine and exposure limits
-- [ ] Idempotent order executor
-- [ ] Order and position reconciliation
-- [ ] Demo stop-loss and take-profit
-- [ ] Failure and disconnect tests
+- [ ] 结构化策略信号格式
+- [ ] 风控引擎和敞口限额
+- [ ] 幂等订单执行器
+- [ ] 订单和持仓对账
+- [ ] 模拟盘止盈止损
+- [ ] 故障和断线测试
 
-## Phase 3: Research and operations
+## 阶段 3：研究和运营
 
-- [ ] TradingAgents integration
-- [ ] Backtesting and replay
-- [ ] Strategy configuration
-- [ ] PnL and drawdown reporting
-- [ ] Audit log viewer
-- [ ] Alerts and daily reports
+- [ ] TradingAgents 集成
+- [ ] 回测和历史重放
+- [ ] 策略配置
+- [ ] 盈亏和回撤报告
+- [ ] 审计日志查看器
+- [ ] 告警和日报
 
-## Phase 4: Live-trading gate
+## 阶段 4：实盘开关
 
-- [ ] Separate live configuration
-- [ ] Manual unlock and emergency stop
-- [ ] Production observability
-- [ ] Recovery drills
-- [ ] Extended demo burn-in
-- [ ] Small-size live pilot only after explicit approval
-
+- [ ] 独立的实盘配置
+- [ ] 手动解锁和紧急停止
+- [ ] 生产环境监控
+- [ ] 故障恢复演练
+- [ ] 延长模拟盘运行观察
+- [ ] 明确批准后才进行小额实盘试运行

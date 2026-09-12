@@ -1,24 +1,18 @@
-# Security Policy
+# 安全策略
 
-## Secrets
+## 密钥
 
-Never commit OKX API keys, OKX secret keys, passphrases, PushPlus tokens,
-database passwords, or proxy credentials. Use environment variables or a
-secret manager on the server.
+不要提交 OKX API Key、Secret Key、Passphrase、PushPlus Token、数据库密码或
+代理凭据。请使用环境变量或服务器上的密钥管理器。
 
-OKX keys should be limited to read and trade permissions, should have
-withdrawal disabled, and should use an IP allowlist where possible.
+OKX 密钥只应开启读取和交易权限，禁止提币，并尽可能配置 IP 白名单。
 
-## Trading safety
+## 交易安全
 
-The default mode is OKX demo trading. Live trading must remain an explicit,
-separately guarded configuration. The risk engine must fail closed when market
-data, account state, order acknowledgements, or the outbound proxy are stale
-or unavailable.
+默认模式为 OKX 模拟盘。实盘必须是单独的、明确的受保护配置。
+当行情、账户状态、订单回报或出站代理过期或不可用时，风控引擎必须停止放行订单。
 
-## Reporting
+## 问题报告
 
-Please do not publish secret values, private account data, or unredacted
-production logs in issues. Report security issues privately to the repository
-maintainers.
-
+请不要在 Issue 中发布密钥、私有账户数据或未脱敏的生产日志。
+安全问题请私下联系仓库维护者。

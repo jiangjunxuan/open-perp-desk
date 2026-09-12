@@ -1,50 +1,46 @@
-# Architecture
+# 系统架构
 
-## Runtime boundary
+## 运行边界
 
-The browser is a control and observability surface. It is not the trading
-engine. The trading worker must continue to operate when the browser is
-closed, and it must not trust commands from an unauthenticated client.
+浏览器只是控制和监控界面，不是交易引擎。关闭浏览器后，交易 Worker 仍应能够
+继续运行；任何未认证客户端的命令都不能被信任。
 
 ```text
-Browser
+浏览器
   |
   v
-Reverse proxy / HTTPS
+反向代理 / HTTPS
   |
-  +--> Web frontend
-  +--> Control-plane API
+  +--> Web 前端
+  +--> 后台 API
               |
               +--> PostgreSQL
               +--> Redis
-              +--> Analysis service
-              +--> Risk engine
-              +--> Order executor ---> OKX REST/WebSocket
+              +--> 分析服务
+              +--> 风控引擎
+              +--> 订单执行器 ---> OKX REST/WebSocket
                                             ^
                                             |
-                                  optional SOCKS5/HTTP egress proxy
+                                  可选 SOCKS5/HTTP 出站代理
 ```
 
-## Order lifecycle
+## 订单生命周期
 
-1. Market adapters normalize OKX market and account events.
-2. Strategy and TradingAgents produce a structured signal.
-3. The risk engine validates freshness, exposure, leverage, loss limits, and
-   duplicate-order guards.
-4. The executor submits an order only after the risk engine approves it.
-5. Private WebSocket events and REST reconciliation confirm the actual state.
-6. The audit log records the decision, order, fills, and risk checks.
-7. PushPlus sends a concise notification for configured events.
+1. 行情适配器统一处理 OKX 行情和账户事件。
+2. 策略和 TradingAgents 生成结构化信号。
+3. 风控引擎检查数据新鲜度、敞口、杠杆、亏损限额和重复订单。
+4. 只有风控批准后，执行器才提交订单。
+5. 通过私有 WebSocket 事件和 REST 对账确认真实状态。
+6. 审计日志记录分析决定、订单、成交和风控检查。
+7. PushPlus 为配置的事件发送简要通知。
 
-The AI layer must never be the only source of truth for balances, positions,
-orders, fills, or risk limits.
+余额、持仓、订单、成交和风险限额不能只以 AI 层的结果为准。
 
-## Initial implementation choices
+## 初始技术选择
 
-- FastAPI for the control-plane API
-- A browser web shell served by Nginx
-- Docker Compose for local and server deployment
-- PostgreSQL for durable state
-- Redis for transient state and worker coordination
-- Demo trading as the default environment
-
+- FastAPI：后台 API
+- Nginx：提供浏览器 Web 页面
+- Docker Compose：本地和服务器部署
+- PostgreSQL：保存持久数据
+- Redis：临时状态和 Worker 协调
+- 模拟盘：默认交易环境
