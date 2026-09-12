@@ -14,6 +14,13 @@ function setText(selector, value) {
   if (element) element.textContent = value;
 }
 
+function setState(selector, value, tone = "neutral") {
+  const element = $(selector);
+  if (!element) return;
+  element.textContent = value;
+  element.dataset.tone = tone;
+}
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -79,6 +86,7 @@ function setConnection(online) {
   element.textContent = online ? "API 在线" : "API 离线";
   element.classList.toggle("status-good", online);
   element.classList.toggle("status-neutral", !online);
+  element.dataset.tone = online ? "good" : "danger";
 }
 
 function renderChart(rows) {
@@ -193,6 +201,7 @@ function renderWatchlist(tickers) {
   const ask = Number(current.askPx);
   setText("#market-spread", Number.isFinite(bid) && Number.isFinite(ask) ? formatNumber(Math.max(0, ask - bid), 2) : "--");
   setText("#market-updated", formatTime(tickers?.[state.symbol]?.received_at));
+  setState("#market-price", formatNumber(current.last, 2), "neutral");
 }
 
 function renderMarketOverview(overview) {
@@ -533,24 +542,29 @@ function applyStatus(status) {
   setText("#top-execution", executionLabel);
   setText("#execute-signal", mode === "LIVE" ? "提交实盘订单" : "执行 Demo");
   setText("#state-mode", modeLabel);
-  setText("#state-market", marketLabel);
-  setText("#state-risk", status.risk_engine_ready ? "就绪" : "已锁定");
+  setState("#state-market", marketLabel, status.market_data_connected ? "good" : "warning");
+  setState("#state-risk", status.risk_engine_ready ? "就绪" : "danger", status.risk_engine_ready ? "good" : "danger");
   setText(
     "#state-exposure-limit",
     `${formatNumber(status.risk_limits?.max_total_notional_pct, 2)}% 权益`,
   );
-  setText("#state-proxy", status.integrations?.outbound_proxy_configured ? "已配置" : "未配置");
-  setText("#state-pushplus", status.integrations?.pushplus_configured ? "已配置" : "未配置");
-  setText("#state-ai", status.integrations?.tradingagents_configured ? "已配置" : "未启用");
-  setText(
+  setState("#state-proxy", status.integrations?.outbound_proxy_configured ? "已配置" : "未配置", status.integrations?.outbound_proxy_configured ? "good" : "neutral");
+  setState("#state-pushplus", status.integrations?.pushplus_configured ? "已配置" : "未配置", status.integrations?.pushplus_configured ? "good" : "neutral");
+  setState("#state-ai", status.integrations?.tradingagents_configured ? "已配置" : "未启用", status.integrations?.tradingagents_configured ? "good" : "neutral");
+  setState(
     "#state-algo-stream",
     status.algo_stream?.connected
       ? "在线"
       : status.algo_stream?.configured
         ? "连接中"
         : "未配置",
+    status.algo_stream?.connected
+      ? "good"
+      : status.algo_stream?.configured
+        ? "warning"
+        : "neutral",
   );
-  setText("#state-stop", status.safety_control?.emergency_stopped ? "已急停" : "未触发");
+  setState("#state-stop", status.safety_control?.emergency_stopped ? "已急停" : "未触发", status.safety_control?.emergency_stopped ? "danger" : "good");
   const liveSafety = status.live_safety || {};
   setText(
     "#live-safety-message",
@@ -584,9 +598,9 @@ function applyStatus(status) {
   $("#toggle-worker").classList.toggle("secondary", !worker.enabled);
   $("#worker-dry-run").checked = worker.dry_run !== false;
   setText("#ribbon-sync", formatTime(status.market_stream?.last_message_at));
-  setText("#sidebar-market", marketLabel);
-  setText("#sidebar-risk", status.risk_engine_ready ? "就绪" : "锁定");
-  setText("#sidebar-worker", workerLabel);
+  setState("#sidebar-market", marketLabel, status.market_data_connected ? "good" : "warning");
+  setState("#sidebar-risk", status.risk_engine_ready ? "就绪" : "锁定", status.risk_engine_ready ? "good" : "danger");
+  setState("#sidebar-worker", workerLabel, worker.running ? "good" : worker.enabled ? "warning" : "neutral");
   updatePrivateActionAvailability();
   $("#execute-signal").disabled = (
     !state.analysis?.signal
@@ -685,7 +699,7 @@ async function loadMarket() {
       renderMarketOverview({});
     }
     setText("#market-tag", stream.fresh ? "实时只读" : "数据过期");
-    setText("#state-market", stream.fresh ? "在线" : "数据过期");
+    setState("#state-market", stream.fresh ? "在线" : "数据过期", stream.fresh ? "good" : "warning");
   } catch (error) {
     setText("#market-tag", "连接失败");
     setText("#chart-empty", error.message);

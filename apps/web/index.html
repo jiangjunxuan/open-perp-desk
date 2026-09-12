@@ -28,7 +28,7 @@
         <span class="context-label">时间</span>
         <span id="clock" class="mono">--</span>
       </div>
-      <div class="topbar-actions">
+      <div class="topbar-actions" aria-label="交易模式与执行状态">
         <span id="trading-mode" class="mode-pill">模拟盘</span>
         <span id="top-execution" class="execution-chip">执行已锁定</span>
       </div>
@@ -199,7 +199,7 @@
                 <span id="market-updated" class="mono subtle">--</span>
               </div>
               <div class="chart-wrap">
-                <canvas id="price-chart" aria-label="合约 OHLC K 线图"></canvas>
+                <canvas id="price-chart" aria-label="合约 OHLC K 线图" aria-describedby="chart-a11y"></canvas>
                 <div class="chart-empty" id="chart-empty" role="status" aria-live="polite">正在读取 OKX 公共行情...</div>
               </div>
               <p class="sr-only" id="chart-a11y">合约价格图表，数据来自 OKX 公共行情。</p>

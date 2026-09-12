@@ -19,6 +19,7 @@ git clone <repository> .
 cp .env.example .env
 mkdir -p backups
 chmod 600 .env
+chmod +x infra/openperpdesk.sh
 ```
 
 编辑 `.env`，至少设置一个随机的 `ADMIN_API_TOKEN`。首次运行保持：
@@ -43,11 +44,9 @@ RISK_MAX_TOTAL_NOTIONAL_PCT=30
 ## 2. 启动与验证
 
 ```bash
-docker compose up -d --build
-docker compose ps
-curl -fsS http://127.0.0.1:8080/api/v1/health
-curl -fsS http://127.0.0.1:8080/api/v1/system/status
-curl -fsS http://127.0.0.1:8080/api/v1/health/readiness
+./infra/openperpdesk.sh up
+./infra/openperpdesk.sh status
+./infra/openperpdesk.sh smoke
 ```
 
 `api` 和 `web` 都带有 Compose healthcheck；API 的优雅停止时间为 30 秒，
@@ -62,10 +61,8 @@ Web 为 15 秒，便于升级时让 WebSocket 和正在处理的请求自然结�
 升级前先查看状态并备份数据库：
 
 ```bash
-docker compose exec -T api python -c \
-  'import os, sqlite3; path=os.path.join(os.getenv("DATA_DIR", "/data"), "openperpdesk.sqlite3"); connection=sqlite3.connect(path); print(connection.execute("PRAGMA integrity_check").fetchone()[0]); connection.execute("PRAGMA wal_checkpoint(TRUNCATE)"); connection.close(); print(path)'
-docker compose cp api:/data/openperpdesk.sqlite3 \
-  "./backups/openperpdesk-$(date -u +%Y%m%dT%H%M%SZ).sqlite3"
+./infra/openperpdesk.sh status
+./infra/openperpdesk.sh backup
 ```
 
 ## 3. 宝塔反向代理
@@ -155,12 +152,11 @@ TradingAgents 输出只能作为研究层结果；它不能绕过结构化信号
 恢复前停止 API，避免 SQLite 写入竞争：
 
 ```bash
-docker compose stop api
-docker compose cp ./backups/openperpdesk-<timestamp>.sqlite3 \
-  api:/data/openperpdesk.sqlite3
-docker compose start api
-curl -fsS http://127.0.0.1:8080/api/v1/health
+./infra/openperpdesk.sh restore ./backups/openperpdesk-<timestamp>.sqlite3
 ```
+
+脚本还提供 `restart`、`logs`、`down` 和 `smoke` 命令。它会拒绝权限不是
+`600` 的 `.env`，备份目录默认为项目下的 `backups/`，不会打印环境变量内容。
 
 升级采用可回滚方式：
 
