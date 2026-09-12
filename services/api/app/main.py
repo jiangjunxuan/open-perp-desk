@@ -6,12 +6,15 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from .okx_account import OkxAccountClient, OkxAccountError
 from .okx_account_stream import OkxAccountStream
 from .okx_market import OkxMarketClient, OkxMarketError
 from .okx_market_stream import OkxMarketStream
 from .pushplus import PushPlusClient
+from .risk_engine import RiskEngine
+from .trading_signal import TradeSignal
 
 
 def _symbols() -> list[str]:
@@ -24,6 +27,7 @@ market_stream = OkxMarketStream(_symbols())
 account_client = OkxAccountClient()
 account_stream = OkxAccountStream()
 pushplus_client = PushPlusClient()
+risk_engine = RiskEngine()
 
 
 @asynccontextmanager
@@ -194,6 +198,34 @@ async def account_overview(
 @app.get("/api/v1/account/stream")
 def account_stream_snapshot() -> dict[str, object]:
     return account_stream.snapshot()
+
+
+class RiskEvaluateRequest(BaseModel):
+    signal: TradeSignal
+    account_equity: float = Field(gt=0.0)
+    daily_pnl_pct: float
+    current_notional: float = Field(default=0.0, ge=0.0)
+
+
+@app.post("/api/v1/risk/evaluate")
+def evaluate_risk(
+    request: RiskEvaluateRequest,
+    _: None = Depends(require_admin_token),
+) -> dict[str, object]:
+    decision = risk_engine.evaluate(
+        request.signal,
+        account_equity=request.account_equity,
+        daily_pnl_pct=request.daily_pnl_pct,
+        current_notional=request.current_notional,
+    )
+    return {
+        "approved": decision.approved,
+        "reasons": list(decision.reasons),
+        "checked_at": decision.checked_at,
+        "execution_enabled": False,
+        "note": "Risk evaluation only; no order was submitted.",
+        "signal": decision.signal,
+    }
 
 
 @app.get("/api/v1/notifications/status")
