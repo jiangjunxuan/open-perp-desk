@@ -39,7 +39,15 @@ class TradingAgentsConfigTests(unittest.TestCase):
                     def __init__(self, **kwargs):
                         captured["config"] = kwargs["config"]
 
+                    def resolve_instrument_context(self, ticker, asset_type="stock"):
+                        captured["base_context"] = (ticker, asset_type)
+                        return "base instrument context"
+
                     def propagate(self, *_args, **_kwargs):
+                        captured["resolved_context"] = self.resolve_instrument_context(
+                            "BTC-USD",
+                            "crypto",
+                        )
                         return {"ok": True}, "Hold"
 
                 default_module = ModuleType("tradingagents.default_config")
@@ -89,6 +97,9 @@ class TradingAgentsConfigTests(unittest.TestCase):
         self.assertEqual(result["decision"], "Hold")
         self.assertEqual(result["market_context"]["bar"], "15m")
         self.assertEqual(result["market_context"]["candle_count"], 100)
+        self.assertEqual(captured["base_context"], ("BTC-USD", "crypto"))
+        self.assertIn("External OKX perpetual market evidence", captured["resolved_context"])
+        self.assertIn('"bar": "15m"', captured["resolved_context"])
 
 
 class AIMarketContextTests(unittest.TestCase):

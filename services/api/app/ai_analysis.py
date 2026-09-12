@@ -21,6 +21,27 @@ def _json_safe(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=True, default=str))
 
 
+def _market_context_prompt(context: dict[str, Any] | None) -> str:
+    """Format a bounded OKX evidence block for the TradingAgents context."""
+    if not context:
+        return ""
+    evidence = {
+        "inst_id": context.get("inst_id"),
+        "bar": context.get("bar"),
+        "candle_count": context.get("candle_count"),
+        "ticker": context.get("ticker", {}),
+        "funding_rate": context.get("funding_rate", {}),
+        "open_interest": context.get("open_interest", {}),
+        "recent_candles": (context.get("candles") or [])[:20],
+        "errors": context.get("errors", []),
+    }
+    return (
+        "\n\nExternal OKX perpetual market evidence (public snapshot; "
+        "prefer this over guessing current price context):\n"
+        f"{json.dumps(_json_safe(evidence), ensure_ascii=True)}"
+    )
+
+
 class TradingAgentsAdapter:
     """Optional bridge to the vendored TradingAgents framework.
 
@@ -80,6 +101,16 @@ class TradingAgentsAdapter:
             debug=False,
             config=config,
         )
+        context_prompt = _market_context_prompt(market_context)
+        resolver = getattr(graph, "resolve_instrument_context", None)
+        if context_prompt and callable(resolver):
+            def resolve_with_okx_context(
+                ticker: str,
+                asset_type: str = "stock",
+            ) -> str:
+                return f"{resolver(ticker, asset_type)}{context_prompt}"
+
+            setattr(graph, "resolve_instrument_context", resolve_with_okx_context)
         ticker = _tradingagents_ticker(inst_id)
         state, decision = graph.propagate(
             ticker,
