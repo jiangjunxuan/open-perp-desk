@@ -212,7 +212,7 @@ def system_status() -> dict[str, object]:
             "max_daily_loss_pct": risk_engine.limits.max_daily_loss_pct,
             "max_stop_distance_pct": risk_engine.limits.max_stop_distance_pct,
         },
-        "state_store_ready": True,
+        "state_store_ready": state_store.path.exists(),
         "integrations": {
             "okx_credentials_configured": all(
                 _is_configured(name)
@@ -237,6 +237,7 @@ def system_status() -> dict[str, object]:
             "last_error": account_stream.last_error,
         },
         "algo_stream": {
+            "configured": algo_stream.configured,
             "connected": algo_stream.connected,
             "authenticated": algo_stream.authenticated,
             "last_message_at": algo_stream.last_message_at,

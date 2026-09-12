@@ -279,6 +279,21 @@ class HealthEndpointTests(unittest.TestCase):
         self.assertNotIn("proxy.example", serialized)
         self.assertNotIn("secret", serialized)
 
+    def test_system_status_exposes_algo_configuration_and_store_state(self) -> None:
+        class ConfiguredAlgoStream:
+            configured = True
+            connected = False
+            authenticated = False
+            last_message_at = None
+            last_error = "ConnectionClosed"
+
+        with patch.object(api_main, "algo_stream", ConfiguredAlgoStream()):
+            payload = api_main.system_status()
+
+        self.assertTrue(payload["state_store_ready"])
+        self.assertTrue(payload["algo_stream"]["configured"])
+        self.assertFalse(payload["algo_stream"]["connected"])
+
 
 class ProxyConfigurationTests(unittest.TestCase):
     def test_proxy_is_loaded_by_rest_and_websocket_clients(self) -> None:
