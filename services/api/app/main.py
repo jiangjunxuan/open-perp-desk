@@ -152,7 +152,6 @@ def _readiness_payload() -> dict[str, object]:
     checks = {
         "state_store": {
             "ok": state_store_ready,
-            "path": str(state_store.path),
         },
         "market_stream": {
             "ok": market_fresh,
@@ -272,7 +271,7 @@ def system_status() -> dict[str, object]:
             "last_message_at": algo_stream.last_message_at,
             "last_error": algo_stream.last_error,
         },
-        "state_store": {"path": str(state_store.path)},
+        "state_store": {"ok": state_store.path.exists()},
         "automation_worker": automation_worker.snapshot(),
         "account_reconciler": account_reconciler.snapshot(),
         "live_safety": trade_client.live_gate.snapshot(),

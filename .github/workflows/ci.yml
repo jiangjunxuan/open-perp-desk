@@ -103,6 +103,30 @@ jobs:
             openperpdesk-ai:ci python -c \
             'import asyncio, json, os; from app.ai_analysis import TradingAgentsAdapter; assert os.geteuid() != 0; result = asyncio.run(TradingAgentsAdapter().check_ready()); assert result["runtime_state"] == "ready"; assert result["provider_connection_verified"] is False; assert result["execution_authorized"] is False; print(json.dumps(result))'
 
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r services/api/requirements.txt
+      - name: browser flows against isolated loopback protocol fixtures
+        env:
+          CHROME_BIN: google-chrome
+        run: python infra/ui-acceptance.py
+      - name: browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-acceptance
+          path: work/ci-ui-artifacts/
+          retention-days: 7
+
   web:
     runs-on: ubuntu-latest
     timeout-minutes: 5

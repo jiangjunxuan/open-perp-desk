@@ -128,6 +128,17 @@ K 线画布非空、关注合约切换、暂停刷新、账单原币种金额及
 管理、研究及历史账单的内容丰富状态使用显式浏览器样本，不连接私有账户；
 包含日期查询、游标分页、补录进度、重复点击、失败保留、权限失效和迟到响应检查。
 
+无需真实 OKX 连接的隔离浏览器回归与 CI 使用：
+
+```bash
+.venv/bin/python infra/ui-acceptance.py
+```
+
+此入口启动临时 API/SQLite 和回环协议测试服务，执行、自动交易和实盘保持关闭，
+并断言没有向测试交易所发送任何变更请求。截图、报告与日志保存在 `work/ci-ui-artifacts/`，
+不会覆盖 `outputs/` 中真实公共行情的验收截图。它不代替真实 OKX 模拟盘联调。
+图表标记的范围与使用方式见 [`docs/CHART_ANNOTATIONS.md`](docs/CHART_ANNOTATIONS.md)。
+
 控制台使用本地图标资源，不依赖外部图标 CDN。同版本资源可通过
 `node infra/vendor-icons.mjs` 重新获取。
 

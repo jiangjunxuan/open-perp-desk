@@ -10,6 +10,7 @@ import { checkRealtime } from "./realtime-ui-checks.mjs";
 import { checkChartAnnotations } from "./chart-annotation-ui-checks.mjs";
 
 const root = process.cwd();
+const outputDirectory = path.resolve(root, process.env.OPENPERPDESK_OUTPUT_DIR || "outputs");
 const origin = process.env.OPENPERPDESK_ORIGIN || "http://127.0.0.1:8099";
 const chromePath = process.env.CHROME_BIN || (
   process.platform === "darwin"
@@ -25,8 +26,11 @@ const chrome = spawn(
     "--no-sandbox",
     "--no-first-run",
     "--no-default-browser-check",
+    "--password-store=basic",
+    "--use-mock-keychain",
     "--disable-background-networking",
     "--disable-component-update",
+    ...(process.env.OPENPERPDESK_DISABLE_PROXY === "true" ? ["--no-proxy-server"] : []),
     "--remote-debugging-port=0",
     `--user-data-dir=${profile}`,
     "about:blank",
@@ -93,6 +97,10 @@ try {
     const response = JSON.parse(event.data);
     if (response.method === "Runtime.exceptionThrown") {
       browserErrors.push(response.params.exceptionDetails.exception?.description || response.params.exceptionDetails.text);
+      console.error(browserErrors.at(-1));
+    }
+    if (response.method === "Network.loadingFailed" && response.params.errorText !== "net::ERR_ABORTED") {
+      console.error(`Browser network failure: ${response.params.type}: ${response.params.errorText}`);
     }
     const waiting = pending.get(response.id);
     if (!waiting) return;
@@ -103,7 +111,8 @@ try {
   });
   await command("Page.enable");
   await command("Runtime.enable");
-  await mkdir(path.join(root, "outputs"), { recursive: true });
+  await command("Network.enable");
+  await mkdir(outputDirectory, { recursive: true });
 
   const results = [];
   for (const viewport of [
@@ -115,6 +124,7 @@ try {
     { name: "small-mobile", width: 375, height: 812 },
     { name: "mobile", width: 390, height: 844 },
   ]) {
+    console.error(`Checking trading console layout: ${viewport.name}`);
     await command("Emulation.setDeviceMetricsOverride", {
       width: viewport.width,
       height: viewport.height,
@@ -169,7 +179,7 @@ try {
       },
     });
     await writeFile(
-      path.join(root, "outputs", `openperpdesk-dashboard-${viewport.name}.png`),
+      path.join(outputDirectory, `openperpdesk-dashboard-${viewport.name}.png`),
       Buffer.from(screenshot.data, "base64"),
     );
     results.push({ viewport: viewport.name, ...layout });
@@ -239,7 +249,7 @@ try {
         }
         if (["desktop", "mobile"].includes(viewport.name)) {
           const focused = await command("Page.captureScreenshot", { format: "png" });
-          await writeFile(path.join(root, "outputs", `openperpdesk-focus-${viewport.name}.png`), Buffer.from(focused.data, "base64"));
+          await writeFile(path.join(outputDirectory, `openperpdesk-focus-${viewport.name}.png`), Buffer.from(focused.data, "base64"));
         }
         await command("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
         await command("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
@@ -537,11 +547,11 @@ try {
           captureBeyondViewport: true,
           clip: { x: 0, y: 0, width: viewport.width, height: Math.min(documentHeight, viewport.height * 3), scale: 1 },
         });
-        await writeFile(path.join(root, "outputs", `openperpdesk-${view}-${viewport.name}.png`), Buffer.from(shot.data, "base64"));
+        await writeFile(path.join(outputDirectory, `openperpdesk-${view}-${viewport.name}.png`), Buffer.from(shot.data, "base64"));
         if (view === "markets") {
           await evaluate('document.querySelector("#ticket-tab-execution").click()');
           const executionShot = await command("Page.captureScreenshot", { format: "png", captureBeyondViewport: true });
-          await writeFile(path.join(root, "outputs", `openperpdesk-execution-${viewport.name}.png`), Buffer.from(executionShot.data, "base64"));
+          await writeFile(path.join(outputDirectory, `openperpdesk-execution-${viewport.name}.png`), Buffer.from(executionShot.data, "base64"));
           await evaluate('document.querySelector("#ticket-tab-signal").click(); window.scrollTo(0, 0)');
         }
       }
@@ -566,7 +576,7 @@ try {
         throw new Error(`${viewport.name} mobile drawer failure: ${JSON.stringify(drawer)}`);
       }
       const shot = await command("Page.captureScreenshot", { format: "png" });
-      await writeFile(path.join(root, "outputs", `openperpdesk-navigation-${viewport.name}.png`), Buffer.from(shot.data, "base64"));
+      await writeFile(path.join(outputDirectory, `openperpdesk-navigation-${viewport.name}.png`), Buffer.from(shot.data, "base64"));
       await command("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
       await command("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
       await delay(80);
@@ -656,7 +666,7 @@ try {
       format: "png", captureBeyondViewport: true,
       clip: { x: 0, y: 0, width: viewport.width, height: viewport.height * 2, scale: 1 },
     });
-    await writeFile(path.join(root, "outputs", `openperpdesk-research-${viewport.name}.png`), Buffer.from(screenshot.data, "base64"));
+    await writeFile(path.join(outputDirectory, `openperpdesk-research-${viewport.name}.png`), Buffer.from(screenshot.data, "base64"));
     await evaluate('window.__restoreResearchFixture()');
   }
   const contrast = await evaluate(`(() => {
@@ -694,7 +704,7 @@ try {
     evaluate, command, origin,
     screenshot: async name => {
       const shot = await command("Page.captureScreenshot", { format: "png" });
-      await writeFile(path.join(root, "outputs", name), Buffer.from(shot.data, "base64"));
+      await writeFile(path.join(outputDirectory, name), Buffer.from(shot.data, "base64"));
     },
   });
   const management = await checkManagement({
@@ -703,7 +713,7 @@ try {
       const size = await evaluate("({width: innerWidth, height: Math.min(document.documentElement.scrollHeight, innerHeight * 3)})");
       const shot = await command("Page.captureScreenshot", { format: "png", captureBeyondViewport: true,
         clip: { x: 0, y: 0, ...size, scale: 1 } });
-      await writeFile(path.join(root, "outputs", name), Buffer.from(shot.data, "base64"));
+      await writeFile(path.join(outputDirectory, name), Buffer.from(shot.data, "base64"));
     },
   });
   const billHistory = await checkBillHistory({
@@ -712,26 +722,26 @@ try {
       const size = await evaluate("({width: innerWidth, height: Math.min(document.documentElement.scrollHeight, innerHeight * 3)})");
       const shot = await command("Page.captureScreenshot", { format: "png", captureBeyondViewport: true,
         clip: { x: 0, y: 0, ...size, scale: 1 } });
-      await writeFile(path.join(root, "outputs", name), Buffer.from(shot.data, "base64"));
+      await writeFile(path.join(outputDirectory, name), Buffer.from(shot.data, "base64"));
     },
   });
   const realtime = await checkRealtime({
     evaluate, command, origin,
     screenshot: async name => {
       const shot = await command("Page.captureScreenshot", { format: "png" });
-      await writeFile(path.join(root, "outputs", name), Buffer.from(shot.data, "base64"));
+      await writeFile(path.join(outputDirectory, name), Buffer.from(shot.data, "base64"));
     },
   });
   const annotations = await checkChartAnnotations({
     evaluate, command, origin,
     screenshot: async name => {
       const shot = await command("Page.captureScreenshot", { format: "png" });
-      await writeFile(path.join(root, "outputs", name), Buffer.from(shot.data, "base64"));
+      await writeFile(path.join(outputDirectory, name), Buffer.from(shot.data, "base64"));
     },
   });
   if (browserErrors.length) throw new Error(`Browser exceptions: ${JSON.stringify(browserErrors)}`);
   const report = { results, paused, symbol, oldSignalCleared, historyPassed, deepLinkPassed, researchChecks, contrast, reducedMotion, appearance, management, billHistory, realtime, annotations, browserErrors };
-  await writeFile(path.join(root, "outputs", "ui-verification.json"), JSON.stringify(report, null, 2));
+  await writeFile(path.join(outputDirectory, "ui-verification.json"), JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
 } finally {
   socket?.close();

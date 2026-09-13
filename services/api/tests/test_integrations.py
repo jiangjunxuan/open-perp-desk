@@ -297,6 +297,16 @@ class HealthEndpointTests(unittest.TestCase):
         self.assertTrue(payload["algo_stream"]["configured"])
         self.assertFalse(payload["algo_stream"]["connected"])
 
+    def test_public_status_and_readiness_do_not_expose_database_paths(self) -> None:
+        with patch.object(api_main, "market_stream", self.ReadyMarket()):
+            ready = api_main.readiness()
+        status = api_main.system_status()
+        for payload in (ready, status, api_main.health_metrics()):
+            serialized = __import__("json").dumps(payload)
+            self.assertNotIn(str(api_main.state_store.path), serialized)
+        self.assertEqual(status["state_store"], {"ok": True})
+        self.assertEqual(ready["checks"]["state_store"], {"ok": True})
+
     def test_system_status_exposes_private_account_stream_configuration(self) -> None:
         class ConfiguredAccountStream:
             configured = True
