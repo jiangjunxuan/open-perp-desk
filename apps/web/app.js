@@ -252,6 +252,16 @@ function formatNumber(value, digits = 4) {
     : "--";
 }
 
+function formatCompact(value, digits = 2) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  const units = [[1e9, "B"], [1e6, "M"], [1e3, "K"]];
+  const unit = units.find(([threshold]) => Math.abs(number) >= threshold);
+  return unit
+    ? `${(number / unit[0]).toFixed(digits).replace(/\.?0+$/, "")}${unit[1]}`
+    : formatNumber(number, digits);
+}
+
 function formatTime(value) {
   return value ? String(value).replace("T", " ").slice(0, 19) : "--";
 }
@@ -706,8 +716,14 @@ function renderWatchlist(tickers) {
     summary.classList.toggle("change-positive", change !== null && change >= 0);
     summary.classList.toggle("change-negative", change !== null && change < 0);
   }
+  setText("#market-change", change === null ? "--" : `${change >= 0 ? "+" : ""}${change.toFixed(2)}%`);
+  const changeElement = $("#market-change");
+  changeElement?.classList.toggle("change-positive", change !== null && change >= 0);
+  changeElement?.classList.toggle("change-negative", change !== null && change < 0);
   setText("#market-high", formatNumber(current.high24h, 2));
   setText("#market-low", formatNumber(current.low24h, 2));
+  setText("#market-volume", formatCompact(current.vol24h));
+  setText("#market-turnover", formatCompact(current.volCcy24h));
   const bid = Number(current.bidPx);
   const ask = Number(current.askPx);
   setText("#market-spread", Number.isFinite(bid) && Number.isFinite(ask) ? formatNumber(Math.max(0, ask - bid), 2) : "--");
@@ -778,6 +794,69 @@ function renderMarketOverview(overview) {
   setText("#market-oi", compactOi);
   $("#market-oi").title = Number.isFinite(oi) ? `${formatNumber(oi, 2)}${openInterest.oi ? " 张" : ""}` : "暂无数据";
   $("#market-oi").setAttribute("aria-label", $("#market-oi").title);
+  renderOrderBook();
+}
+
+function renderOrderBook() {
+  const asksElement = $("#orderbook-asks");
+  const bidsElement = $("#orderbook-bids");
+  if (!asksElement || !bidsElement) return;
+  const record = state.marketStream?.order_books?.[state.symbol];
+  const book = record?.data;
+  const validLevels = (levels, direction) => (Array.isArray(levels) ? levels : [])
+    .map((level) => ({
+      price: Number(level?.[0]),
+      size: Number(level?.[1]),
+    }))
+    .filter((level) => Number.isFinite(level.price) && level.price > 0
+      && Number.isFinite(level.size) && level.size >= 0)
+    .sort((left, right) => direction * (left.price - right.price))
+    .slice(0, 8);
+  const asks = validLevels(book?.asks, 1);
+  const bids = validLevels(book?.bids, -1);
+  const totals = (levels) => {
+    let total = 0;
+    return levels.map((level) => {
+      total += level.size;
+      return { ...level, total };
+    });
+  };
+  const askRows = totals(asks);
+  const bidRows = totals(bids);
+  const maxTotal = Math.max(
+    1,
+    ...askRows.map((row) => row.total),
+    ...bidRows.map((row) => row.total),
+  );
+  const renderSide = (element, rows, side) => {
+    element.innerHTML = rows.length
+      ? rows.map((row) => `
+        <div class="orderbook-row ${side}" aria-label="${side === "ask" ? "卖盘" : "买盘"} ${formatNumber(row.price, 2)}，数量 ${formatNumber(row.size, 5)}">
+          <span class="depth-bar" style="--depth:${Math.min(100, row.total / maxTotal * 100)}%"></span>
+          <strong class="mono">${formatNumber(row.price, 2)}</strong>
+          <span class="mono">${formatNumber(row.size, 5)}</span>
+          <span class="mono">${formatNumber(row.total, 5)}</span>
+        </div>`).join("")
+      : '<div class="orderbook-empty">等待深度数据</div>';
+  };
+  renderSide(asksElement, askRows, "ask");
+  renderSide(bidsElement, bidRows, "bid");
+  const ticker = state.marketStream?.tickers?.[state.symbol]?.data || {};
+  const bestAsk = askRows[0]?.price;
+  const bestBid = bidRows[0]?.price;
+  const last = Number(ticker.last);
+  const mid = Number.isFinite(last) ? last
+    : Number.isFinite(bestAsk) && Number.isFinite(bestBid) ? (bestAsk + bestBid) / 2 : NaN;
+  const spread = Number.isFinite(bestAsk) && Number.isFinite(bestBid)
+    ? Math.max(0, bestAsk - bestBid)
+    : NaN;
+  setText("#orderbook-mid-price", formatNumber(mid, 2));
+  setText("#orderbook-spread", Number.isFinite(spread) ? `价差 ${formatNumber(spread, 2)}` : "价差 --");
+  const ready = record?.fresh === true;
+  setState("#orderbook-state", ready ? "实时深度" : record ? "深度延迟" : "等待实时深度", ready ? "good" : "warning");
+  setText("#orderbook-a11y", ready && askRows.length && bidRows.length
+    ? `盘口实时更新，卖一 ${formatNumber(bestAsk, 2)}，买一 ${formatNumber(bestBid, 2)}，价差 ${formatNumber(spread, 2)}。`
+    : "盘口等待实时数据。");
 }
 
 function renderAnalysis(analysis) {

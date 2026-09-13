@@ -65,7 +65,7 @@ class LocalExchange:
             subscription = json.loads(await socket.recv())
             self.subscriptions[path] = subscription["args"]
             expected_channels = {
-                "/public": {"tickers", "open-interest", "funding-rate"}, "/candles": {"candle1m", "candle15m", "candle1H", "candle4H"},
+                "/public": {"tickers", "books5", "open-interest", "funding-rate"}, "/candles": {"candle1m", "candle15m", "candle1H", "candle4H"},
                 "/private": {"account", "positions", "orders"}, "/algo": {"orders-algo"},
             }[path]
             actual = {item["channel"] for item in subscription["args"]}
@@ -79,6 +79,7 @@ class LocalExchange:
                     continue
                 data = {
                     "tickers": [{"last": "100", "instId": "BTC-USDT-SWAP"}],
+                    "books5": [{"asks": [["101", "1", "0", "1"]], "bids": [["99", "1", "0", "1"]], "ts": "1"}],
                     "open-interest": [{"oi": "100", "instId": "BTC-USDT-SWAP"}],
                     "funding-rate": [{"fundingRate": "0.0001", "instId": "BTC-USDT-SWAP"}],
                     "candle1m": [["1", "100", "101", "99", "100", "1"]],

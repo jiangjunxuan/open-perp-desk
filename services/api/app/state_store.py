@@ -201,6 +201,16 @@ class StateStore:
                     captured_at TEXT NOT NULL,
                     PRIMARY KEY (market_scope, currency, candle_ms)
                 );
+                CREATE TABLE IF NOT EXISTS account_equity_snapshots (
+                    account_scope TEXT NOT NULL,
+                    captured_at_ms INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    equity_usd TEXT NOT NULL,
+                    balance_json TEXT NOT NULL,
+                    PRIMARY KEY (account_scope, captured_at_ms, source)
+                );
+                CREATE INDEX IF NOT EXISTS idx_equity_snapshots_time
+                    ON account_equity_snapshots(account_scope, captured_at_ms);
                 CREATE TABLE IF NOT EXISTS account_bill_valuations (
                     id TEXT PRIMARY KEY,
                     account_scope TEXT NOT NULL,
@@ -1141,6 +1151,61 @@ class StateStore:
                        lease_until_ms = 0, updated_at = ? WHERE id = ?""", (_utc_now(), job_id),
                 )
             return True
+
+    def save_equity_snapshot(
+        self, scope: str, captured_at_ms: int, source: str,
+        balance: list[dict[str, Any]],
+    ) -> bool:
+        from .account_ledger import amount
+
+        if not scope or captured_at_ms <= 0 or source not in {"private_stream", "rest_reconcile"}:
+            raise ValueError("equity_snapshot_identity_invalid")
+        if not isinstance(balance, list) or not balance:
+            raise ValueError("equity_snapshot_balance_invalid")
+        total = None
+        for item in balance:
+            if not isinstance(item, dict):
+                raise ValueError("equity_snapshot_balance_invalid")
+            candidate = item.get("totalEq") or item.get("adjEq")
+            if candidate not in (None, ""):
+                parsed = amount(candidate, "equity_usd")
+                if parsed <= 0:
+                    raise ValueError("equity_snapshot_equity_invalid")
+                if total is not None and total != parsed:
+                    raise ValueError("equity_snapshot_conflict")
+                total = parsed
+        if total is None:
+            raise ValueError("equity_snapshot_equity_missing")
+        encoded = json.dumps(balance, separators=(",", ":"), sort_keys=True, allow_nan=False)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO account_equity_snapshots
+                   (account_scope, captured_at_ms, source, equity_usd, balance_json)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (scope, captured_at_ms, source, str(total), encoded),
+            )
+        return cursor.rowcount == 1
+
+    def equity_snapshots(
+        self, scope: str, start_ms: int, end_ms: int, limit: int = 10_000,
+    ) -> list[dict[str, Any]]:
+        if start_ms <= 0 or end_ms <= start_ms:
+            raise ValueError("equity_snapshot_window_invalid")
+        limit = max(1, min(limit, 10_000))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT captured_at_ms, source, equity_usd, balance_json
+                   FROM account_equity_snapshots
+                   WHERE account_scope = ? AND captured_at_ms >= ? AND captured_at_ms <= ?
+                   ORDER BY captured_at_ms, source LIMIT ?""",
+                (scope, start_ms, end_ms, limit + 1),
+            ).fetchall()
+        if len(rows) > limit:
+            raise ValueError("equity_snapshot_window_too_large")
+        return [{
+            "captured_at_ms": row["captured_at_ms"], "source": row["source"],
+            "equity_usd": row["equity_usd"], "balance": json.loads(row["balance_json"]),
+        } for row in rows]
 
     def pnl_summary(self, limit: int = 500) -> dict[str, Any]:
         fills = self.list_fills(limit)

@@ -44,6 +44,10 @@ def _exchange_ms(value: Any) -> int | None:
     return timestamp if timestamp > 0 else None
 
 
+def _now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
 def _position_side_for_order(pos_side: str, size: float) -> str:
     if pos_side == "long":
         return "buy"
@@ -383,10 +387,31 @@ class AccountSynchronizer:
                 "positions": 0,
                 "orders": 0,
                 "fills": 0,
+                "balances": 0,
                 "skipped": "private_stream_not_ready",
             }
         positions = 0
         orders = 0
+        balances = 0
+        if snapshot.get("balance"):
+            try:
+                exchange_times = [
+                    _exchange_ms(item.get("uTime"))
+                    for item in snapshot["balance"] if isinstance(item, dict)
+                ]
+                balances = int(self.store.save_equity_snapshot(
+                    self.account_client.account_scope,
+                    max((stamp for stamp in exchange_times if stamp is not None), default=_now_ms()),
+                    "private_stream",
+                    snapshot["balance"],
+                ))
+            except (TypeError, ValueError):
+                self.store.add_audit(
+                    "equity_snapshot_invalid",
+                    "Private equity snapshot was not persisted",
+                    severity="warning",
+                    payload={"source": "private_stream"},
+                )
         # Position protection depends on confirmed fills from this same snapshot.
         for item in snapshot.get("orders", []):
             if self._save_regular_order(item, source="okx-account-stream"):
@@ -457,7 +482,10 @@ class AccountSynchronizer:
             loader = getattr(self.account_client, "bills_today", None)
             return await loader(as_of=captured_at) if loader is not None else None
 
-        positions_result, pending_result, fills_result, bills_result = await asyncio.gather(
+        balance_loader = getattr(self.account_client, "balance", None)
+        account_scope = getattr(self.account_client, "account_scope", None)
+        balance_result, positions_result, pending_result, fills_result, bills_result = await asyncio.gather(
+            balance_loader() if callable(balance_loader) else asyncio.sleep(0, result=[]),
             self.account_client.positions(),
             self.account_client.pending_orders(),
             self.account_client.fills_history(),
@@ -481,6 +509,25 @@ class AccountSynchronizer:
             )
             return []
 
+        balance_saved = 0
+        if callable(balance_loader):
+            balance = _result("balance", balance_result)
+        else:
+            balance = []
+        if callable(balance_loader) and account_scope and "balance" not in errors:
+            try:
+                balance_saved = int(self.store.save_equity_snapshot(
+                    account_scope, int(captured_at.timestamp() * 1000),
+                    "rest_reconcile", balance,
+                ))
+            except ValueError:
+                errors.append("balance")
+                self.store.add_audit(
+                    "equity_snapshot_invalid",
+                    "REST equity snapshot was not persisted",
+                    severity="warning",
+                    payload={"source": "rest_reconcile"},
+                )
         positions = _result("positions", positions_result)
         pending_orders = _result("pending_orders", pending_result)
         fills = _result("fills_history", fills_result)
@@ -612,6 +659,7 @@ class AccountSynchronizer:
             "algo_orders": algo_orders,
             "fills": len(fills),
             "bills": bill_count,
+            "balances": balance_saved,
             "recovery": recovery,
         }
         if errors:

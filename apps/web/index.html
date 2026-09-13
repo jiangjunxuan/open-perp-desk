@@ -177,7 +177,7 @@
           </section>
 
           <section class="main-grid">
-            <article class="panel chart-panel" id="markets" data-views="overview markets" aria-labelledby="markets-title">
+	            <article class="panel chart-panel" id="markets" data-views="overview markets" aria-labelledby="markets-title">
               <div class="panel-heading chart-heading">
                 <div>
                   <div class="title-line">
@@ -187,7 +187,9 @@
                   </div>
                 </div>
                 <div class="quote-block">
+                  <span class="quote-label">最新价</span>
                   <strong id="market-price" class="quote-price">--</strong>
+                  <span id="market-change" class="quote-change mono">--</span>
                   <span id="market-tag" class="tag">读取中</span>
                 </div>
                 <button class="button secondary icon-button market-detail-toggle" id="toggle-market-details" type="button" aria-controls="market-stats" aria-expanded="false" aria-label="展开行情详情" title="展开行情详情"><i data-icon="chevron-right" aria-hidden="true"></i></button>
@@ -196,6 +198,8 @@
                 <div><span>日内变化</span><strong id="market-summary">--</strong></div>
                 <div><span>24H 高点</span><strong id="market-high">--</strong></div>
                 <div><span>24H 低点</span><strong id="market-low">--</strong></div>
+                <div><span>24H 成交量</span><strong id="market-volume">--</strong></div>
+                <div><span>24H 成交额</span><strong id="market-turnover">--</strong></div>
                 <div><span>资金费率</span><strong id="market-funding">--</strong></div>
                 <div><span id="market-oi-label">持仓量</span><strong id="market-oi">--</strong></div>
                 <div><span>盘口价差</span><strong id="market-spread">--</strong></div>
@@ -249,10 +253,33 @@
                 <div><span>卖一</span><strong id="best-ask" class="mono change-negative">--</strong></div>
                 <span class="quote-sync"><span id="quote-refresh-label">连接中</span><time id="market-updated" class="mono">--</time></span>
               </div>
-              <p class="sr-only" id="chart-a11y">合约价格图表，数据来自 OKX 公共行情。</p>
-            </article>
+	              <p class="sr-only" id="chart-a11y">合约价格图表，数据来自 OKX 公共行情。</p>
+	            </article>
 
-            <article class="panel safety-panel" id="risk" data-views="overview risk" aria-labelledby="risk-title">
+	            <article class="panel orderbook-panel" id="orderbook" data-views="markets" hidden aria-labelledby="orderbook-title">
+	              <div class="panel-heading orderbook-heading">
+	                <div>
+	                  <h2 id="orderbook-title">盘口</h2>
+	                  <span id="orderbook-state" class="subtle">等待实时深度</span>
+	                </div>
+	                <div class="orderbook-tabs" role="tablist" aria-label="市场深度视图">
+	                  <button type="button" role="tab" aria-selected="true">盘口</button>
+	                  <button type="button" role="tab" aria-selected="false" disabled>逐笔</button>
+	                </div>
+	              </div>
+	              <div class="orderbook-header" aria-hidden="true">
+	                <span>价格(USDT)</span><span>数量(BTC)</span><span>累计</span>
+	              </div>
+	              <div id="orderbook-asks" class="orderbook-side asks" aria-label="卖盘"></div>
+	              <div class="orderbook-mid">
+	                <strong id="orderbook-mid-price" class="mono">--</strong>
+	                <span id="orderbook-spread" class="mono">价差 --</span>
+	              </div>
+	              <div id="orderbook-bids" class="orderbook-side bids" aria-label="买盘"></div>
+	              <p id="orderbook-a11y" class="sr-only" role="status" aria-live="polite">盘口等待实时数据。</p>
+	            </article>
+
+	            <article class="panel safety-panel" id="risk" data-views="overview risk" aria-labelledby="risk-title">
               <div class="panel-heading">
                 <div>
                   <h2 id="risk-title">安全闸门</h2>

@@ -17,6 +17,7 @@ class OkxMarketStreamTests(unittest.TestCase):
             (item["channel"], item["instId"]) for item in message["args"]
         }
         self.assertIn(("tickers", "BTC-USDT-SWAP"), channels)
+        self.assertIn(("books5", "BTC-USDT-SWAP"), channels)
         self.assertNotIn(("candle1m", "ETH-USDT-SWAP"), channels)
         candles = self.stream.subscription_message(candles=True)
         self.assertEqual(
@@ -53,6 +54,24 @@ class OkxMarketStreamTests(unittest.TestCase):
         )
         self.assertIsNotNone(self.stream.last_message_at)
         self.assertIsNotNone(self.stream.candles_last_message_at)
+
+    def test_consume_caches_orderbook(self) -> None:
+        self.stream.connected = True
+        self.stream.consume(
+            json.dumps(
+                {
+                    "arg": {"channel": "books5", "instId": "BTC-USDT-SWAP"},
+                    "data": [{
+                        "asks": [["101", "2", "0", "1"]],
+                        "bids": [["99", "3", "0", "1"]],
+                        "ts": "1710000000000",
+                    }],
+                }
+            )
+        )
+        snapshot = self.stream.browser_snapshot("15m")
+        self.assertEqual(snapshot["order_books"]["BTC-USDT-SWAP"]["data"]["asks"][0][0], "101")
+        self.assertTrue(snapshot["order_books"]["BTC-USDT-SWAP"]["fresh"])
 
     def test_invalid_messages_do_not_change_state(self) -> None:
         self.stream.consume("not-json")
