@@ -13,6 +13,7 @@ from app.automation_worker import AutomationWorker
 from app.backtest import BacktestEngine
 from app.okx_trade import OkxTradeClient
 from app.okx_account import OkxAccountError
+from app.position_protection import attached_algo_client_id
 from app.pushplus import PushPlusClient
 from app.risk_engine import RiskEngine, RiskLimits
 from app.safety_control import SafetyController
@@ -975,6 +976,16 @@ class OrderTimestampAccountClient(FakeAccountClient):
 class ProtectedPositionAccountClient(FakeAccountClient):
     account_scope = "protected-fixture"
 
+    async def pending_algo_orders(self, **_kwargs):
+        return [{
+            "algoId": "native-entry-1", "algoClOrdId": attached_algo_client_id("entry-1"),
+            "instId": "BTC-USDT-SWAP", "posSide": "long", "tdMode": "isolated",
+            "side": "sell", "state": "live", "ordType": "oco", "sz": "1",
+            "slTriggerPx": "49000", "slTriggerPxType": "mark", "slOrdPx": "-1",
+            "tpTriggerPx": "52000", "tpTriggerPxType": "mark", "tpOrdPx": "-1",
+            "uTime": "1767225660000",
+        }]
+
     async def positions(self):
         return [{
             "instId": "BTC-USDT-SWAP",
@@ -1081,7 +1092,7 @@ class AccountSyncTests(unittest.TestCase):
         self.assertEqual(order["created_at"], "2026-01-01T00:00:00+00:00")
         self.assertEqual(order["updated_at"], "2026-01-01T00:01:00+00:00")
 
-    def test_position_sync_restores_local_protective_levels(self) -> None:
+    def test_position_sync_restores_verified_native_protective_levels(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(str(Path(directory) / "state.sqlite3"))
             store.save_order(

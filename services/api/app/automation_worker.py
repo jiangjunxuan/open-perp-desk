@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import math
 import os
 from datetime import datetime, timezone
@@ -218,6 +220,11 @@ class AutomationWorker:
                         })
                         continue
                     close_key = f"{symbol}:{position['position_key']}:{exit_event['reason']}"
+                    if exit_event.get("protection"):
+                        revision = hashlib.sha256(json.dumps(
+                            exit_event["protection"], sort_keys=True, allow_nan=False,
+                        ).encode()).hexdigest()[:24]
+                        close_key += f":protection:{revision}"
                     generation = position["lifecycle_generation"]
                     if generation:
                         close_key += f":lifecycle:{generation}"
@@ -240,6 +247,7 @@ class AutomationWorker:
                         idempotency_key=close_key,
                         market_data_fresh=self.market_data_fresh(),
                         expected_position_trade_id=position.get("exchange_trade_id"),
+                        expected_protection=exit_event.get("protection"),
                     )
                     if (
                         close_result.get("accepted")

@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -6,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app.account_sync import AccountSynchronizer
+from app.position_protection import attached_algo_client_id
 from app.state_store import StateStore
 
 
@@ -34,9 +36,25 @@ class ProtectionBindingTests(unittest.TestCase):
         record["raw"] = {
             "instId": record["inst_id"], "side": record["side"], "posSide": record["pos_side"],
             "tdMode": record["td_mode"], "ordId": record["exchange_order_id"], "clOrdId": name,
-            "tradeId": trade, "accFillSz": "1", **(raw or {}),
+            "tradeId": trade, "accFillSz": "1", "state": record["status"], "sz": str(record["size"]),
+            "uTime": "1000",
+            "attachAlgoOrds": [{
+                "attachAlgoClOrdId": attached_algo_client_id(name),
+                "slTriggerPx": str(record["stop_loss"]), "slTriggerPxType": "mark", "slOrdPx": "-1",
+                "tpTriggerPx": str(record["take_profit"]), "tpTriggerPxType": "mark", "tpOrdPx": "-1",
+            }], **(raw or {}),
         }
-        return self.store.save_order(record)
+        saved = self.store.save_order(record)
+        if record["status"] == "filled":
+            self.sync._save_algo_order({
+                **record["raw"]["attachAlgoOrds"][0], "algoId": f"algo-{name}",
+                "algoClOrdId": attached_algo_client_id(name), "instId": record["inst_id"],
+                "posSide": record["pos_side"], "tdMode": record["td_mode"],
+                "side": "sell" if record["side"] == "buy" else "buy", "reduceOnly": True,
+                "sz": str(record["size"]), "state": "live", "ordType": "oco",
+                "cTime": "1000", "uTime": "1000",
+            })
+        return saved
 
     def position(self, **changes):
         row = {
@@ -174,6 +192,121 @@ class ProtectionBindingTests(unittest.TestCase):
         self.sync._refresh_position_protection(row["position_key"])
         self.assert_unlinked(self.store.get_position(row["position_key"]))
         self.assertEqual(self.position()["protection_order_id"], "entry-1")
+
+    def native(self, name="entry-1", **changes):
+        current = self.store.get_order(attached_algo_client_id(name))
+        row = {**json.loads(current["raw_json"]), "uTime": "2000", **changes}
+        self.sync._save_algo_order(row)
+        return row
+
+    def test_external_amendment_replaces_opening_intent_even_with_unchanged_position(self):
+        self.entry()
+        row = self.position()
+        self.native(slTriggerPx="90", tpTriggerPx="120")
+        self.sync._refresh_position_protection(row["position_key"])
+        current = self.store.get_position(row["position_key"])
+        self.assertEqual((current["stop_loss"], current["take_profit"]), (90, 120))
+        self.assertEqual(self.store.get_order("entry-1")["stop_loss"], 95)
+
+    def test_canceled_triggered_paused_and_failed_native_orders_never_reuse_opening_terms(self):
+        for index, status in enumerate(("canceled", "effective", "pause", "order_failed", "partially_effective")):
+            name, trade = f"entry-{index}", f"trade-{index}"
+            self.entry(name, trade)
+            self.assertEqual(self.position(tradeId=trade)["protection_order_id"], name)
+            self.native(name, state=status)
+            self.assert_unlinked(self.position(tradeId=trade))
+
+    def test_filled_entry_without_native_evidence_does_not_use_historical_attached_terms(self):
+        self.entry()
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute("DELETE FROM orders WHERE order_kind = 'algo'")
+        self.assert_unlinked(self.position())
+
+    def test_native_quantity_never_expands_single_entry_protection_to_merged_position(self):
+        self.entry()
+        self.native(sz=".5")
+        self.assert_unlinked(self.position())
+        self.assertEqual(self.position(pos=".5")["protection_order_id"], "entry-1")
+        self.native(sz="2", uTime="3000")
+        self.assert_unlinked(self.position())
+        self.entry("entry-2", "trade-2")
+        self.assert_unlinked(self.position(tradeId="trade-2", pos="2"))
+
+    def test_unsupported_or_malformed_native_terms_pause_local_fallback(self):
+        for index, change in enumerate((
+            {"slTriggerPxType": "last"}, {"tpTriggerPxType": "index"}, {"slOrdPx": "94"},
+            {"slTriggerPx": "NaN"}, {"tpTriggerPx": "Infinity"}, {"slTriggerPx": "-1"},
+            {"slTriggerRatio": ".1"}, {"amendPxOnTriggerType": "1"}, {"closeFraction": "1"},
+            {"actualSz": ".5"}, {"sz": "NaN"}, {"ordType": "conditional"},
+            {"reduceOnly": False}, {"posSide": "short"}, {"side": "buy"}, {"tdMode": "cross"},
+        )):
+            name, trade = f"entry-{index}", f"trade-{index}"
+            self.entry(name, trade)
+            self.native(name, **change)
+            with self.subTest(change=change):
+                self.assert_unlinked(self.position(tradeId=trade))
+
+    def test_removing_one_leg_does_not_restore_the_original_leg(self):
+        self.entry()
+        self.native(tpTriggerPx="", tpOrdPx="", tpTriggerPxType="")
+        row = self.position()
+        self.assertEqual(row["stop_loss"], 95)
+        self.assertIsNone(row["take_profit"])
+
+    def test_partial_fill_uses_current_exchange_attached_terms_and_not_local_intent(self):
+        self.entry(status="partially_filled", raw={"accFillSz": ".5"})
+        self.entry(status="partially_filled", raw={"accFillSz": ".5", "attachAlgoOrds": [{
+            "attachAlgoClOrdId": attached_algo_client_id("entry-1"),
+            "slTriggerPx": "90", "slTriggerPxType": "mark", "slOrdPx": "-1",
+        }]})
+        row = self.position(pos=".5")
+        self.assertEqual(row["stop_loss"], 90)
+        self.assertIsNone(row["take_profit"])
+        self.entry(status="partially_filled", raw={"accFillSz": ".5", "attachAlgoOrds": []})
+        self.assert_unlinked(self.position(pos=".5"))
+
+    def test_canceled_native_evidence_survives_restart_without_restoring_old_levels(self):
+        self.entry()
+        self.native(state="canceled")
+        self.assert_unlinked(self.position())
+        reopened = StateStore(str(self.path))
+        self.sync = AccountSynchronizer(reopened, self.account, self.stream)
+        self.sync._refresh_position_protection(f"{SYMBOL}:net:isolated")
+        self.assertIsNone(reopened.list_positions()[0]["stop_loss"])
+
+    def test_native_snapshot_with_no_exchange_timestamp_never_binds(self):
+        self.entry()
+        native = self.store.get_order(attached_algo_client_id("entry-1"))
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            raw = json.loads(native["raw_json"])
+            raw["uTime"] = ""
+            connection.execute(
+                "UPDATE orders SET raw_json = ? WHERE client_order_id = ?",
+                (json.dumps(raw), native["client_order_id"]),
+            )
+        self.assert_unlinked(self.position())
+
+    def test_native_push_updates_protection_without_a_position_event_or_private_connection(self):
+        self.entry()
+        row = self.position()
+        algo = self.native(slTriggerPx="90")
+        self.sync.algo_stream = SimpleNamespace(snapshot=lambda: {
+            "connected": True, "authenticated": True, "orders": [algo],
+        })
+        self.stream.snapshot = lambda: {"configured": True, "connected": False, "authenticated": False}
+        self.sync.sync_stream()
+        current = self.store.get_position(row["position_key"])
+        self.assertEqual(current["stop_loss"], 90)
+        self.assertEqual(current["size"], 1)
+
+    def test_older_native_snapshot_cannot_undo_external_amendment_or_cancellation(self):
+        self.entry()
+        self.native(slTriggerPx="90", uTime="3000")
+        self.native(slTriggerPx="95", uTime="2000")
+        self.assertEqual(self.position()["stop_loss"], 90)
+        self.native(state="canceled", uTime="4000")
+        self.native(state="live", uTime="5000")
+        self.assert_unlinked(self.position())
 
 
 if __name__ == "__main__":

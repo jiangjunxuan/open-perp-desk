@@ -15,9 +15,11 @@ from app.execution_engine import ExecutionEngine
 from app.okx_account import OkxAccountClient, OkxAccountError
 from app.okx_trade import OkxOrderRejected, OkxTradeClient, OkxTradeError, OrderRequest
 from app.order_preflight import OrderPreflight, PreflightError
+from app.position_protection import protection_evidence
 from app.risk_engine import RiskEngine, RiskLimits
 from app.state_store import ExposureSnapshotChanged, StateStore
 from app.trading_signal import TradeSignal
+from tests.test_order_recovery import exchange_order, protection_order, snapshot_order
 
 
 def instrument(symbol="BTC-USDT-SWAP"):
@@ -218,6 +220,89 @@ class OrderPreflightTests(unittest.IsolatedAsyncioTestCase):
         accepted = await self.submit(signal, expected_position_trade_id="current-trade")
         self.assertTrue(accepted["accepted"])
         self.assertEqual(len(self.trade.orders), 1)
+
+    def native_close(self):
+        opening = self.store.save_order(snapshot_order(
+            status="filled", source="structured-technical", account_scope=self.account.account_scope,
+            raw=exchange_order(), stop_loss=95, take_profit=110,
+        ))
+        self.account.position_rows = [{**position(size="1"), "tradeId": "entry-trade"}]
+        self.account.algo_rows = [protection_order()]
+        proof = protection_evidence(opening, self.account.algo_rows[0], native=True, position_size=1)
+        signal = TradeSignal(
+            inst_id="BTC-USDT-SWAP", action="close", confidence=1,
+            leverage=1, position_pct=0, source="protective-stop_loss",
+        )
+        return signal, proof
+
+    async def test_native_protective_close_requires_current_verified_parameters(self):
+        signal, proof = self.native_close()
+        result = await self.submit(
+            signal, size=1, expected_position_trade_id="entry-trade", expected_protection=proof,
+        )
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(len(self.trade.orders), 1)
+        self.assertTrue(self.trade.orders[0].reduce_only)
+        self.assertEqual(json.loads(result["order"]["raw_json"])["expected_protection"], proof)
+
+    async def test_external_change_between_trigger_and_preflight_prevents_submission(self):
+        signal, proof = self.native_close()
+        for changes in (
+            {"slTriggerPx": "90"}, {"tpTriggerPx": "120"}, {"slTriggerPxType": "last"},
+            {"tpOrdPx": "110"}, {"state": "canceled"}, {"state": "effective"},
+            {"sz": ".5"}, {"sz": "2"}, {"posSide": "short"}, {"tdMode": "cross"},
+            {"side": "buy"}, {"algoId": "replacement"}, {"algoClOrdId": "different"},
+        ):
+            self.account.algo_rows = [protection_order(**changes)]
+            result = await self.submit(
+                signal, size=1, expected_position_trade_id="entry-trade", expected_protection=proof,
+            )
+            self.assertFalse(result["accepted"], changes)
+            self.assertIn("close_protection_changed", result["reasons"], changes)
+        self.assertEqual(self.trade.orders, [])
+
+    async def test_missing_or_duplicate_native_snapshot_cannot_execute_cached_protection(self):
+        signal, proof = self.native_close()
+        for rows in ([], [protection_order(), protection_order()]):
+            self.account.algo_rows = rows
+            result = await self.submit(
+                signal, size=1, expected_position_trade_id="entry-trade", expected_protection=proof,
+            )
+            self.assertIn("close_protection_changed", result["reasons"])
+        self.assertEqual(self.trade.orders, [])
+
+    async def test_protective_execution_without_evidence_is_rejected(self):
+        signal, _proof = self.native_close()
+        result = await self.submit(signal, size=1, expected_position_trade_id="entry-trade")
+        self.assertIn("close_protection_unverified", result["reasons"])
+        self.assertEqual(self.trade.orders, [])
+
+    async def test_partial_fill_fallback_rechecks_current_parent_attached_terms(self):
+        parent = exchange_order(state="partially_filled", accFillSz=".5", attachAlgoOrds=[{
+            **protection_order(), "sz": "", "attachAlgoClOrdId": protection_order()["algoClOrdId"],
+        }])
+        opening = self.store.save_order(snapshot_order(
+            status="partially_filled", source="structured-technical", account_scope=self.account.account_scope,
+            raw=parent,
+        ))
+        self.account.position_rows = [{**position(size=".5"), "tradeId": "entry-trade"}]
+        self.account.pending_rows = [parent]
+        proof = protection_evidence(opening, parent, native=False, position_size=.5)
+        self.assertIsNotNone(proof)
+        signal = TradeSignal(
+            inst_id="BTC-USDT-SWAP", action="close", confidence=1,
+            leverage=1, position_pct=0, source="protective-stop_loss",
+        )
+        self.account.pending_rows = [{**parent, "attachAlgoOrds": []}]
+        rejected = await self.submit(
+            signal, size=.5, expected_position_trade_id="entry-trade", expected_protection=proof,
+        )
+        self.assertIn("close_protection_changed", rejected["reasons"])
+        self.account.pending_rows = [parent]
+        accepted = await self.submit(
+            signal, size=.5, expected_position_trade_id="entry-trade", expected_protection=proof,
+        )
+        self.assertTrue(accepted["accepted"], accepted)
 
     async def test_pending_and_position_exposure_share_account_budget(self):
         self.account.position_rows = [position(notional="150")]

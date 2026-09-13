@@ -11,6 +11,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .live_safety import LiveSafetyGate
+from .position_protection import attached_algo_client_id
 
 
 class OkxTradeError(RuntimeError):
@@ -71,9 +72,7 @@ class OrderRequest(BaseModel):
                 "tpOrdKind": "condition",
             }
             if self.cl_ord_id:
-                attached["attachAlgoClOrdId"] = (
-                    "opdp" + hashlib.sha256(self.cl_ord_id.encode()).hexdigest()[:24]
-                )
+                attached["attachAlgoClOrdId"] = attached_algo_client_id(self.cl_ord_id)
             if self.take_profit is not None:
                 attached.update(
                     {

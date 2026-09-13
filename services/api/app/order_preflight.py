@@ -8,6 +8,7 @@ from .okx_account import OkxAccountClient
 from .account_ledger import AccountLedgerError, parse_daily_bills, value_daily_risk
 from .okx_market import OkxMarketClient
 from .state_store import StateStore
+from .position_protection import protection_evidence
 from .trading_signal import TradeSignal
 
 
@@ -165,6 +166,7 @@ class OrderPreflight:
         side_override: str | None = None,
         *,
         expected_position_trade_id: str | None = None,
+        expected_protection: dict[str, Any] | None = None,
     ) -> PreparedExecution:
         if not self.configured:
             raise PreflightError("private_account_not_configured")
@@ -261,6 +263,27 @@ class OrderPreflight:
                 raise PreflightError("close_position_mode_unknown")
             if (position_mode == "net_mode") != (pos_side == "net"):
                 raise PreflightError("position_mode_mismatch")
+            if signal.source.startswith("protective-"):
+                if expected_protection is None or not expected_position_trade_id:
+                    raise PreflightError("close_protection_unverified")
+                opening = self.store.get_order(expected_protection.get("opening_order_id", ""))
+                if (
+                    not opening or opening["account_scope"] != self.account.account_scope
+                    or opening["inst_id"] != signal.inst_id or opening["pos_side"] != pos_side
+                    or opening["td_mode"] != td_mode
+                ):
+                    raise PreflightError("close_protection_unverified")
+                native = expected_protection.get("kind") == "native"
+                matches = [
+                    row for row in (algos if native else pending)
+                    if row.get("algoClOrdId" if native else "clOrdId")
+                    == expected_protection.get("algo_client_id" if native else "opening_order_id")
+                ]
+                current = protection_evidence(
+                    opening, matches[0], native=native, position_size=float(position_size),
+                ) if len(matches) == 1 else None
+                if current is None or current != expected_protection:
+                    raise PreflightError("close_protection_changed")
             if any(
                 row.get("instId") == signal.inst_id and row.get("side") == side
                 and row.get("posSide") in {pos_side, None, ""}

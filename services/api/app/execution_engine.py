@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from .okx_trade import OkxOrderRejected, OkxTradeClient, OrderRequest
 from .order_preflight import OrderPreflight, PreflightError, PreparedExecution
+from .position_protection import linked_protection
 from .pushplus import PushPlusClient, PushPlusError
 from .risk_engine import RiskEngine
 from .safety_control import SafetyController
@@ -89,6 +90,7 @@ class ExecutionEngine:
         idempotency_key: str | None = None,
         market_data_fresh: bool = True,
         expected_position_trade_id: str | None = None,
+        expected_protection: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not self.safety.execution_allowed:
             self.store.add_audit(
@@ -133,7 +135,13 @@ class ExecutionEngine:
             if not dry_run and not self.trade_client.enabled:
                 return await self._preflight_rejection(signal, "execution_disabled")
             try:
-                if expected_position_trade_id is not None:
+                if expected_protection is not None:
+                    prepared = await self.preflight.prepare(
+                        signal, size, side_override,
+                        expected_position_trade_id=expected_position_trade_id,
+                        expected_protection=expected_protection,
+                    )
+                elif expected_position_trade_id is not None:
                     prepared = await self.preflight.prepare(
                         signal, size, side_override,
                         expected_position_trade_id=expected_position_trade_id,
@@ -211,6 +219,7 @@ class ExecutionEngine:
                 "signal": signal.model_dump(mode="json"),
                 "preflight": prepared.summary() if prepared else {"basis": "simulation"},
                 "expected_position_trade_id": expected_position_trade_id,
+                "expected_protection": expected_protection,
             },
             "risk_notional": prepared.order_notional if prepared and not reduce_only else 0.0,
             "account_scope": prepared.account_scope if prepared else None,
@@ -355,6 +364,15 @@ class ExecutionEngine:
             take_profit = position["take_profit"]
             if not stop_loss and not take_profit:
                 continue
+            evidence = None
+            if position.get("protection_order_id"):
+                evidence = linked_protection(
+                    self.store, inst_id, position["pos_side"], position["size"],
+                    td_mode=position["td_mode"], account_scope=position["account_scope"],
+                    trade_id=position["exchange_trade_id"],
+                )
+                if evidence is None or (evidence["stop_loss"], evidence["take_profit"]) != (stop_loss, take_profit):
+                    continue
             is_long = position["pos_side"] in {"long", "net"} and position["size"] > 0
             hit_stop = bool(stop_loss and ((is_long and mark_price <= stop_loss) or (not is_long and mark_price >= stop_loss)))
             hit_target = bool(take_profit and ((is_long and mark_price >= take_profit) or (not is_long and mark_price <= take_profit)))
@@ -365,6 +383,7 @@ class ExecutionEngine:
                     "reason": reason,
                     "mark_price": mark_price,
                     "position": position,
+                    "protection": evidence,
                 }
         return None
 

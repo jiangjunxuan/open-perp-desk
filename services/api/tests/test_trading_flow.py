@@ -103,6 +103,46 @@ class TradingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.exchange.order_submissions), 1)
         self.assertEqual(self.exchange.errors, [])
 
+    async def test_external_native_amendment_push_and_missing_cancellation_recovery(self):
+        submitted = await self.api.request("POST", "/execution/signals", await self.signal_payload())
+        self.assertTrue(submitted["accepted"], submitted)
+        self.exchange.fill(submitted["order"]["exchange_order_id"])
+        await self.synchronize()
+        before = (await self.api.request("GET", "/positions"))["data"][0]
+        algo_id = next(iter(self.exchange.algos))
+        with self.exchange.lock:
+            algo = self.exchange.algos[algo_id]
+            updated_stop = float(algo["slTriggerPx"]) - 1
+            algo.update(slTriggerPx=str(updated_stop), uTime=str(int(algo["uTime"]) + 100))
+            self.exchange.private_paused = False
+            self.exchange.revision += 1
+
+        async def amendment_arrived():
+            rows = (await self.api.request("GET", "/positions"))["data"]
+            return rows and rows[0]["stop_loss"] == updated_stop
+
+        await eventually(amendment_arrived)
+        after = (await self.api.request("GET", "/positions"))["data"][0]
+        self.assertEqual(after["size"], before["size"])
+        self.assertEqual(after["exchange_trade_id"], before["exchange_trade_id"])
+        with self.exchange.lock:
+            self.exchange.private_paused = True
+            self.exchange.hide_algo_history = True
+            algo.update(state="canceled", uTime=str(int(algo["uTime"]) + 100))
+            self.exchange.revision += 1
+        await self.synchronize()
+        canceled = (await self.api.request("GET", "/positions"))["data"][0]
+        self.assertIsNone(canceled["stop_loss"])
+        self.assertIsNone(canceled["take_profit"])
+        self.assertEqual(canceled["size"], before["size"])
+        self.assertTrue(any(row["path"] == "/api/v5/trade/order-algo" for row in self.exchange.gets))
+        await self.api.stop()
+        await self.api.start()
+        self.assertIsNone((await self.api.request("GET", "/positions"))["data"][0]["stop_loss"])
+        self.assertEqual(len(self.exchange.order_submissions), 1)
+        self.assertFalse(any(row["path"] == "/api/v5/trade/cancel-algos" for row in self.exchange.posts))
+        self.assertEqual(self.exchange.errors, [])
+
     async def test_submission_crash_exact_lookup_and_no_resend(self):
         payload = await self.signal_payload()
         self.exchange.hold_order_response = True

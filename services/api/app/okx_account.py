@@ -374,6 +374,28 @@ class OkxAccountClient:
             ))
         return rows
 
+    async def algo_order_details(
+        self,
+        inst_id: str,
+        *,
+        algo_id: str | None = None,
+        client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not inst_id or not (algo_id or client_order_id):
+            raise OkxAccountError("Algo instrument and identity are required")
+        params = {"algoId": algo_id} if algo_id else {"algoClOrdId": str(client_order_id)}
+        rows = await self._get("/api/v5/trade/order-algo", params)
+        if len(rows) != 1 or not isinstance(rows[0], dict):
+            raise OkxAccountError("Exact algo lookup did not return one order")
+        row = rows[0]
+        if row.get("instId") != inst_id or not row.get("algoId"):
+            raise OkxAccountError("Algo lookup identity mismatch")
+        if algo_id and row["algoId"] != algo_id:
+            raise OkxAccountError("Algo lookup exchange identity mismatch")
+        if client_order_id and row.get("algoClOrdId") != client_order_id:
+            raise OkxAccountError("Algo lookup client identity mismatch")
+        return row
+
     async def order_details(
         self,
         inst_id: str,

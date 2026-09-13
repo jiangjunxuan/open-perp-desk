@@ -10,6 +10,7 @@ from .okx_account import OkxAccountClient, OkxAccountError
 from .okx_algo_stream import OkxAlgoOrderStream
 from .okx_account_stream import OkxAccountStream
 from .account_ledger import AccountLedgerError, parse_daily_bills
+from .position_protection import linked_protection
 from .state_store import OrderSnapshotConflict, StateStore
 
 
@@ -47,14 +48,6 @@ def _exchange_ms(value: Any) -> int | None:
 
 def _now_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
-
-
-def _position_side_for_order(pos_side: str, size: float) -> str:
-    if pos_side == "long":
-        return "buy"
-    if pos_side == "short":
-        return "sell"
-    return "buy" if size >= 0 else "sell"
 
 
 def _position_key(item: dict[str, Any]) -> str:
@@ -166,40 +159,15 @@ class AccountSynchronizer:
         trade_id: str | None,
     ) -> tuple[float | None, float | None, str | None]:
         empty = (None, None, None)
-        if (
-            not account_scope or account_scope != getattr(self.account_client, "account_scope", None)
-            or not trade_id or not math.isfinite(size) or not size
-            or pos_side not in {"net", "long", "short"} or td_mode not in {"cross", "isolated"}
-        ):
+        if account_scope != getattr(self.account_client, "account_scope", None):
             return empty
-        expected_side = _position_side_for_order(pos_side, size)
-        orders = self.store.protection_orders(inst_id, account_scope, pos_side, td_mode, trade_id)
-        if len(orders) != 1:
-            return empty
-        order = orders[0]
-        try:
-            raw = json.loads(order["raw_json"])
-            if not isinstance(raw, dict) or any(raw.get(field) != expected for field, expected in (
-                ("instId", inst_id), ("posSide", pos_side), ("tdMode", td_mode),
-                ("side", expected_side), ("ordId", order["exchange_order_id"]),
-                ("clOrdId", order["client_order_id"]),
-            )) or not order["exchange_order_id"] or order["side"] != expected_side:
-                return empty
-            filled = Decimal(str(raw.get("accFillSz")))
-            requested = Decimal(str(order["size"]))
-            if (
-                not filled.is_finite() or not requested.is_finite()
-                or not 0 < abs(Decimal(str(size))) <= filled <= requested
-            ):
-                return empty
-            levels = (order.get("stop_loss"), order.get("take_profit"))
-            if not any(value is not None for value in levels) or any(
-                value is not None and (not math.isfinite(value) or value <= 0) for value in levels
-            ):
-                return empty
-        except (ValueError, TypeError, InvalidOperation):
-            return empty
-        return levels[0], levels[1], order["client_order_id"]
+        evidence = linked_protection(
+            self.store, inst_id, pos_side, size, td_mode=td_mode,
+            account_scope=account_scope, trade_id=trade_id,
+        )
+        return (
+            evidence["stop_loss"], evidence["take_profit"], evidence["opening_order_id"],
+        ) if evidence else empty
 
     def _protection_unlinked(self, previous: dict[str, Any] | None, owner: str | None, size: float) -> None:
         if not previous or owner or not size or not (previous["stop_loss"] or previous["take_profit"]):
@@ -207,12 +175,12 @@ class AccountSynchronizer:
         payload = {"inst_id": previous["inst_id"], "reason": "position_protection_unverified"}
         self.store.add_audit(
             "position_protection_unverified",
-            "Local protection was not linked to the current position trade",
+            "Current position trade or native protection terms could not be verified",
             severity="warning", payload=payload,
         )
         self._schedule_notification(
             "position_protection_unverified", "OpenPerpDesk 本地保护关联待核对",
-            f"{previous['inst_id']} 的当前持仓无法关联已验证开仓成交，未套用历史保护价；请核对交易所原生保护单。",
+            f"{previous['inst_id']} 的成交关联或当前原生保护参数无法核实，已暂停该持仓本地兜底；请核对交易所原生保护单。",
             severity="warning", payload=payload,
         )
 
@@ -232,8 +200,10 @@ class AccountSynchronizer:
         previous = self.store.get_order(client_order_id)
         side, pos_side = _text(item.get("side"), "unknown"), _text(item.get("posSide"), "net")
         size = _number(item.get("sz"))
-        if size <= 0:
+        if not math.isfinite(size) or size <= 0:
             size = _number(item.get("actualSz"))
+        if not math.isfinite(size) or size < 0:
+            size = 0.0
         saved, applied = self.store.save_exchange_order(
             {
                 "client_order_id": client_order_id,
@@ -438,20 +408,30 @@ class AccountSynchronizer:
 
     def sync_stream(self) -> dict[str, Any]:
         snapshot = self.account_stream.snapshot()
+        algo_orders = 0
+        if self.algo_stream is not None:
+            algo_snapshot = self.algo_stream.snapshot()
+            if algo_snapshot.get("connected") and algo_snapshot.get("authenticated"):
+                for item in algo_snapshot.get("orders", []):
+                    if self._save_algo_order(item):
+                        algo_orders += 1
         # A disconnected private stream may still contain the last valid
         # event. Never re-apply that stale cache as current account state.
         if snapshot.get("configured") is not None and not (
             snapshot.get("connected") and snapshot.get("authenticated")
         ):
+            for position in self.store.list_positions():
+                self._refresh_position_protection(position["position_key"])
             return {
                 "positions": 0,
-                "orders": 0,
+                "orders": algo_orders,
+                "algo_orders": algo_orders,
                 "fills": 0,
                 "balances": 0,
                 "skipped": "private_stream_not_ready",
             }
         positions = 0
-        orders = 0
+        orders = algo_orders
         balances = 0
         if snapshot.get("balance"):
             try:
@@ -489,14 +469,8 @@ class AccountSynchronizer:
                 self._position_versions[key] = self._position_versions.get(key, 0) + 1
                 positions += 1
             self._stream_position_tokens[key] = token
-        algo_orders = 0
-        if self.algo_stream is not None:
-            algo_snapshot = self.algo_stream.snapshot()
-            if algo_snapshot.get("connected") and algo_snapshot.get("authenticated"):
-                for item in algo_snapshot.get("orders", []):
-                    if self._save_algo_order(item):
-                        orders += 1
-                        algo_orders += 1
+        for position in self.store.list_positions():
+            self._refresh_position_protection(position["position_key"])
         stream_fills = 0
         for item in snapshot.get("fills", []):
             record, is_new_fill = self._save_fill(item, update_existing=False)
@@ -670,6 +644,20 @@ class AccountSynchronizer:
         if recovery["unresolved"]:
             errors.append("order_recovery")
 
+        algo_orders = 0
+        seen_algo_ids: set[str] = set()
+        for item in [*algo_pending, *algo_history]:
+            try:
+                if self._save_algo_order(item, source="okx-algo-rest"):
+                    algo_orders += 1
+                    seen_algo_ids.add(str(item.get("algoId") or ""))
+            except OrderSnapshotConflict:
+                if "algo_identity" not in errors:
+                    errors.append("algo_identity")
+        algo_recovery = await self._recover_algo_orders(seen_algo_ids)
+        if algo_recovery["unresolved"]:
+            errors.append("algo_recovery")
+
         seen_position_keys: set[str] = set()
         for item in positions:
             position_key = _position_key(item)
@@ -709,10 +697,8 @@ class AccountSynchronizer:
                         "realized_pnl": record["realized_pnl"],
                     },
                 )
-        algo_orders = 0
-        for item in [*algo_pending, *algo_history]:
-            if self._save_algo_order(item, source="okx-algo-rest"):
-                algo_orders += 1
+        for position in self.store.list_positions():
+            self._refresh_position_protection(position["position_key"])
         result: dict[str, Any] = {
             "positions": len(positions),
             "orders": len(seen_order_ids),
@@ -721,6 +707,7 @@ class AccountSynchronizer:
             "bills": bill_count,
             "balances": balance_saved,
             "recovery": recovery,
+            "algo_recovery": algo_recovery,
         }
         if errors:
             result["errors"] = errors
@@ -731,6 +718,47 @@ class AccountSynchronizer:
                 payload={"errors": errors},
                 severity="warning",
             )
+        return result
+
+    async def _recover_algo_orders(self, seen_ids: set[str]) -> dict[str, int]:
+        result = {"checked": 0, "recovered": 0, "unresolved": 0}
+        loader = getattr(self.account_client, "algo_order_details", None)
+        _, active = self.store.execution_snapshot()
+        for order in active:
+            if order["order_kind"] != "algo" or order.get("exchange_order_id") in seen_ids:
+                continue
+            result["checked"] += 1
+            try:
+                scope = getattr(self.account_client, "account_scope", None)
+                if not loader or not scope or order.get("account_scope") != scope:
+                    raise OrderSnapshotConflict("algo_account_scope_unverified")
+                raw = json.loads(order["raw_json"])
+                client_id = raw.get("algoClOrdId") or None
+                item = await loader(
+                    order["inst_id"], algo_id=order.get("exchange_order_id"),
+                    client_order_id=client_id,
+                )
+                if (
+                    not isinstance(item, dict) or item.get("instId") != order["inst_id"]
+                    or item.get("algoId") != order["exchange_order_id"]
+                    or (client_id and item.get("algoClOrdId") != client_id)
+                    or not _exchange_ms(item.get("uTime"))
+                    or item.get("state") not in {
+                        "live", "pause", "partially_effective", "effective", "canceled",
+                        "order_failed", "partially_failed",
+                    }
+                ):
+                    raise OrderSnapshotConflict("algo_lookup_identity_mismatch")
+                self._save_algo_order(item, source="okx-algo-recovery")
+                result["recovered"] += 1
+            except Exception as exc:
+                result["unresolved"] += 1
+                self.store.add_audit(
+                    "algo_order_recovery_unresolved",
+                    "Missing native protection was not assumed canceled",
+                    severity="warning",
+                    payload={"client_order_id": order["client_order_id"], "error": type(exc).__name__},
+                )
         return result
 
     async def _recover_orders(self, seen_order_ids: set[str]) -> dict[str, int]:

@@ -44,6 +44,7 @@ class ExchangeServer:
         self.subscriptions = {}
         self.private_paused = True
         self.hide_order_history = False
+        self.hide_algo_history = False
         self.autofill = False
         self.hold_order_response = False
         self.release_order_response = threading.Event()
@@ -181,7 +182,15 @@ class ExchangeServer:
             types = query.get("ordType", [""])[0].split(",")
             return [algo for algo in self.algos.values() if algo["state"] == "live" and algo["ordType"] in types]
         if path == "/api/v5/trade/orders-algo-history":
-            return [algo for algo in self.algos.values() if algo["state"] == query.get("state", [""])[0]]
+            return [] if self.hide_algo_history else [
+                algo for algo in self.algos.values() if algo["state"] == query.get("state", [""])[0]
+            ]
+        if path == "/api/v5/trade/order-algo":
+            algo_id = query.get("algoId", [None])[0]
+            client_id = query.get("algoClOrdId", [None])[0]
+            algo = next((row for row in self.algos.values() if
+                (algo_id and row["algoId"] == algo_id) or (client_id and row["algoClOrdId"] == client_id)), None)
+            return [algo] if algo else None
         if path == "/api/v5/trade/order":
             order_id = query.get("ordId", [None])[0]
             client_id = query.get("clOrdId", [None])[0]

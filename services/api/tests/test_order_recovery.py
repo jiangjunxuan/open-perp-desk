@@ -20,6 +20,7 @@ from app.account_sync import AccountSynchronizer
 from app.execution_engine import ExecutionEngine
 from app.okx_account import OkxAccountClient, OkxAccountError
 from app.okx_trade import OkxTradeClient
+from app.position_protection import attached_algo_client_id
 from app.order_preflight import PreparedExecution
 from app.risk_engine import RiskEngine
 from app.state_store import OrderSnapshotConflict, StateStore
@@ -55,6 +56,17 @@ def snapshot_order(**overrides):
         "status": "live", "source": "okx-rest-orders", "account_scope": "account-a",
         "exchange_updated_ms": 1000, "raw": {"state": "live", "uTime": "1000"},
         **overrides,
+    }
+
+
+def protection_order(**overrides):
+    return {
+        "algoId": "algo1", "algoClOrdId": attached_algo_client_id("local1"),
+        "instId": "BTC-USDT-SWAP", "posSide": "net", "tdMode": "isolated",
+        "side": "sell", "reduceOnly": True, "sz": "1", "state": "live", "ordType": "oco",
+        "slTriggerPx": "95", "slTriggerPxType": "mark", "slOrdPx": "-1",
+        "tpTriggerPx": "110", "tpTriggerPxType": "mark", "tpOrdPx": "-1",
+        "cTime": "1000", "uTime": "1000", **overrides,
     }
 
 
@@ -147,6 +159,34 @@ class AccountContractTests(unittest.IsolatedAsyncioTestCase):
                 return httpx.Response(200, json={"code": "0", "data": rows})
             with self.subTest(rows=rows), self.assertRaises(OkxAccountError):
                 await self.client(handler).order_details("BTC-USDT-SWAP", ord_id="exchange1", client_order_id="local1")
+
+    async def test_exact_algo_lookup_uses_signed_id_query_and_validates_both_identities(self):
+        calls = []
+
+        async def handler(request):
+            self.assert_signed(request)
+            self.assertEqual(request.url.path, "/api/v5/trade/order-algo")
+            calls.append(dict(request.url.params))
+            return httpx.Response(200, json={"code": "0", "data": [protection_order()]})
+
+        client = self.client(handler)
+        client_id = attached_algo_client_id("local1")
+        await client.algo_order_details("BTC-USDT-SWAP", client_order_id=client_id)
+        await client.algo_order_details("BTC-USDT-SWAP", algo_id="algo1", client_order_id=client_id)
+        self.assertEqual(calls, [{"algoClOrdId": client_id}, {"algoId": "algo1"}])
+
+    async def test_exact_algo_lookup_rejects_missing_ambiguous_or_wrong_identities(self):
+        for rows in (
+            [], [protection_order(), protection_order()], [None],
+            [protection_order(instId="ETH-USDT-SWAP")], [protection_order(algoId="other")],
+            [protection_order(algoClOrdId="other")],
+        ):
+            async def handler(_request):
+                return httpx.Response(200, json={"code": "0", "data": rows})
+            with self.subTest(rows=rows), self.assertRaises(OkxAccountError):
+                await self.client(handler).algo_order_details(
+                    "BTC-USDT-SWAP", algo_id="algo1", client_order_id=attached_algo_client_id("local1"),
+                )
 
     async def test_not_found_preserves_exchange_code(self):
         async def handler(_request):
@@ -249,6 +289,8 @@ class SnapshotAccount:
         self.pending = []
         self.history = []
         self.algos = []
+        self.algo_result = None
+        self.algo_lookups = []
         self.position_rows = []
 
     async def positions(self):
@@ -268,6 +310,12 @@ class SnapshotAccount:
 
     async def algo_orders_history(self, **_kwargs):
         return []
+
+    async def algo_order_details(self, inst_id, **kwargs):
+        self.algo_lookups.append((inst_id, kwargs))
+        if isinstance(self.algo_result, BaseException):
+            raise self.algo_result
+        return self.algo_result
 
     async def order_details(self, inst_id, **kwargs):
         self.lookups.append((inst_id, kwargs))
@@ -358,6 +406,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_rest_attaches_protection_on_first_filled_snapshot(self):
         self.intent(stop_loss=95, take_profit=110)
         self.account.history = [exchange_order()]
+        self.account.algos = [protection_order()]
         self.account.position_rows = [{
             "instId": "BTC-USDT-SWAP", "posSide": "net", "pos": "1",
             "mgnMode": "isolated", "avgPx": "100", "markPx": "100",
@@ -372,7 +421,9 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.intent(stop_loss=95, take_profit=110)
         snapshot = {
             "configured": True, "connected": True, "authenticated": True,
-            "orders": [exchange_order(state="partially_filled", accFillSz=".5")],
+            "orders": [exchange_order(state="partially_filled", accFillSz=".5", attachAlgoOrds=[{
+                **protection_order(), "sz": "", "attachAlgoClOrdId": attached_algo_client_id("local1"),
+            }])],
             "positions": [{
                 "instId": "BTC-USDT-SWAP", "posSide": "net", "pos": ".5",
                 "mgnMode": "isolated", "avgPx": "100", "markPx": "100",
@@ -384,6 +435,54 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         position = self.store.list_positions()[0]
         self.assertEqual(position["size"], .5)
         self.assertEqual((position["stop_loss"], position["take_profit"]), (95, 110))
+
+    async def test_missing_native_order_is_exactly_recovered_before_position_protection(self):
+        self.intent(stop_loss=95, take_profit=110)
+        self.account.history = [exchange_order()]
+        self.account.position_rows = [{
+            "instId": "BTC-USDT-SWAP", "posSide": "net", "pos": "1", "mgnMode": "isolated",
+            "avgPx": "100", "tradeId": "entry-trade",
+        }]
+        self.account.algos = [protection_order()]
+        await self.sync.sync_rest()
+        self.assertEqual(self.store.list_positions()[0]["stop_loss"], 95)
+        self.account.algos = []
+        self.account.algo_result = protection_order(state="canceled", uTime="2000")
+        result = await self.sync.sync_rest()
+        self.assertNotIn("errors", result)
+        self.assertEqual(result["algo_recovery"], {"checked": 1, "recovered": 1, "unresolved": 0})
+        self.assertIsNone(self.store.list_positions()[0]["stop_loss"])
+        self.assertEqual(self.account.algo_lookups, [(
+            "BTC-USDT-SWAP", {"algo_id": "algo1", "client_order_id": attached_algo_client_id("local1")},
+        )])
+
+    async def test_missing_native_lookup_failure_is_unresolved_not_cancellation(self):
+        self.sync._save_algo_order(protection_order())
+        for result in (
+            OkxAccountError("not found", code="51603"), TimeoutError("private-proxy-secret"),
+            protection_order(algoId="another"), protection_order(instId="ETH-USDT-SWAP"),
+            protection_order(algoClOrdId="another"), protection_order(uTime=""),
+        ):
+            self.account.algo_result = result
+            response = await self.sync.sync_rest()
+            self.assertIn("algo_recovery", response["errors"])
+            self.assertEqual(response["algo_recovery"]["unresolved"], 1)
+            self.assertEqual(self.store.get_order(attached_algo_client_id("local1"))["status"], "live")
+        self.assertNotIn("private-proxy-secret", str(self.store.list_audit()))
+
+    async def test_native_recovery_cancellation_propagates_without_resubmission(self):
+        self.sync._save_algo_order(protection_order())
+        self.account.algo_result = asyncio.CancelledError()
+        with self.assertRaises(asyncio.CancelledError):
+            await self.sync.sync_rest()
+        self.assertEqual(self.store.get_order(attached_algo_client_id("local1"))["status"], "live")
+
+    async def test_native_recovery_does_not_query_another_account(self):
+        self.sync._save_algo_order(protection_order())
+        self.account.account_scope = "account-b"
+        result = await self.sync.sync_rest()
+        self.assertEqual(result["algo_recovery"]["unresolved"], 1)
+        self.assertEqual(self.account.algo_lookups, [])
 
     async def test_protection_side_and_pending_size_use_order_fields(self):
         self.account.algos = [{
