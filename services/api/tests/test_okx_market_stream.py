@@ -130,6 +130,19 @@ class OkxMarketStreamTests(unittest.TestCase):
         self.assertTrue(self.stream.candles_fresh)
         self.assertFalse(self.stream.fresh)
 
+    def test_trades_cannot_make_stale_core_market_fresh(self) -> None:
+        self.stream.connected = True
+        self.stream.consume(json.dumps({
+            "arg": {"channel": "tickers", "instId": "BTC-USDT-SWAP"},
+            "data": [{"last": "62000"}],
+        }))
+        self.stream._last_message_epoch = time.monotonic() - 60
+        self.stream.consume(json.dumps({
+            "arg": {"channel": "trades", "instId": "BTC-USDT-SWAP"},
+            "data": [{"tradeId": "1", "px": "62000", "sz": "1", "side": "buy", "ts": "1"}],
+        }))
+        self.assertFalse(self.stream.fresh)
+
 
 if __name__ == "__main__":
     unittest.main()

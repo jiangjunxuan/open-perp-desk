@@ -197,7 +197,6 @@ class OkxMarketStream:
                 if len(unique) >= 80:
                     break
             self.last_message_at = received_at
-            self._last_message_epoch = time.monotonic()
             self.trades[inst_id] = {
                 **record,
                 "data": unique,
