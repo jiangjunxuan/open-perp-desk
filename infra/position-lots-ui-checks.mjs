@@ -105,6 +105,11 @@ export async function checkPositionLots({ evaluate, command, screenshot }) {
         };
       })()`);
       Object.assign(checks, layout);
+      await evaluate(`(() => {
+        document.activeElement?.blur();
+        window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+        return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      })()`);
       await screenshot(`openperpdesk-${theme}-position-lots-${viewport.name}-fixture.png`);
       await evaluate("window.__restorePositionLots()");
       const failures = Object.entries(checks).filter(([, value]) => value !== true);
