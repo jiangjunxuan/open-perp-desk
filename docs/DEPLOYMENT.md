@@ -156,6 +156,19 @@ Worker 启停/异常、急停/恢复、成交回报、原生止盈止损状态�
 成交回报按交易所 `tradeId` 去重；没有配置 `PUSHPLUS_TOKEN` 时不会阻塞行情、
 风控或 Demo 执行。
 
+PushPlus 的同步 `code=200` 仅表示接口受理，不代表微信送达。测试接口
+`POST /api/v1/notifications/test` 返回 `accepted=true`、`delivery_confirmed=false`，
+并在可用时携带消息流水号；审计记录为 `notification_accepted`，不会标为送达成功。
+上游消息正文和原始异常不会进入 API 响应，响应体超过 64 KiB 或格式无法识别时
+按受理状态未知处理。明确拒绝、未配置和状态未知使用不同的固定错误码。
+网络失败或 503 之后不自动重发测试通知，因为对端可能已经受理；应先在微信或
+PushPlus 记录核对，避免重复消息。实时行情读取的自动重试不受此限制。
+控制台会阻止重复点击，并忽略管理员权限变更前发出的迟到响应。
+当前没有将 PushPlus 回调作为已验证的微信送达凭据，真实收信仍需单独验收。
+
+接口语义参考 PushPlus 官方发送 API：
+`https://www.pushplus.plus/doc/guide/api.html`。
+
 ## 5. TradingAgents
 
 TradingAgents 是可选分析依赖，不应阻塞结构化策略和风控链。生产部署有两种方式：

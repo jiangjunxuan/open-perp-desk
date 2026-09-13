@@ -1104,7 +1104,13 @@ function updatePrivateActionAvailability() {
   if (!unlocked) resetManagementAccess();
   $("#run-ai-analysis").disabled = !unlocked || !integrations.tradingagents_configured;
   $("#run-worker").disabled = !unlocked || worker.enabled !== true || !executionAllowed;
-  $("#test-notification").disabled = !unlocked || !integrations.pushplus_configured;
+  if (notificationState.token !== state.token) {
+    notificationState.token = state.token;
+    notificationState.action += 1;
+    notificationState.busy = false;
+    setBusy("#test-notification", false);
+  }
+  $("#test-notification").disabled = !unlocked || !integrations.pushplus_configured || notificationState.busy;
   $("#refresh-private").disabled = !unlocked;
   $("#sync-ledger").disabled = !unlocked;
   $("#save-strategy").disabled = !unlocked;
@@ -2250,22 +2256,43 @@ async function runWorkerOnce() {
   }
 }
 
+const notificationState = {token: "", action: 0, busy: false};
+
 async function testNotification() {
+  if (!state.token || notificationState.busy || $("#test-notification").disabled) return;
+  const token = state.token, action = ++notificationState.action;
+  notificationState.busy = true;
   setBusy("#test-notification", true, "发送中...");
   setMessage("正在发送 PushPlus 测试通知...");
   try {
-    await api("/api/v1/notifications/test", {
+    const result = await api("/api/v1/notifications/test", {
       method: "POST",
       body: JSON.stringify({
         title: "OpenPerpDesk 测试通知",
         content: "来自 OpenPerpDesk 控制台的 PushPlus 链路测试。",
       }),
     });
-    setMessage("PushPlus 已受理测试通知，送达以微信为准", "good");
+    if (token !== state.token || action !== notificationState.action) return;
+    if (result.accepted !== true || result.delivery_confirmed !== false) throw new Error("pushplus_acceptance_unknown");
+    setMessage("PushPlus 已受理测试通知，尚未确认微信送达");
   } catch (error) {
-    setMessage(`PushPlus 发送失败：${error.message}`, "error");
+    if (token !== state.token || action !== notificationState.action) return;
+    if (error.status === 401) {
+      lockPrivateAccess();
+      setMessage("管理员访问已失效，测试请求状态需核对", "error");
+    } else {
+      const messages = {
+        pushplus_unconfigured: "PushPlus 尚未配置，未发送测试请求",
+        pushplus_rejected: "PushPlus 拒绝了测试请求，请核对服务端通知配置",
+      };
+      setMessage(messages[error.message] || "测试请求状态未确认，请先核对微信和 PushPlus 记录，避免重复发送", "error");
+    }
   } finally {
-    setBusy("#test-notification", false);
+    if (token === state.token && action === notificationState.action) {
+      notificationState.busy = false;
+      setBusy("#test-notification", false);
+      updatePrivateActionAvailability();
+    }
   }
 }
 

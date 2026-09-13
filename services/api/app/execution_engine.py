@@ -388,5 +388,5 @@ class ExecutionEngine:
 
     async def notify(self, title: str, content: str) -> dict[str, Any]:
         if not self.pushplus.configured:
-            raise PushPlusError("PushPlus token is not configured")
+            raise PushPlusError("pushplus_unconfigured")
         return await self.pushplus.send(title, content)

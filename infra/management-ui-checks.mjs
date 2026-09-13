@@ -4,7 +4,7 @@ async function exerciseManagement() {
   const original = {
     token: state.token, symbol: state.symbol, bar: state.bar, theme: document.documentElement.dataset.theme,
     performance: state.performance, analysis: state.analysis, draftRevision: state.draftRevision,
-    equity: $("#equity-input").value, strategy: state.strategy,
+    equity: $("#equity-input").value, strategy: state.strategy, status: state.status,
   };
   const calls = [];
   const sample = [
@@ -34,6 +34,7 @@ async function exerciseManagement() {
     state.symbol = original.symbol;
     state.bar = original.bar;
     state.strategy = original.strategy;
+    state.status = original.status;
     $("#symbol").value = original.symbol;
     $("#bar").value = original.bar;
     $("#activity-query").value = "";
@@ -168,6 +169,53 @@ async function exerciseManagement() {
     checks.onlyReadOnlyEndpoints = calls.every(call => ["/api/v1/activity", "/api/v1/backtest"].includes(call.url));
     checks.safetyGateUnchanged = !state.status.execution_enabled && !state.status.live_safety.allowed
       && $("#execute-signal").disabled;
+    const beforeNotification = calls.length;
+    state.token = "";
+    updatePrivateActionAvailability();
+    await testNotification();
+    checks.notificationLockedNoRequest = calls.length === beforeNotification;
+    state.token = "local-management-fixture-only";
+    state.status = {...state.status, integrations: {...state.status.integrations, pushplus_configured: true}};
+    updatePrivateActionAvailability();
+    let finishNotification;
+    response = () => new Promise(resolve => { finishNotification = resolve; });
+    const notification = testNotification();
+    await testNotification();
+    checks.notificationDuplicateBlocked = calls.length === beforeNotification + 1 && notificationState.busy;
+    finishNotification({accepted: true, delivery_confirmed: false});
+    await notification;
+    checks.notificationAcceptanceNotDelivery = $("#action-message").textContent.includes("已受理")
+      && $("#action-message").textContent.includes("尚未确认微信送达") && !notificationState.busy;
+    response = async () => { throw new Error("private-provider-secret-url"); };
+    await testNotification();
+    checks.notificationUnknownRedacted = $("#action-message").textContent.includes("状态未确认")
+      && !$("#action-message").textContent.includes("private-provider");
+    response = async () => { throw new Error("pushplus_rejected"); };
+    await testNotification();
+    checks.notificationRejectedExplicit = $("#action-message").textContent.includes("拒绝了测试请求");
+    response = async () => ({sent: true});
+    await testNotification();
+    checks.notificationLegacySuccessNotTrusted = $("#action-message").textContent.includes("状态未确认");
+    response = () => new Promise(resolve => { finishNotification = resolve; });
+    const lateNotification = testNotification();
+    state.token = "";
+    updatePrivateActionAvailability();
+    setMessage("权限已撤销");
+    state.token = "local-management-fixture-only";
+    updatePrivateActionAvailability();
+    finishNotification({accepted: true, delivery_confirmed: false});
+    await lateNotification;
+    checks.notificationLateSameTokenIgnored = $("#action-message").textContent === "权限已撤销"
+      && !notificationState.busy && !$("#test-notification").hasAttribute("aria-busy");
+    response = async () => { const error = new Error("unauthorized"); error.status = 401; throw error; };
+    await testNotification();
+    checks.notificationUnauthorizedLocks = !state.token && $("#test-notification").disabled && !notificationState.busy;
+    checks.notificationRequestsScoped = calls.slice(beforeNotification).every(call =>
+      call.url === "/api/v1/notifications/test" && call.options?.method === "POST");
+    state.token = "local-management-fixture-only";
+    state.status = original.status;
+    updatePrivateActionAvailability();
+    setMessage("");
     state.symbol = original.symbol;
     state.bar = original.bar;
     updateBacktestContext();

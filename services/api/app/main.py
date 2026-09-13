@@ -17,7 +17,7 @@ from .okx_account_stream import OkxAccountStream
 from .okx_market import OkxMarketClient, OkxMarketError
 from .okx_market_stream import OkxMarketStream
 from .okx_trade import OkxTradeClient, OkxTradeError, OrderRequest
-from .pushplus import PushPlusClient
+from .pushplus import PushPlusClient, PushPlusError
 from .risk_engine import RiskEngine
 from .execution_engine import ExecutionEngine
 from .order_preflight import OrderPreflight
@@ -1289,7 +1289,7 @@ def notifications_status() -> dict[str, object]:
 
 class NotificationTestRequest(BaseModel):
     title: str = Field(default="OpenPerpDesk 测试通知", min_length=1, max_length=80)
-    content: str = Field(default="PushPlus 通知链路测试成功。", min_length=1, max_length=2000)
+    content: str = Field(default="来自 OpenPerpDesk 的通知链路测试，请核对微信是否收到。", min_length=1, max_length=2000)
 
 
 @app.post("/api/v1/notifications/test")
@@ -1299,13 +1299,27 @@ async def notification_test(
 ) -> dict[str, object]:
     try:
         result = await execution_engine.notify(request.title, request.content)
+        if result.get("accepted") is not True or result.get("delivery_confirmed") is not False:
+            raise PushPlusError("pushplus_acceptance_unknown")
+    except PushPlusError as exc:
+        state_store.add_audit(
+            "notification_test_unconfirmed" if exc.acceptance_unknown else "notification_test_rejected",
+            "PushPlus test request was not confirmed" if exc.acceptance_unknown else "PushPlus test request was rejected",
+            severity="warning", payload={"error": exc.code, "acceptance_unknown": exc.acceptance_unknown},
+        )
+        raise HTTPException(status_code=503 if exc.code == "pushplus_unconfigured" else 502, detail=exc.code) from None
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        state_store.add_audit(
+            "notification_test_unconfirmed", "PushPlus test request was not confirmed",
+            severity="warning", payload={"error": type(exc).__name__, "acceptance_unknown": True},
+        )
+        raise HTTPException(status_code=502, detail="pushplus_acceptance_unknown") from None
     state_store.add_audit(
-        "notification_sent",
-        "PushPlus test notification sent",
+        "notification_accepted",
+        "PushPlus accepted the test request; WeChat delivery is unverified",
+        payload={"message_id": result.get("message_id"), "delivery_confirmed": False},
     )
-    return {"sent": True, "result": result}
+    return {"accepted": True, "delivery_confirmed": False, "result": result}
 
 
 _module_path = Path(__file__).resolve()
