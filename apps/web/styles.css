@@ -402,6 +402,7 @@ tbody tr:hover { background: var(--surface); }
 .equity-baseline-table:focus-visible { outline-offset: -2px; }
 .bill-archive-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .bill-archive-heading h3 { margin: 0; font-size: 14px; }
+.bill-archive-heading .toolbar-actions { display: flex; flex: 0 0 auto; gap: 8px; }
 .bill-archive-list { padding: 0; margin: 0; list-style: none; }
 .bill-archive-row { display: flex; align-items: center; gap: 12px; padding-block: 12px; border-top: 1px solid var(--border-soft); font-size: 12px; }
 .bill-archive-row > div { flex: 1; display: grid; gap: 6px; min-width: 0; }

@@ -677,6 +677,24 @@
                 </table>
               </div>
             </section>
+            <section class="bill-archive-section" aria-labelledby="account-performance-title">
+              <div class="bill-archive-heading">
+                <h3 id="account-performance-title">账户净值核算 · USD</h3>
+                <div class="toolbar-actions">
+                  <button class="button icon-button secondary" id="collect-account-performance" type="button" title="重新核算当前日期范围" aria-label="重新核算当前日期范围" disabled><i data-icon="refresh-cw" aria-hidden="true"></i></button>
+                  <button class="button icon-button secondary" id="cancel-account-performance" type="button" title="停止当前范围核算" aria-label="停止当前范围核算" disabled><i data-icon="x" aria-hidden="true"></i></button>
+                </div>
+              </div>
+              <p id="account-performance-status" class="settings-message" role="status" aria-live="polite">管理员未解锁</p>
+              <div id="account-performance-summary" class="bill-currency-summary"></div>
+              <div class="table-wrap equity-baseline-table" tabindex="0" role="region" aria-label="账户净值核算表">
+                <table>
+                  <caption class="sr-only">相邻权益观测区间的出入金调整后损益与 Modified Dietz 估算收益，缺口不参与累计</caption>
+                  <thead><tr><th>起始基准 · UTC</th><th>期初权益</th><th>期末权益</th><th>净划入</th><th>调整后盈亏</th><th>估算收益率</th><th>证据状态</th></tr></thead>
+                  <tbody id="account-performance-body"><tr><td colspan="7" class="table-empty">净值尚未核算</td></tr></tbody>
+                </table>
+              </div>
+            </section>
             <div class="table-wrap" tabindex="0" role="region" aria-label="历史账单表">
               <table>
                 <caption class="sr-only">交易账户历史账单，原币种金额与有报价依据的美元净损益</caption>

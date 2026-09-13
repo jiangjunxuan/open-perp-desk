@@ -729,10 +729,14 @@ try {
   });
   const billHistory = await checkBillHistory({
     evaluate, command,
-    screenshot: async name => {
-      const size = await evaluate("({width: innerWidth, height: Math.min(document.documentElement.scrollHeight, innerHeight * 3)})");
+    screenshot: async (name, selector = null) => {
+      const size = selector ? await evaluate(`(() => {
+        const rect = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
+        return {x: 0, y: Math.max(0, scrollY + rect.top - 12), width: innerWidth,
+          height: Math.min(document.documentElement.scrollHeight - (scrollY + rect.top - 12), Math.max(innerHeight, rect.height + 24))};
+      })()`) : await evaluate("({x: 0, y: 0, width: innerWidth, height: Math.min(document.documentElement.scrollHeight, innerHeight * 3)})");
       const shot = await command("Page.captureScreenshot", { format: "png", captureBeyondViewport: true,
-        clip: { x: 0, y: 0, ...size, scale: 1 } });
+        clip: { ...size, scale: 1 } });
       await writeFile(path.join(outputDirectory, name), Buffer.from(shot.data, "base64"));
     },
   });

@@ -25,6 +25,7 @@ from .ai_analysis import AIAnalysisError, TradingAgentsAdapter
 from .account_sync import AccountSynchronizer
 from .account_history import AccountHistoryImporter
 from .account_valuation import AccountValuationWorker
+from .account_performance import AccountPerformanceWorker
 from .quarterly_history import QuarterlyHistoryImporter
 from .historical_ledger import archive_first_day, history_days
 from .account_reconciler import AccountReconciler
@@ -56,6 +57,7 @@ account_history = AccountHistoryImporter(state_store, account_client)
 quarterly_history = QuarterlyHistoryImporter(state_store, account_client)
 account_valuation = AccountValuationWorker(state_store, account_client, market_client)
 equity_baseline = EquityBaselineSampler(state_store, account_client)
+account_performance = AccountPerformanceWorker(state_store, account_client, market_client)
 safety_controller = SafetyController(state_store)
 strategy_engine = StrategyEngine()
 backtest_engine = BacktestEngine(strategy_engine)
@@ -105,11 +107,13 @@ async def lifespan(_: FastAPI):
     await equity_baseline.start()
     await quarterly_history.start()
     await account_valuation.start()
+    await account_performance.start()
     await automation_worker.start()
     try:
         yield
     finally:
         await equity_baseline.stop()
+        await account_performance.close()
         await account_valuation.close()
         await quarterly_history.close()
         await account_history.close()
@@ -380,7 +384,7 @@ async def account_events(
         return bool(expected and x_admin_token and secrets.compare_digest(x_admin_token, expected))
 
     return StreamingResponse(
-        private_events(state_store, account_stream, account_client, authorized),
+        private_events(state_store, account_stream, account_client, authorized, lambda: market_client.rate_scope),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
@@ -680,6 +684,39 @@ async def request_bill_valuation(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     account_valuation.notify()
     return {"job": job}
+
+
+@app.post("/api/v1/account/performance/collect", status_code=202)
+async def collect_account_performance(
+    request: BillImportRequest, _: None = Depends(require_admin_token),
+) -> dict[str, Any]:
+    if not account_client.configured:
+        raise HTTPException(status_code=503, detail="OKX read-only credentials are not configured")
+    now = datetime.now(timezone.utc)
+    try:
+        days = history_days(request.start_day, request.end_day, now=now, importing=True)
+        result = await asyncio.to_thread(
+            state_store.schedule_performance, account_client.account_scope, market_client.rate_scope,
+            days, int(now.timestamp() * 1000), retry=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    account_performance.notify()
+    return result
+
+
+@app.post("/api/v1/account/performance/cancel")
+async def cancel_account_performance(
+    request: BillImportRequest, _: None = Depends(require_admin_token),
+) -> dict[str, int]:
+    try:
+        days = history_days(request.start_day, request.end_day, now=datetime.now(timezone.utc))
+        count = await asyncio.to_thread(
+            state_store.cancel_performance, account_client.account_scope, market_client.rate_scope, days,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"canceled": count}
 
 
 @app.get("/api/v1/account/bills/valuation")

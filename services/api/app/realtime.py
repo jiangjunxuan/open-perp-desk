@@ -34,12 +34,13 @@ async def control_events(
         await asyncio.sleep(.25)
 
 
-async def private_events(store, account, account_client, authorized) -> AsyncIterator[str]:
+async def private_events(store, account, account_client, authorized, rate_scope=lambda: None) -> AsyncIterator[str]:
     revision = None
     previous = {}
     heartbeat_at = float("-inf")
     while authorized():
-        current_revision = store.revision
+        scope, market_scope = account_client.account_scope, rate_scope()
+        current_revision = (store.revision, scope, market_scope)
         payloads = {
             "account": {
                 "configured": account.configured,
@@ -66,10 +67,13 @@ async def private_events(store, account, account_client, authorized) -> AsyncIte
                     "bill_archives": {"data": store.bill_archives(account_client.account_scope)},
                     "bill_valuation": {"job": store.bill_valuation(account_client.account_scope)},
                     "equity_baseline": {"latest": store.equity_baseline(account_client.account_scope)},
+                    "account_performance": store.performance_updates(scope, market_scope),
                     "strategies": {"data": store.list_strategies()},
                     "analyses": {"data": store.analysis_index(limit=1)},
                 }
             payloads.update(await asyncio.to_thread(read_state))
+            if scope != account_client.account_scope or market_scope != rate_scope():
+                continue
             revision = current_revision
         if not authorized():
             break

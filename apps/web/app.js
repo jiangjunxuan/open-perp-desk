@@ -1963,6 +1963,8 @@ function applyPrivateEvent(event, payload) {
     renderBillValuationJob(payload.job);
   } else if (event === "equity_baseline") {
     applyEquityBaseline(payload);
+  } else if (event === "account_performance") {
+    applyAccountPerformance(payload);
   } else if (event === "strategies") {
     const strategy = payload.data?.find(item => item.strategy_id === "structured-technical");
     if (strategy && !state.strategyDirty && !$("#save-strategy").hasAttribute("aria-busy")) {

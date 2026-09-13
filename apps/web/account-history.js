@@ -5,6 +5,7 @@ const billHistoryState = {
   archives: null, archiveRequest: 0, archiveUpdates: 0, archiveAction: 0, archiveBusy: false, archiveTimer: null,
   valuationJob: null, valuationRequest: 0, valuationAction: 0, valuationUpdates: 0, valuationBusy: false, valuationTimer: null,
   baselineUpdates: 0, latestBaseline: null,
+  performanceUpdates: 0, performanceRevision: null, performanceBusy: false, performanceAction: 0, performanceTimer: null,
 };
 
 function billHistoryRange() {
@@ -36,6 +37,12 @@ function updateBillHistoryAvailability() {
     || ["queued", "running"].includes(billHistoryState.valuationJob?.state);
   $("#cancel-bill-valuation").disabled = !unlocked || billHistoryState.valuationBusy
     || !["queued", "running"].includes(billHistoryState.valuationJob?.state);
+  const performancePending = billHistoryState.report?.performance?.daily?.some(row =>
+    ["queued", "running", "retry_wait"].includes(row.job_state));
+  $("#collect-account-performance").disabled = !unlocked || !configured || billHistoryState.performanceBusy
+    || billHistoryState.loading || !billHistoryState.report || billHistoryRangeChanged() || performancePending;
+  $("#cancel-account-performance").disabled = !unlocked || billHistoryState.performanceBusy
+    || billHistoryRangeChanged() || !performancePending;
 }
 
 function resetBillHistoryAccess() {
@@ -62,6 +69,17 @@ function resetBillHistoryAccess() {
   billHistoryState.valuationBusy = false;
   billHistoryState.baselineUpdates += 1;
   billHistoryState.latestBaseline = null;
+  billHistoryState.performanceUpdates += 1;
+  billHistoryState.performanceRevision = null;
+  billHistoryState.performanceBusy = false;
+  billHistoryState.performanceAction += 1;
+  setBusy("#collect-account-performance", false);
+  setBusy("#cancel-account-performance", false);
+  clearTimeout(billHistoryState.performanceTimer);
+  billHistoryState.performanceTimer = null;
+  setText("#account-performance-status", "管理员未解锁");
+  $("#account-performance-summary").replaceChildren();
+  $("#account-performance-body").innerHTML = '<tr><td colspan="7" class="table-empty">账户净值已锁定</td></tr>';
   setText("#equity-baseline-status", "管理员未解锁");
   $("#equity-baseline-body").innerHTML = '<tr><td colspan="4" class="table-empty">权益基准已锁定</td></tr>';
   clearTimeout(billHistoryState.valuationTimer);
@@ -125,10 +143,12 @@ function renderBillHistory(payload, range, page) {
       .map(([ccy, value]) => `<span>${escapeHtml(ccy)} 账户划转<strong>${escapeHtml(value)}</strong></span>`).join("");
   const unclassified = summary.counts?.unclassified || 0;
   setState("#bill-history-message",
-    `${payload.valuation?.status === "valued" ? "历史账单已估值；缺少权益基准，不计算账户总收益" : "未完成历史汇率估值，不计算账户总收益"}${unclassified ? ` · ${unclassified} 条账单待分类` : ""}${!payload.configured ? " · OKX 私有凭据未配置" : ""}`,
+    `${payload.performance?.status === "estimated" ? "账户观测区间已核算 · 非精确时间加权收益"
+      : "账户净值证据不完整，不计算账户总收益"}${unclassified ? ` · ${unclassified} 条账单待分类` : ""}${!payload.configured ? " · OKX 私有凭据未配置" : ""}`,
     unclassified ? "warning" : "neutral");
   renderBillValuation(payload.valuation);
   renderEquityBaselines(payload.equity_baselines);
+  renderAccountPerformance(payload.performance);
   billHistoryState.report = payload;
   billHistoryState.range = range;
   billHistoryState.page = page;
@@ -141,6 +161,7 @@ async function loadBillHistory({ reset = false, page = billHistoryState.page } =
   if (!$("#bill-history-form").reportValidity()) return;
   const request = ++billHistoryState.request;
   const baselineUpdates = billHistoryState.baselineUpdates;
+  const performanceUpdates = billHistoryState.performanceUpdates;
   const token = state.token;
   const range = billHistoryRange();
   if (reset) page = 0;
@@ -157,7 +178,9 @@ async function loadBillHistory({ reset = false, page = billHistoryState.page } =
   try {
     const payload = await api(`/api/v1/account/bills/history?${params}`);
     if (request !== billHistoryState.request || token !== state.token) return;
-    if (baselineUpdates !== billHistoryState.baselineUpdates) return loadBillHistory({ reset, page });
+    if (baselineUpdates !== billHistoryState.baselineUpdates || performanceUpdates !== billHistoryState.performanceUpdates) {
+      return loadBillHistory({ reset, page });
+    }
     renderBillHistory(payload, range, page);
     if (reset) billHistoryState.cursors = [null];
   } catch (error) {
@@ -170,6 +193,7 @@ async function loadBillHistory({ reset = false, page = billHistoryState.page } =
       billHistoryState.loading = false;
       setBusy("#query-bill-history", false);
       updateBillHistoryAvailability();
+      scheduleAccountPerformancePoll();
     }
   }
 }
@@ -204,6 +228,95 @@ function applyEquityBaseline(payload) {
       && document.body.dataset.view === "performance") loadBillHistory();
 }
 
+const performanceLabels = {
+  estimated: "已核算 · 估算", missing_baselines: "缺少权益基准", missing_interval: "账单区间未采集",
+  queued: "等待采集", running: "核算中", retry_wait: "连接失败 · 自动重试", failed: "证据校验失败",
+  canceled: "已停止", unclassified_bills: "含未识别账单", boundary_uncertain: "划转边界不确定",
+  missing_rates: "缺少历史汇率", nonpositive_capital: "有效本金非正数",
+  nonpositive_link_factor: "收益无法连乘",
+};
+
+function renderAccountPerformance(report) {
+  const rows = Array.isArray(report?.daily) ? report.daily : [];
+  const complete = report?.status === "estimated";
+  const percent = value => value == null ? "--" : `${formatNumber(value, 4)}%`;
+  $("#account-performance-summary").innerHTML = [
+    ["调整后盈亏", complete ? report.pnl_usd : null, false],
+    ["账户净划入", complete ? report.cash_flow_usd : null, false],
+    ["累计估算收益", report?.linked_return_pct, true],
+    ["观测点最大回撤", report?.observed_max_drawdown_pct, true],
+  ].map(([label, value, isPercent]) => `<span>${label}<strong title="${escapeHtml(value ?? "")}">${escapeHtml(isPercent ? percent(value) : value ?? "--")}</strong></span>`).join("");
+  $("#account-performance-body").innerHTML = rows.map(row => {
+    const status = row.return_status && row.return_status !== "estimated" ? row.return_status : row.status;
+    const evidence = [
+      row.begin_ms ? `账单覆盖 ${new Date(row.begin_ms).toISOString()} 至 ${new Date(row.end_ms).toISOString()}（不含末端）` : "",
+      row.ledger_received_at_ms ? `账单采集于 ${new Date(row.ledger_received_at_ms).toISOString()}` : "",
+      `未识别 ${row.unclassified_rows || 0} 条 · 边界划转 ${row.boundary_flow_rows || 0} 条 · 缺报价 ${row.missing_rate_rows || 0} 条`,
+      row.attempts ? `采集尝试 ${row.attempts} 次` : "",
+    ].filter(Boolean).join("\n");
+    return `<tr><td class="mono-cell">${escapeHtml(row.day_utc)}</td>
+      ${[row.start?.equity_usd, row.end?.equity_usd, row.cash_flow_usd, row.pnl_usd]
+        .map(value => `<td class="mono-cell">${escapeHtml(value ?? "--")}</td>`).join("")}
+      <td class="mono-cell" title="${escapeHtml(row.return_pct ?? "")}">${escapeHtml(percent(row.return_pct))}</td>
+      <td title="${escapeHtml(evidence)}" data-tone="${status === "estimated" ? "good" : "warning"}">${escapeHtml(performanceLabels[status] || "证据不足")}</td></tr>`;
+  }).join("") || '<tr><td colspan="7" class="table-empty">尚无账户净值核算</td></tr>';
+  setState("#account-performance-status", report
+    ? `${report.complete_intervals} / ${report.total_intervals} 个观测区间 · Modified Dietz 估算${complete ? " · 非日内最大回撤" : " · 缺口不参与累计"}`
+    : "尚无查询结果", complete ? "neutral" : "warning");
+}
+
+function applyAccountPerformance(payload) {
+  const revision = JSON.stringify(payload);
+  const changed = revision !== billHistoryState.performanceRevision;
+  billHistoryState.performanceRevision = revision;
+  billHistoryState.performanceUpdates += 1;
+  if (changed && billHistoryState.report && !billHistoryState.loading && !billHistoryRangeChanged()
+      && $("#bill-history").open && document.body.dataset.view === "performance") loadBillHistory();
+}
+
+function scheduleAccountPerformancePoll() {
+  clearTimeout(billHistoryState.performanceTimer);
+  billHistoryState.performanceTimer = null;
+  if (state.token && state.privateFeedState !== "open" && $("#bill-history").open
+      && document.body.dataset.view === "performance" && !billHistoryRangeChanged()) {
+    billHistoryState.performanceTimer = setTimeout(() => loadBillHistory(), 5000);
+  }
+}
+
+async function changeAccountPerformance(cancel = false) {
+  const button = cancel ? "#cancel-account-performance" : "#collect-account-performance";
+  if (!state.token || billHistoryState.performanceBusy || $(button).disabled) return;
+  const token = state.token, action = ++billHistoryState.performanceAction;
+  const range = billHistoryRange();
+  billHistoryState.performanceBusy = true;
+  setBusy(button, true);
+  setState("#account-performance-status", cancel ? "正在停止核算..." : "正在提交核算...", "neutral");
+  updateBillHistoryAvailability();
+  try {
+    const payload = await api(`/api/v1/account/performance/${cancel ? "cancel" : "collect"}`, {
+      method: "POST", body: JSON.stringify(range),
+    });
+    if (token !== state.token || action !== billHistoryState.performanceAction) return;
+    if (JSON.stringify(range) === JSON.stringify(billHistoryRange())) {
+      await loadBillHistory();
+      if (token !== state.token || action !== billHistoryState.performanceAction) return;
+      if (!cancel && payload.missing_baselines) {
+        setState("#account-performance-status", `${payload.scheduled} 个区间已排队 · ${payload.missing_baselines} 个区间缺少权益基准`, "warning");
+      }
+    }
+  } catch (error) {
+    if (token === state.token && action === billHistoryState.performanceAction && !handleBillHistoryUnauthorized(error)) {
+      setState("#account-performance-status", "核算操作未确认，请重新查询状态", "danger");
+    }
+  } finally {
+    if (token === state.token && action === billHistoryState.performanceAction) {
+      billHistoryState.performanceBusy = false;
+      setBusy(button, false);
+      updateBillHistoryAvailability();
+    }
+  }
+}
+
 function renderBillImport(job) {
   if (job && (!/^[a-f0-9]{32}$/.test(job.id) || !["running", "completed", "failed", "interrupted"].includes(job.status))) {
     throw new Error("补录状态格式无效");
@@ -228,6 +341,7 @@ function scheduleBillImportPoll() {
   }
   scheduleArchivePoll();
   scheduleBillValuationPoll();
+  scheduleAccountPerformancePoll();
 }
 
 const valuationLabels = {
@@ -541,6 +655,8 @@ function initializeBillHistory() {
   $("#import-bill-history").addEventListener("click", startBillImport);
   $("#value-bill-history").addEventListener("click", () => changeBillValuation());
   $("#cancel-bill-valuation").addEventListener("click", () => changeBillValuation(true));
+  $("#collect-account-performance").addEventListener("click", () => changeAccountPerformance());
+  $("#cancel-account-performance").addEventListener("click", () => changeAccountPerformance(true));
   $("#bill-history-previous").addEventListener("click", () => loadBillHistory({ page: billHistoryState.page - 1 }));
   $("#bill-history-next").addEventListener("click", () => {
     billHistoryState.cursors[billHistoryState.page + 1] = billHistoryState.nextCursor;

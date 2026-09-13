@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from .database_maintenance import recovery_marker
 from .equity_baseline import BASELINE_POLICY, CAPTURE_WINDOW_MS, baseline_window, total_equity
+from .equity_performance import observation_bounds, summarize_performance
 from .historical_ledger import DAY_MS, combine_history_windows, day_ms
 from .historical_valuation import MINUTE_MS, required_rates, value_history
 from .strategy_engine import DEFAULT_STRATEGY_CONFIG
@@ -48,6 +49,10 @@ class BillImportLeaseLost(RuntimeError):
 
 class ValuationLeaseLost(RuntimeError):
     """A stale worker cannot publish valuation progress."""
+
+
+class PerformanceLeaseLost(RuntimeError):
+    """Canceled or superseded account-performance work cannot publish."""
 
 
 class StateStore:
@@ -240,6 +245,25 @@ class StateStore:
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_bill_valuation
                     ON account_bill_valuations(account_scope) WHERE state IN ('queued', 'running');
+                CREATE TABLE IF NOT EXISTS account_performance_intervals (
+                    id TEXT PRIMARY KEY,
+                    account_scope TEXT NOT NULL,
+                    market_scope TEXT NOT NULL,
+                    target_ms INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_ms INTEGER NOT NULL,
+                    lease_owner TEXT,
+                    lease_until_ms INTEGER NOT NULL DEFAULT 0,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    error TEXT,
+                    report_json TEXT,
+                    evidence_json TEXT,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(account_scope, market_scope, target_ms)
+                );
+                CREATE INDEX IF NOT EXISTS idx_performance_pending
+                    ON account_performance_intervals(account_scope, market_scope, state, next_attempt_ms);
                 CREATE TABLE IF NOT EXISTS positions (
                     position_key TEXT PRIMARY KEY,
                     inst_id TEXT NOT NULL,
@@ -978,6 +1002,7 @@ class StateStore:
                         if rate is not None:
                             rates[key] = rate["rate"]
                     valuation = value_history(valuation_records, days, {row["day_utc"] for row in windows}, rates)
+            performance = self._account_performance(connection, scope, rate_scope, days, baselines) if rate_scope else None
         data = [json.loads(row["record_json"]) for row in rows[:limit]]
         if valuation is not None:
             valued_rows = valuation.pop("rows", {})
@@ -1005,7 +1030,173 @@ class StateStore:
                 ],
             },
             **({"valuation": valuation} if valuation is not None else {}),
+            **({"performance": performance} if performance is not None else {}),
         }
+
+    def schedule_performance(
+        self, scope: str, market_scope: str, days: list[date], now_ms: int, *, retry: bool = False,
+    ) -> dict[str, int]:
+        result = {"scheduled": 0, "missing_baselines": 0}
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for day in days:
+                target = day_ms(day)
+                pair = connection.execute(
+                    """SELECT * FROM account_equity_baselines WHERE account_scope = ?
+                       AND target_ms IN (?, ?) ORDER BY target_ms""", (scope, target, target + DAY_MS),
+                ).fetchall()
+                if len(pair) != 2:
+                    result["missing_baselines"] += 1
+                    continue
+                _, end = observation_bounds(*(self._equity_baseline(row) for row in pair))
+                existing = connection.execute(
+                    """SELECT * FROM account_performance_intervals
+                       WHERE account_scope = ? AND market_scope = ? AND target_ms = ?""",
+                    (scope, market_scope, target),
+                ).fetchone()
+                due = max(now_ms, end + 300_000)
+                if existing is None:
+                    connection.execute(
+                        """INSERT INTO account_performance_intervals
+                           (id, account_scope, market_scope, target_ms, state, next_attempt_ms, updated_at)
+                           VALUES (?, ?, ?, ?, 'queued', ?, ?)""",
+                        (uuid4().hex, scope, market_scope, target, due, _utc_now()),
+                    )
+                    result["scheduled"] += 1
+                elif retry and existing["state"] in {"completed", "failed", "canceled"}:
+                    connection.execute(
+                        """UPDATE account_performance_intervals SET state = 'queued', attempts = 0,
+                           next_attempt_ms = ?, error = NULL, report_json = NULL, evidence_json = NULL,
+                           lease_owner = NULL, lease_until_ms = 0, revision = revision + 1, updated_at = ? WHERE id = ?""",
+                        (due, _utc_now(), existing["id"]),
+                    )
+                    result["scheduled"] += 1
+        return result
+
+    def performance_updates(self, scope: str, market_scope: str | None) -> dict[str, int]:
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT COUNT(*) AS intervals, COALESCE(SUM(revision), 0) AS revision,
+                   COALESCE(SUM(state IN ('queued', 'running', 'retry_wait')), 0) AS pending
+                   FROM account_performance_intervals WHERE account_scope = ? AND market_scope = ?""",
+                (scope, market_scope),
+            ).fetchone()
+            return dict(row)
+
+    def claim_performance(self, scope: str, market_scope: str, owner: str, now_ms: int) -> dict | None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT * FROM account_performance_intervals WHERE account_scope = ? AND market_scope = ?
+                   AND ((state IN ('queued', 'retry_wait') AND next_attempt_ms <= ?)
+                        OR (state = 'running' AND lease_until_ms <= ?))
+                   ORDER BY next_attempt_ms, target_ms LIMIT 1""", (scope, market_scope, now_ms, now_ms),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """UPDATE account_performance_intervals SET state = 'running', attempts = attempts + 1,
+                   lease_owner = ?, lease_until_ms = ?, revision = revision + 1, updated_at = ? WHERE id = ?""",
+                (owner, now_ms + 60_000, _utc_now(), row["id"]),
+            )
+            pair = connection.execute(
+                """SELECT * FROM account_equity_baselines WHERE account_scope = ?
+                   AND target_ms IN (?, ?) ORDER BY target_ms""", (scope, row["target_ms"], row["target_ms"] + DAY_MS),
+            ).fetchall()
+            return {**dict(row), "attempts": row["attempts"] + 1,
+                    "baselines": [self._equity_baseline(item) for item in pair]}
+
+    @staticmethod
+    def _owned_performance(connection, job_id: str, scope: str, owner: str, now_ms: int):
+        row = connection.execute(
+            """SELECT * FROM account_performance_intervals WHERE id = ? AND account_scope = ?
+               AND state = 'running' AND lease_owner = ? AND lease_until_ms > ?""",
+            (job_id, scope, owner, now_ms),
+        ).fetchone()
+        if row is None:
+            raise PerformanceLeaseLost("performance_lease_lost")
+        return row
+
+    def touch_performance(self, job_id: str, scope: str, owner: str, now_ms: int) -> None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._owned_performance(connection, job_id, scope, owner, now_ms)
+            connection.execute(
+                "UPDATE account_performance_intervals SET lease_until_ms = ? WHERE id = ?", (now_ms + 60_000, job_id),
+            )
+
+    def complete_performance(
+        self, job_id: str, scope: str, owner: str, now_ms: int, report: dict, evidence: dict,
+    ) -> None:
+        encoded_report = json.dumps(report, separators=(",", ":"), allow_nan=False)
+        encoded_evidence = json.dumps(evidence, separators=(",", ":"), allow_nan=False)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            job = self._owned_performance(connection, job_id, scope, owner, now_ms)
+            pair = connection.execute(
+                """SELECT * FROM account_equity_baselines WHERE account_scope = ?
+                   AND target_ms IN (?, ?) ORDER BY target_ms""", (scope, job["target_ms"], job["target_ms"] + DAY_MS),
+            ).fetchall()
+            if [self._equity_baseline(row) for row in pair] != [report["start"], report["end"]]:
+                raise ValueError("performance_baselines_changed")
+            if evidence["market_scope"] != job["market_scope"]:
+                raise PerformanceLeaseLost("performance_market_changed")
+            connection.execute(
+                """UPDATE account_performance_intervals SET state = 'completed', error = NULL, report_json = ?,
+                   evidence_json = ?, lease_owner = NULL, lease_until_ms = 0, revision = revision + 1,
+                   updated_at = ? WHERE id = ?""", (encoded_report, encoded_evidence, _utc_now(), job_id),
+            )
+
+    def defer_performance(
+        self, job_id: str, scope: str, owner: str, now_ms: int, *, retry: bool, error: str | None = None,
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                job = self._owned_performance(connection, job_id, scope, owner, now_ms)
+            except PerformanceLeaseLost:
+                return
+            delay = min(15_000, 1000 * 2 ** min(job["attempts"], 4))
+            connection.execute(
+                """UPDATE account_performance_intervals SET state = ?, error = ?, next_attempt_ms = ?,
+                   lease_owner = NULL, lease_until_ms = 0, revision = revision + 1, updated_at = ? WHERE id = ?""",
+                ("retry_wait" if retry else "failed", error, now_ms + delay, _utc_now(), job_id),
+            )
+
+    def cancel_performance(self, scope: str, market_scope: str, days: list[date]) -> int:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """UPDATE account_performance_intervals SET state = 'canceled', lease_owner = NULL,
+                   lease_until_ms = 0, revision = revision + 1, updated_at = ?
+                   WHERE account_scope = ? AND market_scope = ? AND target_ms >= ? AND target_ms <= ?
+                   AND state IN ('queued', 'running', 'retry_wait')""",
+                (_utc_now(), scope, market_scope, day_ms(days[0]), day_ms(days[-1])),
+            )
+            return cursor.rowcount
+
+    def _account_performance(self, connection, scope: str, market_scope: str, days: list[date], baselines: dict) -> dict:
+        stored = {row["target_ms"]: row for row in connection.execute(
+            """SELECT target_ms, state, attempts, next_attempt_ms, error, report_json, updated_at
+               FROM account_performance_intervals WHERE account_scope = ? AND market_scope = ?
+               AND target_ms >= ? AND target_ms <= ?""",
+            (scope, market_scope, day_ms(days[0]), day_ms(days[-1])),
+        )}
+        daily = []
+        for day in days:
+            target = day_ms(day)
+            row = stored.get(target)
+            entry = {"day_utc": day.isoformat(), "target_ms": target, "status": "missing_interval",
+                     "pnl_usd": None, "cash_flow_usd": None, "return_pct": None}
+            if target not in baselines or target + DAY_MS not in baselines:
+                entry["status"] = "missing_baselines"
+            elif row:
+                entry.update(job_state=row["state"], attempts=row["attempts"], updated_at=row["updated_at"],
+                             next_attempt_ms=row["next_attempt_ms"], error=row["error"], status=row["state"])
+                if row["state"] == "completed" and row["report_json"]:
+                    report = json.loads(row["report_json"])
+                    entry.update(report)
+            daily.append(entry)
+        return summarize_performance(daily)
 
     @staticmethod
     def _valuation_job(row: sqlite3.Row | None) -> dict[str, Any] | None:

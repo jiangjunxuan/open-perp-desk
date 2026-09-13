@@ -241,6 +241,58 @@ async function exerciseBillHistory() {
     renderBillValuation({ status: "incomplete", missing_rate_count: 3, unclassified_rows: 1 });
     checks.valuationIncompleteHidesTotals = !$("#bill-valuation-summary").textContent.includes("8.722")
       && $("#bill-valuation-message").textContent.includes("缺少 3 组报价");
+    const performance = {
+      status: "estimated", complete_intervals: 1, total_intervals: 1,
+      pnl_usd: "52.00000000000000001", cash_flow_usd: "98",
+      linked_return_pct: "4.957102001906577", observed_max_drawdown_pct: "0",
+      daily: [{
+        day_utc: range.start_day, status: "estimated", job_state: "completed", return_status: "estimated",
+        start: {equity_usd: "1000"}, end: {equity_usd: "1150.00000000000000001"},
+        pnl_usd: "52.00000000000000001", cash_flow_usd: "98", return_pct: "4.957102001906577",
+        begin_ms: baseline.request_started_ms, end_ms: baseline.received_at_ms + 86400001,
+      }],
+    };
+    const performanceReport = {...valued, performance};
+    handler = async () => performanceReport;
+    await loadBillHistory();
+    checks.performanceExactAmountsAndEstimation = $("#account-performance-body").textContent.includes("52.00000000000000001")
+      && $("#account-performance-summary").textContent.includes("52.00000000000000001")
+      && $("#account-performance-summary").textContent.includes("4.9571%")
+      && $("#account-performance-status").textContent.includes("Modified Dietz")
+      && $("#account-performance-summary").textContent.includes("观测点最大回撤");
+    renderAccountPerformance({...performance, status: "incomplete", linked_return_pct: null, observed_max_drawdown_pct: null,
+      complete_intervals: 0, daily: [{...performance.daily[0], status: "boundary_uncertain", return_status: "boundary_uncertain",
+        pnl_usd: null, cash_flow_usd: null, return_pct: null, boundary_flow_rows: 1}]});
+    checks.performanceUncertaintyNotProfit = $("#account-performance-body").textContent.includes("划转边界不确定")
+      && !$("#account-performance-summary").textContent.includes("52.")
+      && $("#account-performance-status").textContent.includes("缺口不参与累计");
+    let finishPerformanceQuery;
+    handler = () => new Promise(resolve => { finishPerformanceQuery = resolve; });
+    const oldPerformance = loadBillHistory();
+    applyPrivateEvent("account_performance", {intervals: 1, revision: 4, pending: 0});
+    handler = async () => performanceReport;
+    finishPerformanceQuery(valued);
+    await oldPerformance;
+    checks.performancePushRejectsStaleQuery = billHistoryState.report === performanceReport;
+    let finishPerformance;
+    handler = (url) => url.includes("/history?") ? Promise.resolve(performanceReport)
+      : new Promise(resolve => { finishPerformance = resolve; });
+    const performancePosts = calls.filter(call => call.options?.method === "POST").length;
+    const collecting = changeAccountPerformance();
+    await changeAccountPerformance();
+    checks.performanceDuplicateActionBlocked = calls.filter(call => call.options?.method === "POST").length === performancePosts + 1;
+    finishPerformance({scheduled: 1, missing_baselines: 0});
+    await collecting;
+    checks.performanceReadOnlyEndpoint = calls.some(call => call.url === "/api/v1/account/performance/collect"
+      && JSON.parse(call.options.body).start_day === range.start_day);
+    renderBillHistory({...performanceReport, performance: {...performance,
+      daily: [{...performance.daily[0], status: "retry_wait", job_state: "retry_wait", return_status: null,
+        pnl_usd: null, return_pct: null}], status: "incomplete", linked_return_pct: null}}, range, 0);
+    updateBillHistoryAvailability();
+    handler = async url => url.includes("/history?") ? performanceReport : {canceled: 1};
+    await changeAccountPerformance(true);
+    checks.performanceCancelExplicit = calls.some(call => call.url === "/api/v1/account/performance/cancel"
+      && call.options?.method === "POST");
     let lateValuation;
     handler = () => new Promise(resolve => { lateValuation = resolve; });
     const loadingValuation = loadBillValuationJob();
@@ -250,6 +302,9 @@ async function exerciseBillHistory() {
     await loadingValuation;
     checks.valuationRevocationClears = billHistoryState.valuationJob === null
       && $("#bill-valuation-summary").children.length === 0 && $("#bill-valuation-progress").hidden;
+    checks.performanceRevocationClears = $("#account-performance-summary").children.length === 0
+      && $("#account-performance-body").textContent.includes("已锁定")
+      && $("#collect-account-performance").disabled && billHistoryState.performanceTimer === null;
     state.token = "local-bill-history-fixture";
     updatePrivateActionAvailability();
     let finishArchives;
@@ -268,8 +323,13 @@ async function exerciseBillHistory() {
     renderBillArchives([{ ...archive, state: "waiting" }, { ...archive, id: "c".repeat(32), year: 2023, state: "failed", error: "archive_bill_outside_quarter" }]);
     renderBillValuation(valued.valuation);
     renderBillValuationJob({ ...valuationJob, state: "completed", completed_days: 7, rates_loaded: 38 });
+    renderAccountPerformance({...performance, status: "incomplete", complete_intervals: 1, total_intervals: 3,
+      linked_return_pct: null, observed_max_drawdown_pct: null,
+      daily: [...performance.daily,
+        {day_utc: range.end_day, status: "boundary_uncertain", boundary_flow_rows: 1},
+        {day_utc: range.end_day, status: "missing_baselines"}]});
     checks.onlyImportPosts = calls.filter(call => call.options?.method === "POST")
-      .every(call => /^\/api\/v1\/account\/bills\/(imports|archives|valuation)/.test(call.url));
+      .every(call => /^\/api\/v1\/account\/(bills\/(imports|archives|valuation)|performance\/(collect|cancel))/.test(call.url));
     setState("#bill-history-message", "界面回归样本（非真实账单） · 原币种账本与历史 USD 估值", "neutral");
     renderBillImport({ ...job, status: "failed", completed_days: 1 });
     return checks;
@@ -313,11 +373,20 @@ export async function checkBillHistory({ evaluate, command, screenshot }) {
           region.focus({ preventScroll: true });
           return document.activeElement === region && region.getAttribute("role") === "region"
             && Boolean(region.getAttribute("aria-label"));
-        })()
+        })(),
+        performanceControlsFit: [...document.querySelectorAll("#collect-account-performance, #cancel-account-performance")].every(el => {
+          const rect = el.getBoundingClientRect(), parent = el.closest(".bill-archive-heading").getBoundingClientRect();
+          return rect.height >= 44 && rect.width >= 44 && rect.left >= parent.left && rect.right <= parent.right + 1;
+        }),
+        performanceTableContained: (() => {
+          const rect = $("#account-performance-body").closest(".table-wrap").getBoundingClientRect();
+          return rect.left >= 0 && rect.right <= innerWidth;
+        })(),
       }))()`);
       Object.assign(checks, layout);
       if (["desktop", "mobile"].includes(viewport.name)) {
         await screenshot(`openperpdesk-${theme}-bill-history-${viewport.name}-fixture.png`);
+        await screenshot(`openperpdesk-${theme}-account-performance-${viewport.name}-fixture.png`, '[aria-labelledby="account-performance-title"]');
       }
       await evaluate("window.__restoreBillHistoryFixture()");
       const failed = Object.entries(checks).filter(([, passed]) => passed !== true);

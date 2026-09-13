@@ -53,9 +53,14 @@ by a push while that request was in flight unless its exchange time proves it
 is newer. Protection refreshes use the current stored size, not cached size.
 Funding, interest and historical accounting that have not reached the ledger
 are not presented as verified live values. Historical ledger amounts can now be
-valued with cached, confirmed minute USD index closes; complete FX-adjusted NAV
-still requires historical equity baselines and real OKX file acceptance for
-quarterly archives. Valuation progress publishes through the private feed.
+valued with cached, confirmed minute USD index closes. Separate observed-equity
+intervals now collect their entire ledger window and estimate cash-adjusted
+performance; unknown flows, ambiguous observation boundaries, and missing quotes
+block totals. Private `account_performance` events publish durable progress,
+including read-only retries, completion, and cancellation. The browser refreshes
+the selected range and rejects older responses. These are Modified Dietz
+estimates, not exact midnight NAV or intraday drawdown. Real OKX cross-midnight
+capture and quarterly file acceptance remain deployment acceptance items.
 
 ## Deployment
 
