@@ -22,6 +22,7 @@ from .risk_engine import RiskEngine
 from .execution_engine import ExecutionEngine
 from .order_preflight import OrderPreflight
 from .position_lots import positions_with_lots
+from .protection_handoff import handoff_summaries
 from .ai_analysis import AIAnalysisError, TradingAgentsAdapter
 from .account_sync import AccountSynchronizer
 from .account_history import AccountHistoryImporter
@@ -551,6 +552,11 @@ def stored_orders(
     _: None = Depends(require_admin_token),
 ) -> dict[str, object]:
     return {"data": state_store.list_orders(limit)}
+
+
+@app.get("/api/v1/protection/handoffs")
+def stored_protection_handoffs(_: None = Depends(require_admin_token)) -> dict[str, object]:
+    return {"data": handoff_summaries(state_store, account_client.account_scope)}
 
 
 @app.get("/api/v1/fills")

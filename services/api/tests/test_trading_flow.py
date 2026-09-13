@@ -319,7 +319,7 @@ class TradingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(reopened["accepted"])
         await self.synchronize()
         positions = (await self.api.request("GET", "/positions"))["data"]
-        self.assertEqual(positions[0]["lifecycle_generation"], 1)
+        self.assertEqual(positions[0]["lifecycle_generation"], 2)
         await run_cycle(dry_run=False, expected_count=8)
         self.assertEqual(len(self.exchange.order_submissions), 4)
         second_close = self.exchange.order_submissions[3]

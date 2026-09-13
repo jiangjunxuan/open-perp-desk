@@ -371,6 +371,11 @@ tbody tr:hover { background: var(--surface); }
 .lot-protection-state { display: block; font-size: 12px; color: var(--warning); }
 .lot-protection-state[data-tone="good"] { color: var(--positive); }
 .lot-allocation-reason { color: var(--warning); overflow-wrap: anywhere; }
+.protection-handoffs { padding: 12px 0; border-top: 1px solid var(--border-soft); }
+.protection-handoffs h3 { margin: 0 0 8px; font-size: 12px; color: var(--muted-strong); }
+.protection-handoffs ul { list-style: none; margin: 0; padding: 0; }
+.protection-handoffs li { display: flex; flex-wrap: wrap; gap: 8px 20px; padding: 8px 0; font-size: 12px; }
+.protection-handoffs li > * { min-width: 0; overflow-wrap: anywhere; }
 @media (max-width: 1023px) {
   .position-lot-details li { grid-template-columns: minmax(0, 1fr); gap: 8px; }
 }

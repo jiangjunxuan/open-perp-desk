@@ -380,6 +380,10 @@
                 <label class="record-search" for="positions-query"><span>合约筛选</span><input id="positions-query" type="search" data-record-query="positions" placeholder="BTC / ETH" disabled></label>
                 <span class="record-count" id="positions-filter-count" role="status">账户未解锁</span>
               </div>
+              <section class="protection-handoffs" id="protection-handoffs" aria-labelledby="protection-handoff-title" hidden>
+                <h3 id="protection-handoff-title" role="status" aria-atomic="true"></h3>
+                <ul id="protection-handoff-list"></ul>
+              </section>
               <div class="table-wrap" tabindex="0" role="region" aria-label="持仓表">
                 <table>
                   <caption class="sr-only">当前活动持仓</caption>

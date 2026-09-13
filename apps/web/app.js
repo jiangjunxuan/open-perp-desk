@@ -33,6 +33,7 @@ const state = {
   ledger: "positions",
   ticket: "signal",
   records: { positions: null, orders: null, fills: null },
+  handoffs: [],
   chartMode: "candles",
   chartRange: 80,
   chartCursorTime: null,
@@ -1243,11 +1244,36 @@ const positionLotReasons = {
   lot_reversal_requires_review: "单次成交包含反向开仓，归属待核对",
   lot_close_quantity_exceeds_owner: "保护平仓数量超过对应分单",
   lot_close_owner_missing: "未找到保护平仓对应的开仓单",
+  lot_close_context_unverified: "历史保护平仓缺少开仓归属证据",
   lot_native_owner_missing: "原生保护成交的开仓归属待核对",
   lot_native_owner_ambiguous: "原生保护成交存在多重关联",
   lot_position_quantity_mismatch: "分单合计与交易所持仓数量不一致",
   lot_account_changed: "账户配置已变化",
 };
+
+const handoffStates = {
+  cancel_pending: "原生撤单待确认", ready: "本地接管待执行", closing: "分单平仓中",
+  native_executing: "原生平仓核对中", review: "接管需人工核对",
+};
+
+function renderProtectionHandoffs(rows) {
+  state.handoffs = rows || [];
+  $("#protection-handoffs").hidden = !state.handoffs.length;
+  setText("#protection-handoff-title", `保护接管 · ${state.handoffs.length} 笔待完成`);
+  $("#protection-handoff-list").innerHTML = state.handoffs.map(row => `<li>
+    <strong>${escapeHtml(row.inst_id)}</strong><span class="mono-cell">${escapeHtml(row.opening_order_id)}</span>
+    <span class="lot-protection-state">${escapeHtml(handoffStates[row.status] || "接管待核对")}</span>
+  </li>`).join("");
+}
+
+function lotExecutionLabel(status) {
+  if (!state.controlSnapshotFresh || state.controlFeedState !== "open") return "状态待确认";
+  const worker = status?.automation_worker;
+  const allowed = status?.execution_enabled === true && status.risk_engine_ready === true
+    && status.safety_control?.execution_allowed === true && !status.safety_control?.emergency_stopped
+    && (status.trading_mode === "demo" || status.trading_mode === "live" && status.live_safety?.allowed === true);
+  return !worker?.enabled || !allowed ? "未启用" : worker.dry_run ? "仅预览" : "已启用";
+}
 
 function renderPositionLots(row) {
   const allocation = row.lot_allocation;
@@ -1260,6 +1286,7 @@ function renderPositionLots(row) {
     canceled: "原生保护已撤销", effective: "原生保护已触发",
     order_failed: "原生保护失败", pause: "原生保护已暂停",
   };
+  const executionLabel = lotExecutionLabel(state.status);
   return `<div class="position-lot-details">
     ${verified ? `<p class="subtle">手动减仓归属：先进先出</p>
       <ul>${lots.map(lot => `<li data-lot-id="${escapeHtml(lot.lot_id)}">
@@ -1267,9 +1294,10 @@ function renderPositionLots(row) {
         <dl><div><dt>剩余 / 开仓</dt><dd>${formatNumber(lot.remaining_size, 8)} / ${formatNumber(lot.opened_size, 8)} 张</dd></div>
         <div><dt>原生保护</dt><dd>${formatNumber(lot.protection?.size, 8)} 张</dd></div>
         <div><dt>止盈 / 止损</dt><dd>${formatNumber(lot.protection?.take_profit, 2)} / ${formatNumber(lot.protection?.stop_loss, 2)}</dd></div></dl>
-        <span class="lot-protection-state" data-tone="${lot.protection?.state === "native_matched" ? "good" : "warning"}">${escapeHtml(states[lot.protection?.state] || "保护待核对")}</span>
+        <div><span class="lot-protection-state" data-tone="${lot.protection?.state === "native_matched" ? "good" : "warning"}">${escapeHtml(states[lot.protection?.state] || "保护待核对")}</span>
+        ${lot.handoff ? `<span class="lot-protection-state">${escapeHtml(handoffStates[lot.handoff.status] || "接管待核对")}</span>` : ""}</div>
       </li>`).join("")}</ul>
-      <p class="subtle">分单本地执行：${allocation.execution_ready ? "已启用" : "未启用"}</p>`
+      <p class="subtle" data-lot-execution>分单本地执行：${executionLabel}</p>`
       : `<p class="lot-allocation-reason">${escapeHtml(positionLotReasons[allocation.reason] || "成交归属尚未核实")}</p>`}
     </div>`;
 }
@@ -1629,6 +1657,9 @@ function applyStatus(status) {
   const worker = status.automation_worker || {};
   const workerLabel = worker.running ? "运行中" : worker.enabled ? "已启用" : "待命";
   const gateOpen = executionGateOpen(status);
+  document.querySelectorAll("[data-lot-execution]").forEach(element => {
+    element.textContent = `分单本地执行：${lotExecutionLabel(status)}`;
+  });
   const executionLabel = status.safety_control?.emergency_stopped
     ? "急停已触发"
     : gateOpen ? mode === "LIVE" ? "实盘执行已解锁" : "模拟盘执行已启用" : "执行已锁定";
@@ -1968,6 +1999,7 @@ function lockPrivateAccess() {
   state.privateFeedState = "locked";
   state.token = "";
   state.privateUpdates += 1;
+  renderProtectionHandoffs([]);
   renderPositions([]);
   renderOrders([]);
   renderFills([]);
@@ -2006,6 +2038,7 @@ function applyPrivateEvent(event, payload) {
     renderPositions(payload.data);
     renderPnl(payload.data);
   } else if (event === "orders") renderOrders(payload.data);
+  else if (event === "protection_handoffs") renderProtectionHandoffs(payload.data);
   else if (event === "fills") {
     renderFills(payload.data);
     clearTimeout(state.performanceTimer);
@@ -2094,7 +2127,7 @@ async function loadPrivate() {
     if (token !== state.token) return false;
     const activityRequest = ++state.activityRequest;
     const privateUpdates = state.privateUpdates;
-    const [account, positions, orders, fills, pnl, report, activity, bills] = await Promise.all([
+    const [account, positions, orders, fills, pnl, report, activity, bills, handoffs] = await Promise.all([
       api("/api/v1/account/overview"),
       api("/api/v1/positions"),
       api("/api/v1/orders"),
@@ -2103,6 +2136,7 @@ async function loadPrivate() {
       api(`/api/v1/performance/report?initial_equity=${encodeURIComponent($("#equity-input").value)}`),
       api("/api/v1/activity"),
       api("/api/v1/account/bills").catch(error => ({ error: error.message })),
+      api("/api/v1/protection/handoffs"),
     ]);
     if (token !== state.token) return false;
     if (privateUpdates !== state.privateUpdates && state.privateFeedState === "open") return true;
@@ -2111,6 +2145,7 @@ async function loadPrivate() {
     setText("#metric-equity", formatNumber(equity, 2));
     setText("#metric-equity-note", account.configured ? "OKX 账户快照" : "OKX 私有凭据未配置");
     renderPositions(positions.data);
+    renderProtectionHandoffs(handoffs.data);
     renderPnl(positions.data);
     renderOrders(orders.data);
     renderFills(fills.data);

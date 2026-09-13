@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable
 
 from .account_sync import AccountSynchronizer
 from .execution_engine import ExecutionEngine
+from .protection_handoff import ProtectionHandoff
 from .okx_account import OkxAccountClient, OkxAccountError
 from .okx_market import OkxMarketClient
 from .risk_engine import RiskEngine
@@ -73,6 +74,7 @@ class AutomationWorker:
         self.run_count = 0
         self._task: asyncio.Task[None] | None = None
         self._cycle_lock = asyncio.Lock()
+        self.protection_handoff = ProtectionHandoff(store, account_sync, execution, account=account_client)
 
     async def start(self) -> None:
         if self.enabled and self._task is None:
@@ -181,6 +183,8 @@ class AutomationWorker:
                 position["inst_id"] == symbol and (position["stop_loss"] or position["take_profit"])
                 for position in self.store.list_positions()
             )
+            if self.account_client.configured:
+                protected = protected or self.protection_handoff.has_work(symbol)
             if protected:
                 try:
                     mark_price = await self.market_client.mark_price(symbol)
@@ -202,6 +206,13 @@ class AutomationWorker:
                         "accepted": False, "reasons": ["mark_price_unavailable"],
                     })
                     continue
+                if self.account_client.configured:
+                    handoff_result = await self.protection_handoff.run(
+                        symbol, mark_price, dry_run=self.dry_run, market_data_fresh=self.market_data_fresh(),
+                    )
+                    if handoff_result is not None:
+                        results.append(handoff_result)
+                        continue
                 exit_event = self.execution.protective_exit(
                     inst_id=symbol,
                     mark_price=mark_price,

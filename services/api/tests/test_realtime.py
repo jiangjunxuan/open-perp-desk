@@ -156,7 +156,7 @@ class RealtimeHttpTests(unittest.IsolatedAsyncioTestCase):
         await self.api.start()
 
     async def test_public_sse_and_private_auth_boundary(self):
-        for route in ("/account/events", "/account/events?token=local-acceptance-admin-token"):
+        for route in ("/account/events", "/account/events?token=local-acceptance-admin-token", "/protection/handoffs"):
             response = await self.api.client.get("/api/v1" + route, headers={"X-Admin-Token": ""})
             self.assertEqual(response.status_code, 401)
         response = await self.api.client.get("/api/v1/market/events?bar=invalid")

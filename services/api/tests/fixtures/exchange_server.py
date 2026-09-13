@@ -242,18 +242,23 @@ class ExchangeServer:
         self.revision += 1
         return order
 
-    def _fill(self, order_id):
+    def _fill(self, order_id, quantity=None):
         order = self.orders[order_id]
         if order["state"] == "filled":
             return
-        now, quantity = milliseconds(), float(order["sz"])
+        requested, filled = float(order["sz"]), float(order["accFillSz"])
+        now, quantity = milliseconds(), float(quantity) if quantity is not None else requested - filled
+        if not 0 < quantity <= requested - filled:
+            raise AssertionError("Fixture fill exceeds remaining order quantity")
+        cumulative = filled + quantity
         previous = float(self.position["pos"]) if self.position else 0
         change = quantity if order["side"] == "buy" else -quantity
         if order["reduceOnly"] and (previous == 0 or abs(change) > abs(previous) or change * previous >= 0):
             raise AssertionError("Fixture refused a non-reducing close")
         size = previous + change
         order.update(
-            state="filled", accFillSz=order["sz"], fillSz=order["sz"],
+            state="filled" if cumulative == requested else "partially_filled",
+            accFillSz=str(cumulative), fillSz=str(quantity),
             avgPx=self.price, fillPx=self.price, tradeId=str(8000 + len(self.fills)),
             fillTime=now, uTime=now, fillFee="-.001", fillFeeCcy="USDT", fillPnl="0",
         )
@@ -273,7 +278,7 @@ class ExchangeServer:
             "upl": "0", "uTime": now,
             "tradeId": order["tradeId"],
         }
-        for attached in order.get("attachAlgoOrds", []):
+        for attached in order.get("attachAlgoOrds", []) if order["state"] == "filled" else []:
             algo_id = str(7000 + len(self.algos))
             self.algos[algo_id] = {
                 **attached, "algoId": algo_id, "algoClOrdId": attached["attachAlgoClOrdId"],
@@ -283,9 +288,9 @@ class ExchangeServer:
             }
         self.revision += 1
 
-    def fill(self, order_id):
+    def fill(self, order_id, quantity=None):
         with self.lock:
-            self._fill(order_id)
+            self._fill(order_id, quantity=quantity)
 
     def trigger_protection(self, algo_id):
         with self.lock:

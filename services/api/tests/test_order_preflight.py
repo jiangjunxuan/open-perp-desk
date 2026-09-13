@@ -238,12 +238,16 @@ class OrderPreflightTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_protective_close_requires_current_verified_parameters(self):
         signal, proof = self.native_close()
         result = await self.submit(
-            signal, size=1, expected_position_trade_id="entry-trade", expected_protection=proof,
+            signal, size=1, expected_position_trade_id="entry-trade", expected_protection=proof, dry_run=True,
         )
         self.assertTrue(result["accepted"], result)
-        self.assertEqual(len(self.trade.orders), 1)
-        self.assertTrue(self.trade.orders[0].reduce_only)
+        self.assertEqual(self.trade.orders, [])
         self.assertEqual(json.loads(result["order"]["raw_json"])["expected_protection"], proof)
+        rejected = await self.submit(
+            signal, size=1, expected_position_trade_id="entry-trade", expected_protection=proof,
+        )
+        self.assertEqual(rejected["reasons"], ["native_protection_handoff_required"])
+        self.assertEqual(self.trade.orders, [])
 
     async def test_external_change_between_trigger_and_preflight_prevents_submission(self):
         signal, proof = self.native_close()
@@ -300,9 +304,13 @@ class OrderPreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("close_protection_changed", rejected["reasons"])
         self.account.pending_rows = [parent]
         accepted = await self.submit(
-            signal, size=.5, expected_position_trade_id="entry-trade", expected_protection=proof,
+            signal, size=.5, expected_position_trade_id="entry-trade", expected_protection=proof, dry_run=True,
         )
         self.assertTrue(accepted["accepted"], accepted)
+        rejected = await self.submit(
+            signal, size=.5, expected_position_trade_id="entry-trade", expected_protection=proof,
+        )
+        self.assertIn("native_protection_handoff_required", rejected["reasons"])
 
     async def test_pending_and_position_exposure_share_account_budget(self):
         self.account.position_rows = [position(notional="150")]

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
@@ -9,6 +10,7 @@ from .account_ledger import AccountLedgerError, parse_daily_bills, value_daily_r
 from .okx_market import OkxMarketClient
 from .state_store import StateStore
 from .position_protection import protection_evidence
+from .protection_handoff import HandoffError, close_context, native_evidence, verified_lot
 from .trading_signal import TradeSignal
 
 
@@ -228,6 +230,8 @@ class OrderPreflight:
         spec.validate_size(quantity)
         open_signal = signal.action in {"open_long", "open_short"}
         if open_signal:
+            if self.store.protection_handoffs(self.account.account_scope, signal.inst_id):
+                raise PreflightError("protection_handoff_pending")
             reference = number(signal.entry_price, "signal_price", positive=True)
             if abs(price - reference) / reference > Decimal("0.01"):
                 raise PreflightError("signal_price_deviation")
@@ -273,15 +277,59 @@ class OrderPreflight:
                     or opening["td_mode"] != td_mode
                 ):
                     raise PreflightError("close_protection_unverified")
-                native = expected_protection.get("kind") == "native"
-                matches = [
-                    row for row in (algos if native else pending)
-                    if row.get("algoClOrdId" if native else "clOrdId")
-                    == expected_protection.get("algo_client_id" if native else "opening_order_id")
-                ]
-                current = protection_evidence(
-                    opening, matches[0], native=native, position_size=float(position_size),
-                ) if len(matches) == 1 else None
+                protected_size = position_size
+                if expected_protection.get("lot_id"):
+                    local = self.store.get_position(f"{signal.inst_id}:{pos_side}:{td_mode}")
+                    if (
+                        not local or local["account_scope"] != self.account.account_scope
+                        or local["exchange_trade_id"] != position.get("tradeId")
+                        or abs(number(local["size"], "local_position_size")) != position_size
+                    ):
+                        raise PreflightError("close_lot_position_changed")
+                    try:
+                        lot = verified_lot(self.store, local, expected_protection["lot_id"])
+                    except HandoffError as exc:
+                        raise PreflightError(str(exc)) from exc
+                    if (
+                        not lot or lot["opening_order_id"] != opening["client_order_id"]
+                        or lot["opening_exchange_id"] != opening["exchange_order_id"]
+                        or number(lot["remaining_size"], "lot_remaining_size", positive=True) != quantity
+                    ):
+                        raise PreflightError("close_lot_quantity_changed")
+                    protected_size = quantity
+                if expected_protection.get("kind") == "handoff":
+                    handoff = self.store.protection_handoff(expected_protection.get("handoff_id", ""))
+                    if (
+                        not handoff or handoff["status"] != "ready"
+                        or handoff["account_scope"] != self.account.account_scope
+                        or handoff["inst_id"] != signal.inst_id
+                        or close_context(handoff) != expected_protection
+                        or not expected_protection.get("lot_id")
+                        or any(row.get("algoId") == expected_protection["algo_id"] for row in algos)
+                    ):
+                        raise PreflightError("close_handoff_unverified")
+                    try:
+                        native_row = await self.account.algo_order_details(
+                            signal.inst_id, algo_id=expected_protection["algo_id"],
+                            client_order_id=expected_protection["algo_client_id"],
+                        )
+                    except Exception as exc:
+                        raise PreflightError("close_handoff_native_unavailable") from exc
+                    if not native_evidence(opening, native_row, json.loads(handoff["evidence_json"]), canceled=True):
+                        raise PreflightError("close_handoff_cancellation_unverified")
+                    current = expected_protection
+                else:
+                    native = expected_protection.get("kind") == "native"
+                    matches = [
+                        row for row in (algos if native else pending)
+                        if row.get("algoClOrdId" if native else "clOrdId")
+                        == expected_protection.get("algo_client_id" if native else "opening_order_id")
+                    ]
+                    current = protection_evidence(
+                        opening, matches[0], native=native, position_size=float(protected_size),
+                    ) if len(matches) == 1 else None
+                    if current is not None and expected_protection.get("lot_id"):
+                        current["lot_id"] = expected_protection["lot_id"]
                 if current is None or current != expected_protection:
                     raise PreflightError("close_protection_changed")
             if any(

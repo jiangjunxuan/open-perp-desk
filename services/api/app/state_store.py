@@ -29,6 +29,7 @@ TERMINAL_ORDER_STATUSES = {
     "filled", "canceled", "cancelled", "failed", "rejected",
     "effective", "triggered", "order_failed", "expired", "mmp_canceled",
 }
+LOT_RECONSTRUCTION_VERSION = 2
 
 
 class ExposureSnapshotChanged(RuntimeError):
@@ -301,6 +302,26 @@ class StateStore:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (account_scope, position_key)
                 );
+                CREATE TABLE IF NOT EXISTS protection_handoffs (
+                    handoff_id TEXT PRIMARY KEY,
+                    account_scope TEXT NOT NULL,
+                    inst_id TEXT NOT NULL,
+                    position_key TEXT NOT NULL,
+                    lot_id TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    trigger_price REAL,
+                    status TEXT NOT NULL DEFAULT 'cancel_pending',
+                    version INTEGER NOT NULL DEFAULT 0,
+                    cancel_attempts INTEGER NOT NULL DEFAULT 0,
+                    cancel_after_ms INTEGER NOT NULL DEFAULT 0,
+                    close_sequence INTEGER NOT NULL DEFAULT 0,
+                    close_order_id TEXT,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(account_scope, lot_id)
+                );
                 CREATE TABLE IF NOT EXISTS analyses (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     inst_id TEXT NOT NULL,
@@ -353,6 +374,9 @@ class StateStore:
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(orders)")
             }
+            handoff_columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(protection_handoffs)")}
+            if "trigger_price" not in handoff_columns:
+                connection.execute("ALTER TABLE protection_handoffs ADD COLUMN trigger_price REAL")
             if "risk_notional" not in order_columns:
                 connection.execute("ALTER TABLE orders ADD COLUMN risk_notional REAL")
             if "account_scope" not in order_columns:
@@ -545,6 +569,60 @@ class StateStore:
                 ).fetchone()[0]
                 if current != expected_generation:
                     raise ExposureSnapshotChanged("execution_budget_snapshot_changed")
+            context = order.get("protection_context") or {}
+            if order["status"] != "preview":
+                if not order.get("reduce_only"):
+                    pending = connection.execute(
+                        """SELECT 1 FROM protection_handoffs WHERE account_scope = ? AND inst_id = ?
+                           AND status != 'complete' LIMIT 1""",
+                        (order.get("account_scope"), order["inst_id"]),
+                    ).fetchone()
+                    if pending:
+                        raise ExposureSnapshotChanged("protection_handoff_pending")
+                if context.get("kind") == "handoff":
+                    handoff = connection.execute(
+                        "SELECT * FROM protection_handoffs WHERE handoff_id = ?", (context.get("handoff_id"),),
+                    ).fetchone()
+                    if (
+                        not handoff or handoff["status"] != "ready"
+                        or handoff["account_scope"] != order.get("account_scope")
+                        or handoff["inst_id"] != order["inst_id"] or handoff["lot_id"] != context.get("lot_id")
+                        or handoff["close_sequence"] + 1 != context.get("close_sequence")
+                        or not order.get("reduce_only") or not order.get("source", "").startswith("protective-")
+                    ):
+                        raise ExposureSnapshotChanged("protection_handoff_changed")
+                    position = connection.execute(
+                        "SELECT * FROM positions WHERE position_key = ?", (handoff["position_key"],),
+                    ).fetchone()
+                    snapshot = connection.execute(
+                        """SELECT * FROM position_lot_snapshots WHERE account_scope = ? AND position_key = ?""",
+                        (handoff["account_scope"], handoff["position_key"]),
+                    ).fetchone()
+                    if not position or not snapshot or position["status"] != "open" or any(
+                        snapshot[left] != position[right] for left, right in (
+                            ("position_trade_id", "exchange_trade_id"), ("position_size", "size"),
+                            ("lifecycle_generation", "lifecycle_generation"),
+                        )
+                    ) or position["account_scope"] != handoff["account_scope"]:
+                        raise ExposureSnapshotChanged("protection_handoff_position_changed")
+                    allocation = json.loads(snapshot["snapshot_json"])
+                    lot = next((row for row in allocation.get("lots", []) if row["lot_id"] == handoff["lot_id"]), None)
+                    evidence = json.loads(handoff["evidence_json"])
+                    if (
+                        allocation.get("status") != "verified" or allocation.get("policy_version") != LOT_RECONSTRUCTION_VERSION
+                        or allocation.get("execution_generation") != expected_generation
+                        or not lot or float(lot["remaining_size"]) != order["size"]
+                        or context.get("opening_order_id") != evidence["opening_order_id"]
+                        or context.get("opening_exchange_id") != evidence["opening_exchange_id"]
+                        or position["exchange_trade_id"] != order.get("raw", {}).get("expected_position_trade_id")
+                        or (position["pos_side"], position["td_mode"]) != (order["pos_side"], order["td_mode"])
+                    ):
+                        raise ExposureSnapshotChanged("protection_handoff_lot_changed")
+                    connection.execute(
+                        """UPDATE protection_handoffs SET status = 'closing', close_sequence = close_sequence + 1,
+                           close_order_id = ?, version = version + 1, updated_at = ? WHERE handoff_id = ?""",
+                        (order["client_order_id"], _utc_now(), handoff["handoff_id"]),
+                    )
             inserted = self._write_order(connection, order, replace=False).rowcount == 1
             if inserted and order["status"] != "preview":
                 connection.execute(
@@ -555,6 +633,71 @@ class StateStore:
                 (order["client_order_id"],),
             ).fetchone()
         return inserted, dict(row)
+
+    def protection_handoff(self, handoff_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM protection_handoffs WHERE handoff_id = ?", (handoff_id,),
+            ).fetchone()
+        return self._row(row)
+
+    def protection_handoffs(self, account_scope: str, inst_id: str | None = None) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM protection_handoffs WHERE account_scope = ? AND status != 'complete'
+                   AND (? IS NULL OR inst_id = ?) ORDER BY created_at, handoff_id""",
+                (account_scope, inst_id, inst_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_protection_handoff(
+        self, record: dict[str, Any], position: dict[str, Any], *, expected_generation: int,
+    ) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            generation = connection.execute(
+                "SELECT generation FROM execution_generation WHERE singleton = 1",
+            ).fetchone()[0]
+            current = connection.execute(
+                "SELECT * FROM positions WHERE position_key = ?", (position["position_key"],),
+            ).fetchone()
+            if generation != expected_generation or not current or current["status"] != "open" or any(
+                current[field] != position[field] for field in (
+                    "account_scope", "exchange_trade_id", "size", "lifecycle_generation",
+                )
+            ):
+                raise ExposureSnapshotChanged("protection_handoff_position_changed")
+            now = _utc_now()
+            connection.execute(
+                """INSERT OR IGNORE INTO protection_handoffs
+                   (handoff_id, account_scope, inst_id, position_key, lot_id, evidence_json,
+                    reason, trigger_price, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (record["handoff_id"], position["account_scope"], position["inst_id"], position["position_key"],
+                 record["lot_id"], json.dumps(record["evidence"], sort_keys=True, allow_nan=False),
+                 record["reason"], record["trigger_price"], now, now),
+            )
+            saved = connection.execute(
+                "SELECT * FROM protection_handoffs WHERE account_scope = ? AND lot_id = ?",
+                (position["account_scope"], record["lot_id"]),
+            ).fetchone()
+        return dict(saved)
+
+    def update_protection_handoff(self, handoff: dict[str, Any], **changes: Any) -> dict[str, Any] | None:
+        allowed = {"status", "last_error", "cancel_attempts", "cancel_after_ms"}
+        if not changes or changes.keys() - allowed:
+            raise ValueError("invalid_handoff_update")
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE protection_handoffs SET " + ", ".join(f"{key} = ?" for key in changes)
+                + ", version = version + 1, updated_at = ? WHERE handoff_id = ? AND version = ? AND status != 'complete'",
+                (*changes.values(), _utc_now(), handoff["handoff_id"], handoff["version"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                "SELECT * FROM protection_handoffs WHERE handoff_id = ?", (handoff["handoff_id"],),
+            ).fetchone()
+        return dict(row)
 
     def finalize_submission(
         self,
@@ -735,6 +878,8 @@ class StateStore:
         )):
             return None
         snapshot = json.loads(row["snapshot_json"])
+        if snapshot.get("status") == "verified" and snapshot.get("policy_version") != LOT_RECONSTRUCTION_VERSION:
+            return None
         if snapshot.get("status") == "verified" and snapshot.get("execution_generation") != generation:
             return None
         return snapshot

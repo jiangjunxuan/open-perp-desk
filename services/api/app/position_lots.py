@@ -5,7 +5,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
 from .position_protection import attached_algo_client_id, protection_evidence
-from .state_store import StateStore
+from .state_store import LOT_RECONSTRUCTION_VERSION, StateStore
 
 
 class PositionLotError(ValueError):
@@ -174,6 +174,8 @@ class PositionLotReconciler:
     def _close_owner(self, position: dict[str, Any], order: dict[str, Any], lots: list[dict[str, Any]]) -> str | None:
         owners = set()
         context = json.loads(order.get("protection_context_json") or "{}")
+        if order["source"].startswith("protective-") and not context:
+            raise PositionLotError("lot_close_context_unverified")
         if context:
             if not order["source"].startswith("protective-") or not order["reduce_only"]:
                 raise PositionLotError("lot_close_context_unverified")
@@ -249,6 +251,7 @@ class PositionLotReconciler:
             raise PositionLotError("lot_position_quantity_mismatch")
         return {
             "status": "verified", "reason": None, "policy": "fifo_with_protective_links",
+            "policy_version": LOT_RECONSTRUCTION_VERSION,
             "execution_ready": False, "fill_count": len(frames), "first_bill_id": frames[0]["bill_id"],
             "last_bill_id": frames[-1]["bill_id"], "attributed_closes": attributed_closes, "fifo_closes": fifo_closes,
             "lots": [{
@@ -274,7 +277,15 @@ def positions_with_lots(store: StateStore, *, account_scope: str | None = None) 
                 else "lot_position_identity_unverified"
             ), "lots": [], "execution_ready": False,
         }
+        handoffs = {
+            row["lot_id"]: row for row in store.protection_handoffs(position.get("account_scope"), position["inst_id"])
+            if row["position_key"] == position["position_key"]
+        }
         for lot in allocation["lots"]:
+            handoff = handoffs.get(lot["lot_id"])
+            lot["handoff"] = {
+                key: handoff[key] for key in ("handoff_id", "status", "last_error", "close_sequence")
+            } if handoff else None
             protection = None
             state = "external_entry" if not lot["managed"] else "native_unverified"
             opening = store.get_order(lot["opening_order_id"])

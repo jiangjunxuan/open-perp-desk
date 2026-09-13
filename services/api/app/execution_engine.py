@@ -159,6 +159,10 @@ class ExecutionEngine:
             market_data_fresh = market_data_fresh and -5 <= age <= 30
         if not self.safety.execution_allowed:
             return await self._preflight_rejection(signal, "emergency_stop_active")
+        if not dry_run and signal.source.startswith("protective-") and (
+            not expected_protection or expected_protection.get("kind") != "handoff"
+        ):
+            return await self._preflight_rejection(signal, "native_protection_handoff_required")
         decision = self.risk_engine.evaluate(
             signal,
             account_equity=account_equity,

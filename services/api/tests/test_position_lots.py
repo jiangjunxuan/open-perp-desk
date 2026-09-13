@@ -150,6 +150,28 @@ class PositionLotTests(unittest.IsolatedAsyncioTestCase):
         self.assert_lots(result, {"client1": 1, "client2": "1.5"})
         self.assertEqual(result["attributed_closes"], 1)
 
+    async def test_legacy_protective_close_without_owner_is_not_treated_as_manual_fifo(self):
+        self.fill("client1", 1)
+        self.fill("client2", 2)
+        self.fill("client3", ".5", side="sell", reduce=True, source="protective-stop_loss")
+        result = await self.reconcile(2.5)
+        self.assertEqual(result["reason"], "lot_close_context_unverified")
+        self.assertEqual(result["lots"], [])
+
+    async def test_old_verified_policy_snapshot_is_rebuilt_after_upgrade(self):
+        self.fill("client1", 1)
+        target = self.position(1)
+        result = await self.reconciler.reconcile(target)
+        old = {key: value for key, value in result.items() if key != "policy_version"}
+        self.assertTrue(self.store.save_position_lots(
+            target, old, expected_generation=self.store.execution_snapshot()[0],
+        ))
+        self.assertIsNone(self.store.position_lots(target))
+        pages = self.account.pages
+        rebuilt = await self.reconciler.reconcile(target)
+        self.assertGreater(self.account.pages, pages)
+        self.assert_lots(rebuilt, {"client1": 1})
+
     def native(self, owner, *, child=None, size="1", state="live"):
         self.sync._save_algo_order({
             "algoId": f"9{owner.removeprefix('client')}", "algoClOrdId": attached_algo_client_id(owner),
