@@ -23,7 +23,10 @@ const chrome = spawn(
   [
     "--headless=new",
     "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--disable-extensions",
     "--no-sandbox",
+    "--no-zygote",
     "--no-first-run",
     "--no-default-browser-check",
     "--password-store=basic",
@@ -35,10 +38,15 @@ const chrome = spawn(
     `--user-data-dir=${profile}`,
     "about:blank",
   ],
-  { stdio: "ignore" },
+  { stdio: ["ignore", "ignore", "pipe"] },
 );
 let spawnError;
+const chromeStderr = [];
 chrome.once("error", (error) => { spawnError = error; });
+chrome.stderr.on("data", chunk => {
+  chromeStderr.push(chunk.toString());
+  if (chromeStderr.length > 20) chromeStderr.shift();
+});
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let socket;
@@ -72,8 +80,11 @@ async function evaluate(expression) {
 
 try {
   let target;
-  for (let attempt = 0; attempt < 60; attempt++) {
+  for (let attempt = 0; attempt < 120; attempt++) {
     if (spawnError) throw spawnError;
+    if (chrome.exitCode !== null) {
+      throw new Error(`Chrome exited before CDP startup (${chrome.exitCode}): ${chromeStderr.join("").slice(-3000)}`);
+    }
     try {
       const portFile = await readFile(path.join(profile, "DevToolsActivePort"), "utf8");
       const port = Number(portFile.split("\n")[0]);
@@ -87,7 +98,7 @@ try {
       await delay(100);
     }
   }
-  if (!target) throw new Error("Chrome debugging endpoint did not start");
+  if (!target) throw new Error(`Chrome debugging endpoint did not start: ${chromeStderr.join("").slice(-3000)}`);
   socket = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise((resolve, reject) => {
     socket.addEventListener("open", resolve, { once: true });
