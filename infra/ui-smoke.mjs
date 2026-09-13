@@ -6,6 +6,7 @@ import { checkResearchUI } from "./research-ui-checks.mjs";
 import { checkAppearance } from "./appearance-ui-checks.mjs";
 import { checkManagement } from "./management-ui-checks.mjs";
 import { checkBillHistory } from "./bill-history-ui-checks.mjs";
+import { checkRealtime } from "./realtime-ui-checks.mjs";
 
 const root = process.cwd();
 const origin = process.env.OPENPERPDESK_ORIGIN || "http://127.0.0.1:8099";
@@ -713,8 +714,15 @@ try {
       await writeFile(path.join(root, "outputs", name), Buffer.from(shot.data, "base64"));
     },
   });
+  const realtime = await checkRealtime({
+    evaluate, command, origin,
+    screenshot: async name => {
+      const shot = await command("Page.captureScreenshot", { format: "png" });
+      await writeFile(path.join(root, "outputs", name), Buffer.from(shot.data, "base64"));
+    },
+  });
   if (browserErrors.length) throw new Error(`Browser exceptions: ${JSON.stringify(browserErrors)}`);
-  const report = { results, paused, symbol, oldSignalCleared, historyPassed, deepLinkPassed, researchChecks, contrast, reducedMotion, appearance, management, billHistory, browserErrors };
+  const report = { results, paused, symbol, oldSignalCleared, historyPassed, deepLinkPassed, researchChecks, contrast, reducedMotion, appearance, management, billHistory, realtime, browserErrors };
   await writeFile(path.join(root, "outputs", "ui-verification.json"), JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
 } finally {

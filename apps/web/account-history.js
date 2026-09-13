@@ -56,7 +56,7 @@ function resetBillHistoryAccess() {
 
 function handleBillHistoryUnauthorized(error) {
   if (error.status !== 401) return false;
-  state.token = "";
+  lockPrivateAccess();
   resetBillHistoryAccess();
   updatePrivateActionAvailability();
   return true;
@@ -151,7 +151,7 @@ function renderBillImport(job) {
 function scheduleBillImportPoll() {
   clearTimeout(billHistoryState.timer);
   billHistoryState.timer = null;
-  if (state.token && $("#bill-history").open && document.body.dataset.view === "performance"
+  if (state.privateFeedState !== "open" && state.token && $("#bill-history").open && document.body.dataset.view === "performance"
       && billHistoryState.job?.status === "running") {
     billHistoryState.timer = setTimeout(() => refreshBillImport(billHistoryState.job?.id), 1500);
   }

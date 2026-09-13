@@ -7,7 +7,7 @@ import math
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from websockets.asyncio.client import connect
 
@@ -35,9 +35,11 @@ class OkxAccountStream:
         self.last_error: str | None = None
         self.balance: list[dict[str, Any]] = []
         self.positions: dict[str, dict[str, Any]] = {}
+        self.position_versions: dict[str, int] = {}
         self.orders: dict[str, dict[str, Any]] = {}
         self.fills: dict[str, dict[str, Any]] = {}
         self._task: asyncio.Task[None] | None = None
+        self.on_update: Callable[[], None] | None = None
 
     @property
     def configured(self) -> bool:
@@ -167,7 +169,9 @@ class OkxAccountStream:
             self.balance = list(balances.values())
         elif channel == "positions":
             for item in data:
-                self.positions[self._position_key(item)] = item
+                key = self._position_key(item)
+                self.positions[key] = item
+                self.position_versions[key] = self.position_versions.get(key, 0) + 1
         elif channel == "orders":
             for item in data:
                 order_id = str(item.get("ordId") or item.get("clOrdId") or "")
@@ -188,6 +192,8 @@ class OkxAccountStream:
                     and fill_price > 0
                 ):
                     self.fills[trade_id] = item
+        if channel in {"positions", "orders"} and self.on_update is not None:
+            self.on_update()
 
     @staticmethod
     def _position_key(position: dict[str, Any]) -> str:
@@ -210,6 +216,7 @@ class OkxAccountStream:
             "last_error": self.last_error,
             "balance": list(self.balance),
             "positions": list(self.positions.values()),
+            "position_versions": dict(self.position_versions),
             "orders": list(self.orders.values()),
             "fills": list(self.fills.values()),
         }

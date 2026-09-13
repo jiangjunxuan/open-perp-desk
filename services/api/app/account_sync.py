@@ -52,6 +52,14 @@ def _position_side_for_order(pos_side: str, size: float) -> str:
     return "buy" if size >= 0 else "sell"
 
 
+def _position_key(item: dict[str, Any]) -> str:
+    return ":".join((
+        str(item.get("instId", "")),
+        str(item.get("posSide", "net")),
+        str(item.get("mgnMode", "")),
+    ))
+
+
 class AccountSynchronizer:
     """Normalize OKX private stream/REST snapshots into local state."""
 
@@ -68,6 +76,10 @@ class AccountSynchronizer:
         self.account_stream = account_stream
         self.algo_stream = algo_stream
         self.notifier = notifier
+        self._stream_position_tokens: dict[str, tuple[Any, str]] = {}
+        self._position_versions: dict[str, int] = {}
+        self._position_times: dict[str, int] = {}
+        self._rest_lock = asyncio.Lock()
 
     @staticmethod
     def _validate_local_order(order: dict[str, Any], item: dict[str, Any]) -> None:
@@ -322,7 +334,45 @@ class AccountSynchronizer:
                 payload={"event_type": event_type, "error": type(exc).__name__},
             )
 
-    def sync_stream(self) -> dict[str, int]:
+    def _save_position(self, item: dict[str, Any]) -> bool:
+        key = _position_key(item)
+        timestamp = _exchange_ms(item.get("uTime"))
+        if timestamp is not None and timestamp < self._position_times.get(key, 0):
+            return False
+        size = _number(item.get("pos"))
+        pos_side = str(item.get("posSide", "net"))
+        stop_loss, take_profit = self._local_protection(str(item.get("instId", "")), pos_side, size)
+        self.store.upsert_position({
+            "position_key": key,
+            "inst_id": str(item.get("instId", "")),
+            "pos_side": pos_side,
+            "size": size,
+            "entry_price": _number(item.get("avgPx") or item.get("openAvgPx")),
+            "mark_price": _number(item.get("markPx")),
+            "notional": _number(item.get("notionalUsd") or item.get("notional") or item.get("notionalCcy")),
+            "unrealized_pnl": _number(item.get("upl")),
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "status": "open" if abs(size) > 0 else "closed",
+        })
+        if timestamp is not None:
+            self._position_times[key] = timestamp
+        return True
+
+    def _refresh_position_protection(self, key: str) -> None:
+        current = self.store.get_position(key)
+        if current is None or current["status"] != "open":
+            return
+        stop_loss, take_profit = self._local_protection(
+            current["inst_id"], current["pos_side"], current["size"],
+        )
+        if (stop_loss, take_profit) != (current["stop_loss"], current["take_profit"]):
+            self.store.upsert_position({
+                **current, "stop_loss": stop_loss, "take_profit": take_profit,
+                "updated_at": None,
+            })
+
+    def sync_stream(self) -> dict[str, Any]:
         snapshot = self.account_stream.snapshot()
         # A disconnected private stream may still contain the last valid
         # event. Never re-apply that stale cache as current account state.
@@ -342,39 +392,18 @@ class AccountSynchronizer:
             if self._save_regular_order(item, source="okx-account-stream"):
                 orders += 1
         for item in snapshot.get("positions", []):
-            size = _number(item.get("pos"))
-            pos_side = str(item.get("posSide", "net"))
-            stop_loss, take_profit = self._local_protection(
-                str(item.get("instId", "")),
-                pos_side,
-                size,
+            key = _position_key(item)
+            token = (
+                snapshot.get("position_versions", {}).get(key),
+                json.dumps(item, sort_keys=True),
             )
-            self.store.upsert_position(
-                {
-                    "position_key": ":".join(
-                        (
-                            str(item.get("instId", "")),
-                            str(item.get("posSide", "net")),
-                            str(item.get("mgnMode", "")),
-                        )
-                    ),
-                    "inst_id": str(item.get("instId", "")),
-                    "pos_side": pos_side,
-                    "size": size,
-                    "entry_price": _number(item.get("avgPx") or item.get("openAvgPx")),
-                    "mark_price": _number(item.get("markPx")),
-                    "notional": _number(
-                        item.get("notionalUsd")
-                        or item.get("notional")
-                        or item.get("notionalCcy")
-                    ),
-                    "unrealized_pnl": _number(item.get("upl")),
-                    "stop_loss": stop_loss,
-                    "take_profit": take_profit,
-                    "status": "open" if abs(size) > 0 else "closed",
-                }
-            )
-            positions += 1
+            if self._stream_position_tokens.get(key) == token:
+                self._refresh_position_protection(key)
+                continue
+            if self._save_position(item):
+                self._position_versions[key] = self._position_versions.get(key, 0) + 1
+                positions += 1
+            self._stream_position_tokens[key] = token
         algo_orders = 0
         if self.algo_stream is not None:
             algo_snapshot = self.algo_stream.snapshot()
@@ -415,9 +444,14 @@ class AccountSynchronizer:
         }
 
     async def sync_rest(self) -> dict[str, Any]:
+        async with self._rest_lock:
+            return await self._sync_rest()
+
+    async def _sync_rest(self) -> dict[str, Any]:
         if not self.account_client.configured:
             return {"positions": 0, "orders": 0, "fills": 0}
         captured_at = datetime.now(timezone.utc)
+        position_versions = dict(self._position_versions)
 
         async def load_bills() -> list[dict[str, Any]] | None:
             loader = getattr(self.account_client, "bills_today", None)
@@ -531,41 +565,20 @@ class AccountSynchronizer:
 
         seen_position_keys: set[str] = set()
         for item in positions:
-            size = _number(item.get("pos"))
-            pos_side = str(item.get("posSide", "net"))
-            stop_loss, take_profit = self._local_protection(
-                str(item.get("instId", "")),
-                pos_side,
-                size,
-            )
-            position_key = ":".join(
-                (
-                    str(item.get("instId", "")),
-                    pos_side,
-                    str(item.get("mgnMode", "")),
-                )
-            )
+            position_key = _position_key(item)
             seen_position_keys.add(position_key)
-            self.store.upsert_position(
-                {
-                    "position_key": position_key,
-                    "inst_id": str(item.get("instId", "")),
-                    "pos_side": pos_side,
-                    "size": size,
-                    "entry_price": _number(item.get("avgPx") or item.get("openAvgPx")),
-                    "mark_price": _number(item.get("markPx")),
-                    "notional": _number(
-                        item.get("notionalUsd")
-                        or item.get("notional")
-                        or item.get("notionalCcy")
-                    ),
-                    "stop_loss": stop_loss,
-                    "take_profit": take_profit,
-                    "unrealized_pnl": _number(item.get("upl")),
-                    "status": "open" if abs(size) > 0 else "closed",
-                }
-            )
+            pushed_during_request = self._position_versions.get(position_key) != position_versions.get(position_key)
+            rest_timestamp = _exchange_ms(item.get("uTime"))
+            proven_newer = rest_timestamp is not None and rest_timestamp > self._position_times.get(position_key, rest_timestamp)
+            if not pushed_during_request or proven_newer:
+                self._save_position(item)
         if "positions" not in errors:
+            # A REST response cannot roll back or close a position updated by a
+            # push while this request was in flight.
+            seen_position_keys.update(
+                key for key, version in self._position_versions.items()
+                if version != position_versions.get(key)
+            )
             self.store.close_positions_not_seen(seen_position_keys)
         for item in fills:
             record, is_new_fill = self._save_fill(item)

@@ -69,23 +69,28 @@ function resetResearchAccess() {
   researchRunMessage("");
 }
 
+function renderResearchStatus(payload) {
+  researchState.runtime = payload.tradingagents;
+  const runtime = researchState.runtime || {};
+  const checking = researchState.checkBusy;
+  const busy = runtime.busy || researchState.runBusy;
+  const label = checking ? "自检中" : busy ? "研究运行中"
+    : !runtime.configured ? "未就绪"
+      : ({ ready: "运行时就绪", failed: "运行失败", canceled: "已取消" })[runtime.runtime_state] || "待自检";
+  setState("#ai-runtime-state", label, !runtime.configured || runtime.runtime_state === "failed"
+    ? "warning" : runtime.runtime_state === "ready" ? "good" : "neutral");
+  setText("#ai-runtime-note", runtime.last_error
+    ? runtimeErrors[runtime.last_error] || `运行状态：${runtime.last_error}`
+    : `研究与交易隔离 · 时限 ${runtime.timeout_seconds || "--"} 秒 · 自检不验证模型连通性`);
+  updateResearchAvailability();
+}
+
 async function loadResearchStatus() {
   const request = ++researchState.runtimeRequest;
   try {
     const payload = await api("/api/v1/analysis/status");
     if (request !== researchState.runtimeRequest) return;
-    researchState.runtime = payload.tradingagents;
-    const runtime = researchState.runtime || {};
-    const checking = researchState.checkBusy;
-    const busy = runtime.busy || researchState.runBusy;
-    const label = checking ? "自检中" : busy ? "研究运行中"
-      : !runtime.configured ? "未就绪"
-        : ({ ready: "运行时就绪", failed: "运行失败", canceled: "已取消" })[runtime.runtime_state] || "待自检";
-    setState("#ai-runtime-state", label, !runtime.configured || runtime.runtime_state === "failed"
-      ? "warning" : runtime.runtime_state === "ready" ? "good" : "neutral");
-    setText("#ai-runtime-note", runtime.last_error
-      ? runtimeErrors[runtime.last_error] || `运行状态：${runtime.last_error}`
-      : `研究与交易隔离 · 时限 ${runtime.timeout_seconds || "--"} 秒 · 自检不验证模型连通性`);
+    renderResearchStatus(payload);
   } catch {
     if (request !== researchState.runtimeRequest) return;
     researchState.runtime = null;
@@ -414,6 +419,6 @@ function initializeResearch() {
   });
   loadResearchStatus();
   setInterval(() => {
-    if (document.body.dataset.view === "strategies" || researchState.runBusy) loadResearchStatus();
+    if (state.controlFeedState !== "open" && (document.body.dataset.view === "strategies" || researchState.runBusy)) loadResearchStatus();
   }, 15000);
 }

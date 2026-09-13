@@ -27,4 +27,4 @@ RUN mkdir -p /data/tradingagents/cache /data/tradingagents/results /data/trading
 USER nobody
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-graceful-shutdown", "20"]

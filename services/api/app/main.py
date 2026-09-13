@@ -4,11 +4,12 @@ import secrets
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Path as RoutePath, Query
 from pydantic import BaseModel, ConfigDict, Field
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse
 
 from .okx_account import OkxAccountClient, OkxAccountError
 from .okx_algo_stream import OkxAlgoOrderStream
@@ -31,6 +32,7 @@ from .state_store import BillImportBusy, StateStore
 from .safety_control import SafetyController
 from .strategy_engine import StrategyEngine
 from .trading_signal import TradeSignal
+from .realtime import control_events, private_events
 
 
 def _symbols() -> list[str]:
@@ -88,6 +90,8 @@ automation_worker = AutomationWorker(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    account_stream.on_update = account_reconciler.notify_stream
+    algo_stream.on_update = account_reconciler.notify_stream
     await market_stream.start()
     await account_stream.start()
     await algo_stream.start()
@@ -330,6 +334,42 @@ async def market_overview(
 @app.get("/api/v1/market/stream")
 def market_stream_snapshot() -> dict[str, Any]:
     return market_stream.snapshot()
+
+
+@app.get("/api/v1/market/events")
+async def market_events(
+    bar: Literal["1m", "15m", "1H", "4H"] = "15m",
+) -> StreamingResponse:
+    return StreamingResponse(
+        market_stream.events(bar),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/v1/system/events")
+async def system_events() -> StreamingResponse:
+    return StreamingResponse(
+        control_events(system_status, analysis_status),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/v1/account/events")
+async def account_events(
+    x_admin_token: str | None = Header(default=None),
+    _: None = Depends(require_admin_token),
+) -> StreamingResponse:
+    def authorized() -> bool:
+        expected = os.getenv("ADMIN_API_TOKEN", "").strip()
+        return bool(expected and x_admin_token and secrets.compare_digest(x_admin_token, expected))
+
+    return StreamingResponse(
+        private_events(state_store, account_stream, account_client, authorized),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/api/v1/account/overview")

@@ -32,6 +32,11 @@ class AccountReconciler:
         self.last_attempt_at: str | None = None
         self.last_error: str | None = None
         self._task: asyncio.Task[None] | None = None
+        self._stream_task: asyncio.Task[None] | None = None
+        self._stream_changed = asyncio.Event()
+
+    def notify_stream(self) -> None:
+        self._stream_changed.set()
 
     async def start(self) -> None:
         if self.enabled and self._task is None:
@@ -39,13 +44,19 @@ class AccountReconciler:
                 self._run(),
                 name="openperpdesk-account-reconciler",
             )
+            self._stream_task = asyncio.create_task(
+                self._run_stream(), name="openperpdesk-private-stream-sync",
+            )
 
     async def stop(self) -> None:
         if self._task is None:
             return
-        self._task.cancel()
-        await asyncio.gather(self._task, return_exceptions=True)
+        tasks = [task for task in (self._task, self._stream_task) if task is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         self._task = None
+        self._stream_task = None
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -79,6 +90,20 @@ class AccountReconciler:
             payload=result,
         )
         return result
+
+    async def _run_stream(self) -> None:
+        while True:
+            await self._stream_changed.wait()
+            self._stream_changed.clear()
+            try:
+                self.synchronizer.sync_stream()
+            except Exception as exc:
+                self.last_error = type(exc).__name__
+                self.store.add_audit(
+                    "account_stream_sync_failed",
+                    "Private stream update could not be persisted",
+                    severity="error", payload={"error": type(exc).__name__},
+                )
 
     async def _run(self) -> None:
         while True:

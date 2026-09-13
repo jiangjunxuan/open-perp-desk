@@ -2,6 +2,7 @@ import json
 import math
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -52,6 +53,8 @@ class StateStore:
     """
 
     def __init__(self, path: str | None = None) -> None:
+        self.revision = 0
+        self._revision_lock = threading.Lock()
         configured = path or os.getenv("STATE_DB_PATH", "")
         if configured:
             self.path = Path(configured)
@@ -70,6 +73,9 @@ class StateStore:
         try:
             yield connection
             connection.commit()
+            if connection.total_changes:
+                with self._revision_lock:
+                    self.revision += 1
         finally:
             connection.close()
 

@@ -58,8 +58,10 @@ jobs:
           curl --fail --silent http://127.0.0.1:8080/research.js | grep 'initializeResearch' >/dev/null
           curl --fail --silent http://127.0.0.1:8080/theme.js | grep 'openperpdesk.theme' >/dev/null
           curl --fail --silent http://127.0.0.1:8080/account-history.js | grep 'initializeBillHistory' >/dev/null
+          curl --fail --silent http://127.0.0.1:8080/live.js | grep 'openLiveStream' >/dev/null
           curl --fail --silent http://127.0.0.1:8080/assets/reports/marked.js | grep 'Marked' >/dev/null
           curl --fail --silent http://127.0.0.1:8080/assets/reports/purify.min.js | grep 'DOMPurify' >/dev/null
+          python infra/realtime-smoke.py --base-url http://127.0.0.1:8080
           docker compose exec -T api python -c \
             'from app.state_store import StateStore; StateStore().set_control_flag("ci_roundtrip", True)'
           ./infra/openperpdesk.sh backup
@@ -74,6 +76,7 @@ jobs:
           docker compose exec -T api python -m app.database_maintenance verify-runtime
           docker compose exec -T api python -c \
             'from app.state_store import StateStore; assert StateStore().get_control_flag("ci_roundtrip")'
+          python infra/realtime-smoke.py --base-url http://127.0.0.1:8080
 
   tradingagents-image:
     runs-on: ubuntu-latest
@@ -115,7 +118,8 @@ jobs:
       - run: node --check apps/web/research.js
       - run: node --check apps/web/theme.js
       - run: node --check apps/web/account-history.js
-      - run: node --test infra/appearance.test.mjs
+      - run: node --check apps/web/live.js
+      - run: node --test infra/appearance.test.mjs infra/live.test.mjs
       - run: bash -n infra/openperpdesk.sh
       - run: ./infra/openperpdesk.sh --help
       - name: preflight safety smoke

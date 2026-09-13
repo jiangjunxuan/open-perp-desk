@@ -49,6 +49,7 @@ RISK_MAX_TOTAL_NOTIONAL_PCT=30
 ./infra/openperpdesk.sh up
 ./infra/openperpdesk.sh status
 ./infra/openperpdesk.sh smoke
+python infra/realtime-smoke.py --base-url http://127.0.0.1:8080
 ```
 
 `preflight` 会在不打印密钥的前提下检查 `.env` 权限、Demo/实盘模式、
@@ -63,6 +64,8 @@ Live 模式必须保持 `OKX_DEMO=false`；需要执行时才额外要求
 
 `api` 和 `web` 都带有 Compose healthcheck；API 的优雅停止时间为 30 秒，
 Web 为 15 秒，便于升级时让 WebSocket 和正在处理的请求自然结束。
+Uvicorn 在 20 秒后终止仍未结束的连接，避免空闲 SSE 阻止容器退出；
+未确认订单仍保留持久化占位，重启后只读查单恢复，不自动重发。
 `/api/v1/health` 是进程存活检查；`/api/v1/health/readiness` 会在公共行情
 断线或状态库不可用时返回 `503`，适合接入反向代理或外部监控；运行指标可从
 `/api/v1/health/metrics` 读取，返回内容不包含代理地址、令牌或 API 密钥。
@@ -98,6 +101,25 @@ http://127.0.0.1:8080
 
 不要把 `ADMIN_API_TOKEN` 放在 Nginx 配置、URL、前端 HTML 或浏览器 localStorage
 中。控制台只在当前页面内存中发送 `X-Admin-Token`。
+
+实时推送的三个路径是 `/api/v1/market/events`、`/api/v1/system/events`
+和 `/api/v1/account/events`。宝塔外层代理应关闭这些路径的响应缓冲与缓存：
+
+```nginx
+location ~ ^/api/v1/(market|system|account)/events$ {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header Connection "";
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 60s;
+}
+```
+
+不要新增公开 API 端口或绕过站点访问控制。配置后用实际 HTTPS 域名运行
+`infra/realtime-smoke.py --base-url https://perp.example.com`，脚本只读检查
+连续事件、心跳时延及私有通道未认证时的拒绝结果，不会发单。
 
 ## 4. OKX 出站代理
 
@@ -301,9 +323,12 @@ Demo Worker。任何实盘试运行必须另行
 
 本地测试覆盖真实 SQLite WAL 快照、并发写入时的一致性、坏库拒绝、回滚归档、
 自定义路径、标准输入传输校验、恢复子进程强制退出和持久启动拦截。
-Compose 编排测试使用命令契约替身，不代表容器已经实际运行。
-CI 的 Compose 作业另行构建镜像、验证图标、在自定义数据路径执行备份恢复及重启持久性。
-当前开发机没有 Docker，容器构建、服务器 HTTPS 和宝塔验收仍需实际运行证明。
+本地 Compose 编排测试使用命令契约替身，不代表容器已经实际运行。
+CI 基线 `b58edbc` 已在 2026-09-13 实际构建镜像、验证图标、在自定义数据路径
+执行备份恢复及重启持久性；可选 TradingAgents 镜像也通过离线非 root 自检。
+实时 SSE 版本另外增加容器 Nginx 及恢复重启后的流式检查，须以该版本的 CI 结果为准。
+当前开发机没有 Docker，目标服务器 HTTPS、宝塔和实际外部凭据仍需另行验收；
+离线研究自检不能证明真实模型连接可用。
 
 ## 7. 最小上线检查
 

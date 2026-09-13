@@ -6,7 +6,7 @@ import json
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from websockets.asyncio.client import connect
 
@@ -34,6 +34,7 @@ class OkxAlgoOrderStream:
         self.last_error: str | None = None
         self.orders: dict[str, dict[str, Any]] = {}
         self._task: asyncio.Task[None] | None = None
+        self.on_update: Callable[[], None] | None = None
 
     @property
     def configured(self) -> bool:
@@ -158,6 +159,8 @@ class OkxAlgoOrderStream:
                 self.orders[order_id] = item
         if any(isinstance(item, dict) for item in rows):
             self.last_message_at = datetime.now(timezone.utc).isoformat()
+            if self.on_update is not None:
+                self.on_update()
 
     def snapshot(self) -> dict[str, Any]:
         return {

@@ -65,7 +65,7 @@ class LocalExchange:
             subscription = json.loads(await socket.recv())
             self.subscriptions[path] = subscription["args"]
             expected_channels = {
-                "/public": {"tickers"}, "/candles": {"candle1m"},
+                "/public": {"tickers", "open-interest", "funding-rate"}, "/candles": {"candle1m", "candle15m", "candle1H", "candle4H"},
                 "/private": {"account", "positions", "orders"}, "/algo": {"orders-algo"},
             }[path]
             actual = {item["channel"] for item in subscription["args"]}
@@ -79,7 +79,12 @@ class LocalExchange:
                     continue
                 data = {
                     "tickers": [{"last": "100", "instId": "BTC-USDT-SWAP"}],
+                    "open-interest": [{"oi": "100", "instId": "BTC-USDT-SWAP"}],
+                    "funding-rate": [{"fundingRate": "0.0001", "instId": "BTC-USDT-SWAP"}],
                     "candle1m": [["1", "100", "101", "99", "100", "1"]],
+                    "candle15m": [["1", "100", "101", "99", "100", "1"]],
+                    "candle1H": [["1", "100", "101", "99", "100", "1"]],
+                    "candle4H": [["1", "100", "101", "99", "100", "1"]],
                     "account": [{"ccy": "USDT", "cashBal": "1000"}],
                     "positions": [{"instId": "BTC-USDT-SWAP", "posSide": "net", "pos": "1"}],
                     "orders": [{"ordId": "order1", "state": "filled", "tradeId": "fill1", "fillSz": "1", "fillPx": "100"}],

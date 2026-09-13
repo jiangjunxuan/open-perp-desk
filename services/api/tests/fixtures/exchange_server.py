@@ -285,7 +285,7 @@ class ExchangeServer:
             args = json.loads(await socket.recv())["args"]
             self.subscriptions[path] = {item["channel"] for item in args}
             expected = {
-                "/public": {"tickers"}, "/candles": {"candle1m"},
+                "/public": {"tickers", "open-interest", "funding-rate"}, "/candles": {"candle1m", "candle15m", "candle1H", "candle4H"},
                 "/private": {"account", "orders", "positions"}, "/algo": {"orders-algo"},
             }[path]
             if self.subscriptions[path] != expected:
@@ -304,7 +304,11 @@ class ExchangeServer:
                             channel = arg["channel"]
                             if channel == "tickers":
                                 data = [self.ticker()]
-                            elif channel == "candle1m":
+                            elif channel == "open-interest":
+                                data = [{"instId": SYMBOL, "oi": "100"}]
+                            elif channel == "funding-rate":
+                                data = [{"instId": SYMBOL, "fundingRate": "0.0001"}]
+                            elif channel in {"candle1m", "candle15m", "candle1H", "candle4H"}:
                                 data = self.candles[:1]
                             elif channel == "account":
                                 data = [self.balance()]

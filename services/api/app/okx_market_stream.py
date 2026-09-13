@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import time
+from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from typing import Any
 
@@ -12,6 +13,9 @@ from .okx_websocket import OkxSubscriptionError, decode_message, socket_messages
 
 class OkxMarketStream:
     """Read-only OKX public market stream with fail-closed reconnects."""
+
+    candle_bars = ("1m", "15m", "1H", "4H")
+    public_channels = ("tickers", "open-interest", "funding-rate")
 
     def __init__(self, symbols: list[str]) -> None:
         self.symbols = symbols
@@ -26,6 +30,13 @@ class OkxMarketStream:
         self.candles_last_error: str | None = None
         self.tickers: dict[str, dict[str, Any]] = {}
         self.candles: dict[str, dict[str, Any]] = {}
+        self._candles_by_bar: dict[str, dict[str, dict[str, Any]]] = {
+            bar: {} for bar in self.candle_bars
+        }
+        self._record_epochs: dict[tuple[str, str], float] = {}
+        self.metrics: dict[str, dict[str, dict[str, Any]]] = {
+            channel: {} for channel in ("open-interest", "funding-rate")
+        }
         self._last_message_epoch: float | None = None
         self._last_candle_epoch: float | None = None
         self._task: asyncio.Task[None] | None = None
@@ -78,6 +89,14 @@ class OkxMarketStream:
         while True:
             try:
                 setattr(self, epoch_field, None)
+                channels = (
+                    {f"candle{bar}" for bar in self.candle_bars}
+                    if candles else set(self.public_channels)
+                )
+                self._record_epochs = {
+                    key: value for key, value in self._record_epochs.items()
+                    if key[0] not in channels
+                }
                 async with connect(
                     url,
                     proxy=self.proxy_url,
@@ -106,11 +125,13 @@ class OkxMarketStream:
             delay = min(delay * 2, 30.0)
 
     def subscription_message(self, *, candles: bool = False) -> dict[str, Any]:
+        channels = [f"candle{bar}" for bar in self.candle_bars] if candles else self.public_channels
         return {
             "op": "subscribe",
             "args": [
-                {"channel": "candle1m" if candles else "tickers", "instId": symbol}
+                {"channel": channel, "instId": symbol}
                 for symbol in self.symbols
+                for channel in channels
             ],
         }
 
@@ -126,7 +147,7 @@ class OkxMarketStream:
             return
         channel = argument.get("channel")
         inst_id = argument.get("instId")
-        if not channel or not inst_id or not data:
+        if not isinstance(channel, str) or inst_id not in self.symbols or not data:
             return
 
         received_at = datetime.now(timezone.utc).isoformat()
@@ -140,10 +161,54 @@ class OkxMarketStream:
             self.last_message_at = received_at
             self._last_message_epoch = time.monotonic()
             self.tickers[inst_id] = record
-        elif channel == "candle1m" and isinstance(data[0], list):
+            self._record_epochs[(channel, inst_id)] = time.monotonic()
+        elif channel in {f"candle{bar}" for bar in self.candle_bars} and isinstance(data[0], list):
             self.candles_last_message_at = received_at
             self._last_candle_epoch = time.monotonic()
-            self.candles[inst_id] = record
+            bar = channel.removeprefix("candle")
+            self._candles_by_bar[bar][inst_id] = record
+            self._record_epochs[(channel, inst_id)] = time.monotonic()
+            if bar == "1m":
+                self.candles[inst_id] = record
+        elif channel in self.metrics and isinstance(data[0], dict):
+            self.metrics[channel][inst_id] = record
+            self._record_epochs[(channel, inst_id)] = time.monotonic()
+
+    def _records(self, records: dict[str, dict[str, Any]], connected: bool) -> dict[str, Any]:
+        now = time.monotonic()
+        return {
+            symbol: {
+                **record,
+                "fresh": connected and now - self._record_epochs.get(
+                    (record["channel"], symbol), float("-inf"),
+                ) < (120 if record["channel"] == "funding-rate" else 45),
+            }
+            for symbol, record in records.items()
+        }
+
+    def browser_snapshot(self, bar: str) -> dict[str, Any]:
+        return {
+            "bar": bar,
+            "connected": self.connected,
+            "candles_connected": self.candles_connected,
+            "tickers": self._records(self.tickers, self.connected),
+            "candles": self._records(self._candles_by_bar[bar], self.candles_connected),
+            "open_interest": self._records(self.metrics["open-interest"], self.connected),
+            "funding_rate": self._records(self.metrics["funding-rate"], self.connected),
+        }
+
+    async def events(self, bar: str) -> AsyncIterator[str]:
+        """Bounded latest-state delivery, not an unbounded queue of trade ticks."""
+        previous = None
+        sent_at = float("-inf")
+        yield "retry: 2000\n\n"
+        while True:
+            payload = json.dumps(self.browser_snapshot(bar), separators=(",", ":"))
+            now = time.monotonic()
+            if payload != previous or now - sent_at >= 5:
+                yield f"event: market\ndata: {payload}\n\n"
+                previous, sent_at = payload, now
+            await asyncio.sleep(.25)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -157,6 +222,6 @@ class OkxMarketStream:
             "candles_fresh": self.candles_fresh,
             "candles_last_message_at": self.candles_last_message_at,
             "candles_last_error": self.candles_last_error,
-            "tickers": self.tickers,
-            "candles": self.candles,
+            "tickers": self._records(self.tickers, self.connected),
+            "candles": self._records(self.candles, self.candles_connected),
         }

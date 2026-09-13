@@ -20,7 +20,8 @@ class OkxMarketStreamTests(unittest.TestCase):
         self.assertNotIn(("candle1m", "ETH-USDT-SWAP"), channels)
         candles = self.stream.subscription_message(candles=True)
         self.assertEqual(
-            {item["channel"] for item in candles["args"]}, {"candle1m"}
+            {item["channel"] for item in candles["args"]},
+            {"candle1m", "candle15m", "candle1H", "candle4H"},
         )
         self.assertTrue(self.stream.candles_url.endswith("/business"))
 

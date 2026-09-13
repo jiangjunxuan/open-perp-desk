@@ -7,6 +7,19 @@ const state = {
   status: null,
   marketPaused: false,
   marketRequest: 0,
+  marketFeedState: "connecting",
+  marketStream: null,
+  marketSnapshotFresh: false,
+  marketCandleKey: null,
+  controlFeedState: "connecting",
+  controlSnapshotFresh: false,
+  controlUpdates: 0,
+  statusRequest: 0,
+  privateFeedState: "locked",
+  privateUpdates: 0,
+  strategyDirty: false,
+  workerModeDirty: false,
+  performanceRequest: 0,
   analysisRequest: 0,
   submitting: false,
   ledger: "positions",
@@ -173,14 +186,14 @@ function showLedger(ledger, focus = false) {
 
 function setText(selector, value) {
   const element = $(selector);
-  if (element) element.textContent = value;
+  if (element && element.textContent !== String(value)) element.textContent = value;
 }
 
 function setState(selector, value, tone = "neutral") {
   const element = $(selector);
   if (!element) return;
-  element.textContent = value;
-  element.dataset.tone = tone;
+  if (element.textContent !== String(value)) element.textContent = value;
+  if (element.dataset.tone !== tone) element.dataset.tone = tone;
 }
 
 function escapeHtml(value) {
@@ -309,6 +322,12 @@ function renderChart(rows) {
     padding.top + (1 - (value - min) / range) * chartHeight;
   const xFor = (index) =>
     padding.left + (index + 0.5) * chartWidth / candles.length;
+  const latest = candles.at(-1);
+  const latestY = yFor(latest.close);
+  const priceLabelY = Math.min(
+    padding.top + chartHeight - 10,
+    Math.max(padding.top + 10, latestY),
+  );
 
   const colors = getComputedStyle(document.documentElement);
   context.strokeStyle = colors.getPropertyValue("--border-soft").trim();
@@ -322,7 +341,9 @@ function renderChart(rows) {
     context.moveTo(padding.left, y);
     context.lineTo(padding.left + chartWidth, y);
     context.stroke();
-    context.fillText(formatNumber(max - row * range / 4, 2), padding.left + chartWidth + 8, y + 3);
+    if (Math.abs(y - priceLabelY) > 18) {
+      context.fillText(formatNumber(max - row * range / 4, 2), padding.left + chartWidth + 8, y + 3);
+    }
   }
   for (let column = 1; column < 4; column += 1) {
     const x = padding.left + column * chartWidth / 4;
@@ -373,7 +394,6 @@ function renderChart(rows) {
     });
     context.stroke();
   }
-  const latest = candles.at(-1);
   const closeY = yFor(latest.close);
   const closeColor = colors.getPropertyValue(latest.close >= latest.open ? "--accent" : "--danger").trim();
   context.strokeStyle = closeColor;
@@ -385,9 +405,9 @@ function renderChart(rows) {
   context.stroke();
   context.setLineDash([]);
   context.fillStyle = closeColor;
-  context.fillRect(padding.left + chartWidth + 2, closeY - 9, padding.right - 4, 18);
+  context.fillRect(padding.left + chartWidth + 2, priceLabelY - 9, padding.right - 4, 18);
   context.fillStyle = colors.getPropertyValue("--on-chart-label").trim();
-  context.fillText(formatNumber(latest.close, 2), padding.left + chartWidth + 7, closeY + 3);
+  context.fillText(formatNumber(latest.close, 2), padding.left + chartWidth + 7, priceLabelY + 3);
   state.chartGeometry = { candles, padding, chartWidth };
   const cursorIndex = candles.findIndex(candle => candle.time === state.chartCursorTime);
   showChartCursor(cursorIndex);
@@ -443,14 +463,17 @@ function renderWatchlist(tickers) {
   setText("#best-bid", formatNumber(current.bidPx, 2));
   setText("#best-ask", formatNumber(current.askPx, 2));
   setText("#market-updated", formatTime(tickers?.[state.symbol]?.received_at));
+  setText("#ribbon-sync", formatTime(tickers?.[state.symbol]?.received_at));
   setState("#market-price", formatNumber(current.last, 2), "neutral");
 
   const watchlist = $("#watchlist");
   if (watchlist) {
-    const focusedSymbol = document.activeElement?.closest(".watch-item")?.dataset.symbol;
     const symbols = [...new Set(["BTC-USDT-SWAP", "ETH-USDT-SWAP", ...Object.keys(tickers || {})])];
     const visibleSymbols = symbols.length ? symbols : ["BTC-USDT-SWAP", "ETH-USDT-SWAP"];
-    watchlist.innerHTML = visibleSymbols.map((symbol) => {
+    for (const item of [...watchlist.children]) {
+      if (!visibleSymbols.includes(item.dataset.symbol)) item.remove();
+    }
+    visibleSymbols.forEach((symbol) => {
       const ticker = tickers?.[symbol]?.data || {};
       const tickerLast = Number(ticker.last);
       const tickerOpen = Number(ticker.sodUtc8);
@@ -459,28 +482,40 @@ function renderWatchlist(tickers) {
         : null;
       const shortName = symbol.split("-")[0];
       const isActive = symbol === state.symbol;
-      const freshness = tickers?.[symbol]?.received_at ? "在线" : "等待";
+      const freshness = tickers?.[symbol]?.fresh === false ? "延迟"
+        : tickers?.[symbol]?.received_at ? "在线" : "等待";
       const changeLabel = tickerChange === null
         ? "等待行情"
         : `${tickerChange >= 0 ? "+" : ""}${tickerChange.toFixed(2)}%`;
-      return `
-        <button class="watch-item${isActive ? " is-active" : ""}" type="button"
-          data-symbol="${escapeHtml(symbol)}" aria-pressed="${isActive ? "true" : "false"}">
-          <span class="watch-item-top"><strong>${escapeHtml(shortName)}</strong><span class="watch-item-state">${freshness}</span></span>
-          <span class="watch-item-price mono">${formatNumber(ticker.last, 2)}</span>
-          <span class="watch-item-change mono${tickerChange !== null && tickerChange >= 0 ? " change-positive" : tickerChange !== null ? " change-negative" : ""}">${changeLabel}</span>
-        </button>`;
-    }).join("");
-    if (focusedSymbol) {
-      [...watchlist.querySelectorAll(".watch-item")]
-        .find(item => item.dataset.symbol === focusedSymbol)?.focus({ preventScroll: true });
-    }
+      let button = [...watchlist.children].find(item => item.dataset.symbol === symbol);
+      if (!button) {
+        button = document.createElement("button");
+        button.type = "button";
+        button.dataset.symbol = symbol;
+        button.innerHTML = '<span class="watch-item-top"><strong></strong><span class="watch-item-state"></span></span><span class="watch-item-price mono"></span><span class="watch-item-change mono"></span>';
+        watchlist.append(button);
+      }
+      button.className = `watch-item${isActive ? " is-active" : ""}`;
+      button.setAttribute("aria-pressed", String(isActive));
+      for (const [selector, text] of [
+        ["strong", shortName], [".watch-item-state", freshness],
+        [".watch-item-price", formatNumber(ticker.last, 2)], [".watch-item-change", changeLabel],
+      ]) {
+        const element = button.querySelector(selector);
+        if (element.textContent !== text) element.textContent = text;
+      }
+      button.querySelector(".watch-item-change").className = `watch-item-change mono${tickerChange !== null && tickerChange >= 0 ? " change-positive" : tickerChange !== null ? " change-negative" : ""}`;
+    });
   }
 }
 
 function renderMarketOverview(overview) {
-  const funding = overview?.funding_rate || {};
-  const openInterest = overview?.open_interest || {};
+  if (overview) state.marketOverview = overview;
+  const snapshot = state.marketFeedState === "open" && !state.marketPaused ? state.marketStream : null;
+  const funding = snapshot?.funding_rate?.[state.symbol]?.fresh
+    ? snapshot.funding_rate[state.symbol].data : state.marketOverview?.funding_rate || {};
+  const openInterest = snapshot?.open_interest?.[state.symbol]?.fresh
+    ? snapshot.open_interest[state.symbol].data : state.marketOverview?.open_interest || {};
   const fundingRate = funding.fundingRate == null || funding.fundingRate === "" ? NaN : Number(funding.fundingRate);
   const oi = Number(openInterest.oi || openInterest.oiCcy || NaN);
   setText(
@@ -697,6 +732,7 @@ async function saveStrategy() {
       }),
     });
     renderStrategy(payload.data);
+    state.strategyDirty = false;
     setText("#strategy-message", "策略参数已保存，下一次分析和自动运行将读取新配置。");
     setMessage("策略配置已更新", "good");
   } catch (error) {
@@ -1052,6 +1088,8 @@ async function loadActivity() {
 
 function executionGateOpen(status) {
   return status?.execution_enabled === true
+    && state.controlFeedState === "open"
+    && state.controlSnapshotFresh
     && status.risk_engine_ready === true
     && status.safety_control?.emergency_stopped !== true
     && status.safety_control?.execution_allowed === true
@@ -1171,7 +1209,7 @@ function applyStatus(status) {
   setText("#toggle-worker", worker.enabled ? "停止自动执行" : "启用模拟盘自动执行");
   $("#toggle-worker").classList.toggle("danger", worker.enabled);
   $("#toggle-worker").classList.toggle("secondary", !worker.enabled);
-  $("#worker-dry-run").checked = worker.dry_run !== false;
+  if (!state.workerModeDirty) $("#worker-dry-run").checked = worker.dry_run !== false;
   setText("#ribbon-sync", formatTime(status.market_stream?.last_message_at));
   setState("#sidebar-market", marketLabel, status.market_data_connected ? "good" : "warning");
   setState("#sidebar-risk", status.risk_engine_ready ? "就绪" : "锁定", status.risk_engine_ready ? "good" : "danger");
@@ -1235,6 +1273,10 @@ async function setEmergencyStop(path, message) {
     setMessage("请先输入管理员令牌", "error");
     return;
   }
+  const button = path.endsWith("emergency-stop") ? "#emergency-stop" : "#resume-trading";
+  if ($(button).hasAttribute("aria-busy")) return;
+  setBusy(button, true);
+  setMessage(path.endsWith("emergency-stop") ? "正在触发急停..." : "正在恢复执行闸门...");
   try {
     const payload = await api(path, {
       method: "POST",
@@ -1245,15 +1287,22 @@ async function setEmergencyStop(path, message) {
     await loadStatus();
   } catch (error) {
     setMessage(`安全操作失败：${error.message}`, "error");
+  } finally {
+    setBusy(button, false);
+    updatePrivateActionAvailability();
   }
 }
 
 async function loadStatus() {
+  const request = ++state.statusRequest;
+  const updates = state.controlUpdates;
   try {
     const payload = await api("/api/v1/system/status");
+    if (request !== state.statusRequest || updates !== state.controlUpdates) return;
     applyStatus(payload);
     setConnection(true);
   } catch {
+    if (request !== state.statusRequest || updates !== state.controlUpdates) return;
     setConnection(false);
   }
 }
@@ -1268,8 +1317,11 @@ async function loadMarket() {
       api(`/api/v1/market/candles?inst_id=${encodeURIComponent(symbol)}&bar=${encodeURIComponent(bar)}&limit=100`),
     ]);
     if (request !== state.marketRequest) return;
-    renderWatchlist(stream.tickers);
+    state.marketSnapshotFresh = stream.tickers?.[symbol]?.fresh ?? stream.fresh;
+    if (state.marketFeedState !== "open" || state.marketPaused) renderWatchlist(stream.tickers);
     renderChart(candlePayload.data);
+    state.marketCandleKey = null;
+    applyLiveCandle();
     try {
       const overview = await api(`/api/v1/market/overview?inst_id=${encodeURIComponent(symbol)}`);
       if (request !== state.marketRequest) return;
@@ -1278,14 +1330,16 @@ async function loadMarket() {
       if (request !== state.marketRequest) return;
       renderMarketOverview({});
     }
-    setText("#market-tag", stream.fresh ? "行情快照 · 15s" : "数据过期");
-    setState("#state-market", stream.fresh ? "在线" : "数据过期", stream.fresh ? "good" : "warning");
+    updateMarketRefreshControl();
   } catch (error) {
     if (request !== state.marketRequest) return;
-    setText("#market-tag", "连接失败");
-    setText("#chart-empty", error.message);
-    $("#chart-empty").hidden = false;
-    $("#chart-cursor").hidden = true;
+    state.marketSnapshotFresh = false;
+    updateMarketRefreshControl();
+    if (!state.lastCandles?.length) {
+      setText("#chart-empty", error.message);
+      $("#chart-empty").hidden = false;
+      $("#chart-cursor").hidden = true;
+    }
   } finally {
     if (request === state.marketRequest) setBusy("#refresh-market", false);
   }
@@ -1300,8 +1354,197 @@ function updateMarketRefreshControl() {
   button.querySelector("[data-icon]").dataset.icon = state.marketPaused ? "play" : "pause";
   renderIcons(button);
   button.setAttribute("aria-pressed", String(state.marketPaused));
-  setText("#market-refresh-state", state.marketPaused ? "已暂停，手动刷新仍可用" : "每 15 秒更新");
-  setText("#quote-refresh-label", state.marketPaused ? "自动刷新已暂停" : "15 秒快照");
+  const live = state.marketFeedState === "open";
+  const fresh = state.marketStream?.tickers?.[state.symbol]?.fresh;
+  const labelText = state.marketPaused ? "行情已暂停"
+    : live ? fresh ? "实时推送" : "行情延迟"
+      : state.marketFeedState === "connecting" ? "连接中"
+        : state.marketSnapshotFresh ? "推送断开 · 快照备用" : "行情连接中断";
+  const tone = !state.marketPaused && live && fresh ? "good" : "warning";
+  setText("#market-refresh-state", labelText);
+  setState("#market-tag", labelText, tone);
+  setText("#quote-refresh-label", labelText);
+}
+
+let marketFeed;
+let controlFeed;
+let privateFeed;
+
+function applyLiveCandle() {
+  if (state.marketPaused || state.marketFeedState !== "open" || !state.lastCandles?.length) return;
+  const snapshot = state.marketStream;
+  const record = snapshot?.bar === state.bar ? snapshot.candles?.[state.symbol] : null;
+  const row = record?.data;
+  if (!record?.fresh || !Array.isArray(row) || row.length < 6
+      || !row.slice(0, 6).every(value => value !== "" && Number.isFinite(Number(value)))
+      || Number(row[0]) < Number(state.lastCandles[0][0])) return;
+  const key = `${state.symbol}:${state.bar}:${JSON.stringify(row)}`;
+  if (key === state.marketCandleKey) return;
+  state.marketCandleKey = key;
+  const rows = state.lastCandles.filter(item => String(item[0]) !== String(row[0]));
+  renderChart([row, ...rows].slice(0, 100));
+}
+
+function connectMarketFeed() {
+  marketFeed?.close();
+  marketFeed = null;
+  state.marketFeedState = "connecting";
+  state.marketStream = null;
+  state.marketCandleKey = null;
+  updateMarketRefreshControl();
+  if (state.marketPaused || document.hidden) return;
+  const bar = state.bar;
+  marketFeed = openLiveStream(`/api/v1/market/events?bar=${encodeURIComponent(bar)}`, {
+    onState(status) {
+      state.marketFeedState = status;
+      updateMarketRefreshControl();
+    },
+    onEvent(event, snapshot) {
+      if (event !== "market" || snapshot.bar !== state.bar || state.marketPaused
+          || !snapshot.tickers || !snapshot.candles) return;
+      state.marketStream = snapshot;
+      renderWatchlist(snapshot.tickers);
+      renderMarketOverview();
+      applyLiveCandle();
+      updateMarketRefreshControl();
+    },
+  });
+}
+
+function connectControlFeed() {
+  controlFeed?.close();
+  if (document.hidden) return;
+  controlFeed = openLiveStream("/api/v1/system/events", {
+    onState(status) {
+      state.controlFeedState = status;
+      setConnection(status === "open");
+      if (status !== "open") {
+        state.controlSnapshotFresh = false;
+        state.controlUpdates += 1;
+        if (state.status) applyStatus(state.status);
+        $("#execute-signal").disabled = true;
+        setState("#top-execution", "连接待确认 · 禁止提交", "warning");
+      }
+    },
+    onEvent(event, payload) {
+      if (event === "status") {
+        state.controlSnapshotFresh = true;
+        state.controlUpdates += 1;
+        applyStatus(payload);
+      }
+      if (event === "analysis_status") {
+        researchState.runtimeRequest += 1;
+        renderResearchStatus(payload);
+      }
+    },
+  });
+}
+
+function lockPrivateAccess() {
+  privateFeed?.close();
+  privateFeed = null;
+  state.privateFeedState = "locked";
+  state.token = "";
+  state.privateUpdates += 1;
+  renderPositions([]);
+  renderOrders([]);
+  renderFills([]);
+  renderPnl([]);
+  renderPerformance({});
+  renderAccountBills({ configured: false });
+  setText("#metric-equity", "--");
+  setText("#metric-equity-note", "管理员访问已锁定");
+  setText("#positions-tag", "需要令牌");
+  updatePrivateActionAvailability();
+}
+
+async function refreshLivePerformance() {
+  const token = state.token;
+  const request = ++state.performanceRequest;
+  if (!token) return;
+  try {
+    const report = await api(`/api/v1/performance/report?initial_equity=${encodeURIComponent($("#equity-input").value)}`);
+    if (token !== state.token || request !== state.performanceRequest) return;
+    renderPerformance(report.data);
+    setText("#pnl-summary", `净 PnL ${formatNumber(report.data?.net_pnl, 4)} · 回撤 ${formatNumber(report.data?.max_drawdown_pct, 2)}% · ${report.data?.fills || 0} 笔成交`);
+  } catch {
+    if (token === state.token) setText("#performance-basis", "绩效更新失败 · 保留上次数据");
+  }
+}
+
+function applyPrivateEvent(event, payload) {
+  if (!state.token) return;
+  if (event === "heartbeat") return;
+  if (event === "locked") {
+    lockPrivateAccess();
+    return;
+  }
+  state.privateUpdates += 1;
+  if (event === "positions") {
+    renderPositions(payload.data);
+    renderPnl(payload.data);
+  } else if (event === "orders") renderOrders(payload.data);
+  else if (event === "fills") {
+    renderFills(payload.data);
+    clearTimeout(state.performanceTimer);
+    state.performanceTimer = setTimeout(refreshLivePerformance, 100);
+  } else if (event === "activity") {
+    state.activityRequest += 1;
+    renderActivity(payload.data);
+  } else if (event === "bills") renderAccountBills(payload);
+  else if (event === "account") {
+    const ready = payload.connected && payload.authenticated;
+    setState("#positions-tag", ready ? "实时同步" : payload.configured ? "账户回报断开" : "私有凭据未配置", ready ? "good" : "warning");
+    const balance = payload.balance?.[0];
+    if (ready && balance) {
+      const equity = balance.totalEq ?? balance.adjEq ?? balance.eq;
+      if (equity !== undefined) {
+        setText("#metric-equity", formatNumber(equity, 2));
+        setText("#metric-equity-note", "OKX 账户实时回报");
+      }
+    }
+  } else if (event === "bill_import") {
+    const previous = billHistoryState.job?.status;
+    billHistoryState.jobRequest += 1;
+    renderBillImport(payload.job);
+    updateBillHistoryAvailability();
+    scheduleBillImportPoll();
+    if (previous === "running" && payload.job?.status !== "running" && billHistoryState.report) {
+      loadBillHistory({ reset: true });
+    }
+  } else if (event === "strategies") {
+    const strategy = payload.data?.find(item => item.strategy_id === "structured-technical");
+    if (strategy && !state.strategyDirty && !$("#save-strategy").hasAttribute("aria-busy")) {
+      renderStrategy(strategy);
+    } else if (strategy && state.strategyDirty) {
+      setText("#strategy-message", "服务器配置已更新；保留当前未保存参数。");
+    }
+  } else if (event === "analyses" && !researchState.runBusy) {
+    loadResearchHistory({ page: researchState.page });
+  }
+}
+
+function connectPrivateFeed() {
+  privateFeed?.close();
+  privateFeed = null;
+  if (!state.token || document.hidden) return;
+  const token = state.token;
+  privateFeed = openLiveStream("/api/v1/account/events", {
+    token,
+    onState(status) {
+      if (token !== state.token) return;
+      state.privateFeedState = status;
+      if (status === "locked") lockPrivateAccess();
+      else if (status !== "open") {
+        setState("#positions-tag", "账户推送重连中", "warning");
+        setText("#metric-equity-note", "账户推送重连中 · 保留上次数据");
+      }
+      scheduleBillImportPoll();
+    },
+    onEvent(event, payload) {
+      if (token === state.token) applyPrivateEvent(event, payload);
+    },
+  });
 }
 
 async function loadPrivate() {
@@ -1318,6 +1561,7 @@ async function loadPrivate() {
     }
     if (token !== state.token) return false;
     const activityRequest = ++state.activityRequest;
+    const privateUpdates = state.privateUpdates;
     const [account, positions, orders, fills, pnl, report, activity, bills] = await Promise.all([
       api("/api/v1/account/overview"),
       api("/api/v1/positions"),
@@ -1329,6 +1573,7 @@ async function loadPrivate() {
       api("/api/v1/account/bills").catch(error => ({ error: error.message })),
     ]);
     if (token !== state.token) return false;
+    if (privateUpdates !== state.privateUpdates && state.privateFeedState === "open") return true;
     const accountRow = account.balance?.[0] || {};
     const equity = accountRow.totalEq || accountRow.adjEq || accountRow.eq;
     setText("#metric-equity", formatNumber(equity, 2));
@@ -1563,7 +1808,7 @@ async function testNotification() {
         content: "来自 OpenPerpDesk 控制台的 PushPlus 链路测试。",
       }),
     });
-    setMessage("PushPlus 测试通知已发送", "good");
+    setMessage("PushPlus 已受理测试通知，送达以微信为准", "good");
   } catch (error) {
     setMessage(`PushPlus 发送失败：${error.message}`, "error");
   } finally {
@@ -1639,6 +1884,7 @@ function reloadSelectedMarket() {
   renderChart([]);
   renderWatchlist({});
   renderMarketOverview({});
+  connectMarketFeed();
   document.querySelectorAll("[data-bar]").forEach(button => {
     button.setAttribute("aria-pressed", String(button.dataset.bar === state.bar));
   });
@@ -1748,6 +1994,8 @@ document.addEventListener("click", event => {
   input.focus();
 });
 $("#size-input").addEventListener("input", clearPreflight);
+$(".strategy-settings").addEventListener("input", () => { state.strategyDirty = true; });
+$("#worker-dry-run").addEventListener("change", () => { state.workerModeDirty = true; });
 $("#equity-input").addEventListener("input", clearPreflight);
 $("#refresh-market").addEventListener("click", loadMarket);
 $("#toggle-market-details").addEventListener("click", () => {
@@ -1759,7 +2007,12 @@ $("#toggle-market-details").addEventListener("click", () => {
 });
 $("#toggle-market-refresh").addEventListener("click", () => {
   state.marketPaused = !state.marketPaused;
-  updateMarketRefreshControl();
+  if (state.marketPaused) {
+    state.marketRequest += 1;
+    setBusy("#refresh-market", false);
+  }
+  connectMarketFeed();
+  if (!state.marketPaused) loadMarket();
   setMessage(state.marketPaused ? "行情自动刷新已暂停" : "行情自动刷新已恢复", "good");
 });
 $("#run-analysis").addEventListener("click", runAnalysis);
@@ -1810,7 +2063,11 @@ $("#resume-trading").addEventListener("click", () => setEmergencyStop("/api/v1/s
 $("#auth-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   setBusy("#save-token", true, "同步中...");
+  privateFeed?.close();
+  privateFeed = null;
+  state.privateFeedState = "locked";
   state.token = $("#admin-token").value.trim();
+  if (!state.token) lockPrivateAccess();
   try {
     const [privateLoaded, strategiesLoaded] = await Promise.all([
       loadPrivate(),
@@ -1825,9 +2082,9 @@ $("#auth-form").addEventListener("submit", async (event) => {
       $("#open-auth").title = "管理员已解锁";
       $("#open-auth").setAttribute("aria-label", "管理员已解锁");
       loadResearchHistory({ reset: true });
+      connectPrivateFeed();
     } else if (state.token) {
-      state.token = "";
-      updatePrivateActionAvailability();
+      lockPrivateAccess();
       setMessage("管理员令牌无效或私有接口不可用", "error");
     }
   } finally {
@@ -1925,6 +2182,35 @@ window.addEventListener("storage", event => {
     setTheme(event.newValue, false);
   }
 });
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    marketFeed?.close();
+    controlFeed?.close();
+    privateFeed?.close();
+    state.marketFeedState = "offline";
+    state.controlFeedState = "offline";
+    state.controlSnapshotFresh = false;
+    state.controlUpdates += 1;
+    state.privateFeedState = "offline";
+  } else {
+    connectMarketFeed();
+    connectControlFeed();
+    connectPrivateFeed();
+    loadMarket();
+  }
+});
+window.addEventListener("pagehide", () => {
+  marketFeed?.close();
+  controlFeed?.close();
+  privateFeed?.close();
+});
+window.addEventListener("pageshow", event => {
+  if (event.persisted) {
+    connectMarketFeed();
+    connectControlFeed();
+    connectPrivateFeed();
+  }
+});
 
 setTheme(document.documentElement.dataset.theme, false);
 renderIcons();
@@ -1934,9 +2220,13 @@ showView(location.hash.slice(1));
 tickClock();
 setInterval(tickClock, 1000);
 loadStatus();
-setInterval(loadStatus, 15000);
-loadMarket();
 setInterval(() => {
-  if (!state.marketPaused) loadMarket();
+  if (!document.hidden && state.controlFeedState !== "open") loadStatus();
+}, 15000);
+connectControlFeed();
+loadMarket();
+connectMarketFeed();
+setInterval(() => {
+  if (!state.marketPaused && !document.hidden) loadMarket();
 }, 15000);
 updateMarketRefreshControl();

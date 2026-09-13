@@ -120,7 +120,7 @@
           <section class="market-strip" data-views="overview markets" aria-labelledby="market-strip-title">
             <div class="market-strip-heading">
               <h2 id="market-strip-title">自选</h2>
-              <span id="market-refresh-state" class="market-refresh-state" role="status" aria-live="polite">每 15 秒更新</span>
+              <span id="market-refresh-state" class="market-refresh-state" role="status" aria-live="polite" aria-atomic="true">行情连接中</span>
             </div>
             <div id="watchlist" class="watchlist" aria-label="关注合约列表">
               <button class="watch-item is-active" type="button" data-symbol="BTC-USDT-SWAP" aria-pressed="true">
@@ -231,7 +231,7 @@
               <div class="quote-tape" aria-label="最优买卖报价">
                 <div><span>买一</span><strong id="best-bid" class="mono change-positive">--</strong></div>
                 <div><span>卖一</span><strong id="best-ask" class="mono change-negative">--</strong></div>
-                <span class="quote-sync"><span id="quote-refresh-label">15 秒快照</span><time id="market-updated" class="mono">--</time></span>
+                <span class="quote-sync"><span id="quote-refresh-label">连接中</span><time id="market-updated" class="mono">--</time></span>
               </div>
               <p class="sr-only" id="chart-a11y">合约价格图表，数据来自 OKX 公共行情。</p>
             </article>
@@ -655,6 +655,7 @@
     <script src="/assets/reports/purify.min.js"></script>
     <script src="/research.js"></script>
     <script src="/account-history.js"></script>
+    <script src="/live.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>
