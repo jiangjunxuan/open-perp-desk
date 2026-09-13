@@ -291,6 +291,16 @@ class StateStore:
                     payload_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS position_lot_snapshots (
+                    account_scope TEXT NOT NULL,
+                    position_key TEXT NOT NULL,
+                    position_trade_id TEXT NOT NULL,
+                    position_size REAL NOT NULL,
+                    lifecycle_generation INTEGER NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (account_scope, position_key)
+                );
                 CREATE TABLE IF NOT EXISTS analyses (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     inst_id TEXT NOT NULL,
@@ -347,6 +357,8 @@ class StateStore:
                 connection.execute("ALTER TABLE orders ADD COLUMN risk_notional REAL")
             if "account_scope" not in order_columns:
                 connection.execute("ALTER TABLE orders ADD COLUMN account_scope TEXT")
+            if "protection_context_json" not in order_columns:
+                connection.execute("ALTER TABLE orders ADD COLUMN protection_context_json TEXT NOT NULL DEFAULT '{}'")
             if "order_kind" not in order_columns:
                 connection.execute("ALTER TABLE orders ADD COLUMN order_kind TEXT NOT NULL DEFAULT 'standard'")
                 connection.execute("UPDATE orders SET order_kind = 'algo' WHERE source LIKE 'okx-algo%'")
@@ -420,8 +432,8 @@ class StateStore:
                     client_order_id, exchange_order_id, status, inst_id, side,
                     pos_side, ord_type, td_mode, size, price, reduce_only,
                     stop_loss, take_profit, source, raw_json, created_at, updated_at,
-                    risk_notional, exchange_updated_ms, account_scope, order_kind
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    risk_notional, exchange_updated_ms, account_scope, order_kind, protection_context_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(client_order_id)
                 """ + on_conflict,
                 (
@@ -446,6 +458,7 @@ class StateStore:
                     order.get("exchange_updated_ms"),
                     order.get("account_scope"),
                     order.get("order_kind", "standard"),
+                    json.dumps(order.get("protection_context") or {}, ensure_ascii=True, allow_nan=False),
                 ),
             )
 
@@ -625,6 +638,106 @@ class StateStore:
                 (account_scope, inst_id, pos_side, td_mode, trade_id),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def exchange_order(self, inst_id: str, account_scope: str, exchange_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM orders WHERE inst_id = ? AND account_scope = ?
+                   AND exchange_order_id = ? AND order_kind = 'standard' LIMIT 2""",
+                (inst_id, account_scope, exchange_id),
+            ).fetchall()
+        if len(rows) > 1:
+            raise OrderSnapshotConflict("exchange_order_identity_ambiguous")
+        return dict(rows[0]) if rows else None
+
+    def native_parent_orders(self, position: dict[str, Any], exchange_id: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM orders
+                   WHERE account_scope = ? AND inst_id = ? AND pos_side = ? AND td_mode = ?
+                     AND order_kind = 'algo' AND (
+                       CASE WHEN json_valid(raw_json) THEN json_extract(raw_json, '$.ordId') END = ?
+                       OR EXISTS (
+                         SELECT 1 FROM json_each(CASE WHEN json_valid(raw_json)
+                           THEN json_extract(raw_json, '$.ordIdList') ELSE '[]' END)
+                         WHERE value = ?
+                       )
+                     ) LIMIT 2""",
+                (position["account_scope"], position["inst_id"], position["pos_side"],
+                 position["td_mode"], exchange_id, exchange_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_position_lots(
+        self, position: dict[str, Any], snapshot: dict[str, Any], *, expected_generation: int,
+    ) -> bool:
+        if not position.get("account_scope") or not position.get("exchange_trade_id"):
+            return False
+        encoded = json.dumps(snapshot, ensure_ascii=True, sort_keys=True, allow_nan=False)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT * FROM positions WHERE position_key = ?", (position["position_key"],),
+            ).fetchone()
+            identity = ("account_scope", "inst_id", "pos_side", "td_mode", "exchange_trade_id", "size", "lifecycle_generation")
+            if not current or current["status"] != "open" or any(
+                current[field] != position[field] for field in identity
+            ):
+                return False
+            generation = connection.execute(
+                "SELECT generation FROM execution_generation WHERE singleton = 1",
+            ).fetchone()[0]
+            if generation != expected_generation:
+                return False
+            connection.execute(
+                """INSERT INTO position_lot_snapshots
+                   (account_scope, position_key, position_trade_id, position_size,
+                    lifecycle_generation, snapshot_json, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(account_scope, position_key) DO UPDATE SET
+                    position_trade_id = excluded.position_trade_id,
+                    position_size = excluded.position_size,
+                    lifecycle_generation = excluded.lifecycle_generation,
+                    snapshot_json = excluded.snapshot_json, updated_at = excluded.updated_at
+                   WHERE position_lot_snapshots.snapshot_json != excluded.snapshot_json
+                      OR position_lot_snapshots.position_trade_id != excluded.position_trade_id
+                      OR position_lot_snapshots.position_size != excluded.position_size
+                      OR position_lot_snapshots.lifecycle_generation != excluded.lifecycle_generation""",
+                (position["account_scope"], position["position_key"], position["exchange_trade_id"],
+                 position["size"], position["lifecycle_generation"], encoded, _utc_now()),
+            )
+        return True
+
+    def position_lots(self, position: dict[str, Any]) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            current = connection.execute(
+                "SELECT * FROM positions WHERE position_key = ?", (position["position_key"],),
+            ).fetchone()
+            if not current or current["status"] != "open" or any(
+                current[field] != position.get(field) for field in (
+                    "account_scope", "inst_id", "pos_side", "td_mode", "exchange_trade_id",
+                    "size", "lifecycle_generation", "status",
+                )
+            ):
+                return None
+            row = connection.execute(
+                """SELECT * FROM position_lot_snapshots
+                   WHERE account_scope = ? AND position_key = ?""",
+                (position.get("account_scope"), position["position_key"]),
+            ).fetchone()
+            generation = connection.execute(
+                "SELECT generation FROM execution_generation WHERE singleton = 1",
+            ).fetchone()[0]
+        if not row or position["status"] != "open" or any(row[left] != position[right] for left, right in (
+            ("position_trade_id", "exchange_trade_id"), ("position_size", "size"),
+            ("lifecycle_generation", "lifecycle_generation"),
+        )):
+            return None
+        snapshot = json.loads(row["snapshot_json"])
+        if snapshot.get("status") == "verified" and snapshot.get("execution_generation") != generation:
+            return None
+        return snapshot
 
     def save_fill(self, fill: dict[str, Any]) -> dict[str, Any]:
         with self._connection() as connection:

@@ -87,6 +87,8 @@ API 健康检查地址为 `/api/v1/health`。
 - 结构化策略分析、信号有效期和风控评估
 - 历史回测、Demo 预览和信号执行
 - 风控限额、原生止盈止损、保护性止盈止损和紧急停止
+- 合并持仓分单明细、剩余张数及原生保护数量核对；分单本地自动执行尚未启用，见
+  [`docs/POSITION_LOTS.md`](docs/POSITION_LOTS.md)
 - 自动策略 Worker，默认关闭且默认只做 Dry Run
 - OKX REST/WebSocket 连接，以及可选的 SOCKS5/HTTP 出站代理
 - OKX 私有账户流与业务算法订单流，分别用于账户状态和原生止盈止损状态

@@ -21,6 +21,7 @@ from .pushplus import PushPlusClient, PushPlusError
 from .risk_engine import RiskEngine
 from .execution_engine import ExecutionEngine
 from .order_preflight import OrderPreflight
+from .position_lots import positions_with_lots
 from .ai_analysis import AIAnalysisError, TradingAgentsAdapter
 from .account_sync import AccountSynchronizer
 from .account_history import AccountHistoryImporter
@@ -541,7 +542,7 @@ async def run_worker_once(
 def stored_positions(
     _: None = Depends(require_admin_token),
 ) -> dict[str, object]:
-    return {"data": state_store.list_positions()}
+    return {"data": positions_with_lots(state_store, account_scope=account_client.account_scope)}
 
 
 @app.get("/api/v1/orders")

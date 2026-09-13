@@ -215,6 +215,7 @@ class ExecutionEngine:
             "stop_loss": signal.stop_loss,
             "take_profit": signal.take_profit,
             "source": signal.source,
+            "protection_context": expected_protection,
             "raw": {
                 "signal": signal.model_dump(mode="json"),
                 "preflight": prepared.summary() if prepared else {"basis": "simulation"},

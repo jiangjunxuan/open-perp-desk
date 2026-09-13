@@ -354,6 +354,26 @@ tbody tr:hover { background: var(--surface); }
 .table-empty > .button { min-height: 36px; }
 .table-action { min-height: 44px; padding: 8px 12px; border: 1px solid var(--control-border); border-radius: 4px; background: transparent; color: var(--danger); }
 .table-action:hover { background: var(--danger-soft); border-color: var(--danger); }
+.position-lot-toggle { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-height: 44px; margin-left: auto; padding: 4px 0 4px 8px; border: 0; background: transparent; color: var(--muted-strong); font-size: 12px; }
+.position-lot-toggle:hover { color: var(--text); }
+.position-lot-toggle[aria-expanded="true"] [data-icon] { transform: rotate(90deg); }
+.position-lot-row > td { padding-top: 0; }
+.position-lot-row:hover { background: transparent; }
+.position-lot-details { position: sticky; left: 12px; width: 100%; max-width: calc(100vw - 72px); white-space: normal; text-align: left; }
+.position-lot-details > p { margin: 4px 0 12px; font-size: 12px; line-height: 1.6; }
+.position-lot-details ul { list-style: none; margin: 0; padding: 0; }
+.position-lot-details li { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(290px, 2fr) minmax(120px, 1fr); align-items: center; gap: 24px; border-top: 1px solid var(--border-soft); padding: 12px 0; }
+.lot-order-id { display: block; min-width: 0; overflow-wrap: anywhere; color: var(--muted-strong); }
+.position-lot-details dl { min-width: 0; margin: 0; }
+.position-lot-details dl > div { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; }
+.position-lot-details dt { color: var(--muted); flex-shrink: 0; }
+.position-lot-details dd { margin: 0; text-align: right; overflow-wrap: anywhere; font-family: var(--mono); }
+.lot-protection-state { display: block; font-size: 12px; color: var(--warning); }
+.lot-protection-state[data-tone="good"] { color: var(--positive); }
+.lot-allocation-reason { color: var(--warning); overflow-wrap: anywhere; }
+@media (max-width: 1023px) {
+  .position-lot-details li { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+}
 .performance-panel { order: 5; grid-column: 1; padding-right: 24px; }
 #performance-basis { display: block; font-size: 11px; margin-top: 4px; }
 .performance-summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; padding: 24px 0; }

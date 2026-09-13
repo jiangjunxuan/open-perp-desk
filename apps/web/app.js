@@ -1227,8 +1227,60 @@ function statusTone(status) {
   return "neutral";
 }
 
+const positionLotReasons = {
+  lot_snapshot_pending: "分单记录正在核对",
+  lot_snapshot_changed: "核对期间持仓或订单已变化",
+  lot_order_snapshot_changed: "核对期间委托回报已更新",
+  lot_position_identity_unverified: "持仓成交或账户依据不足",
+  lot_latest_trade_missing: "尚未取得持仓对应的最后成交",
+  lot_flat_boundary_missing: "当前历史记录未覆盖本次仓位的开仓起点",
+  lot_history_unavailable: "成交历史暂不可用",
+  lot_history_order_invalid: "成交分页顺序或合约不符",
+  lot_order_identity_mismatch: "成交与委托信息不一致",
+  lot_fill_size_unverified: "成交张数尚未核实",
+  lot_fill_type_unsupported: "存在尚未支持的成交业务",
+  lot_trade_identity_ambiguous: "成交编号存在重复或歧义",
+  lot_reversal_requires_review: "单次成交包含反向开仓，归属待核对",
+  lot_close_quantity_exceeds_owner: "保护平仓数量超过对应分单",
+  lot_close_owner_missing: "未找到保护平仓对应的开仓单",
+  lot_native_owner_missing: "原生保护成交的开仓归属待核对",
+  lot_native_owner_ambiguous: "原生保护成交存在多重关联",
+  lot_position_quantity_mismatch: "分单合计与交易所持仓数量不一致",
+  lot_account_changed: "账户配置已变化",
+};
+
+function renderPositionLots(row) {
+  const allocation = row.lot_allocation;
+  if (!allocation) return "";
+  const lots = allocation.lots || [];
+  const verified = allocation.status === "verified";
+  const states = {
+    native_matched: "原生数量匹配", native_size_mismatch: "原生数量待调整",
+    native_unverified: "原生保护待核对", external_entry: "外部开仓",
+    canceled: "原生保护已撤销", effective: "原生保护已触发",
+    order_failed: "原生保护失败", pause: "原生保护已暂停",
+  };
+  return `<div class="position-lot-details">
+    ${verified ? `<p class="subtle">手动减仓归属：先进先出</p>
+      <ul>${lots.map(lot => `<li data-lot-id="${escapeHtml(lot.lot_id)}">
+        <span class="mono-cell lot-order-id">${escapeHtml(lot.opening_order_id)}</span>
+        <dl><div><dt>剩余 / 开仓</dt><dd>${formatNumber(lot.remaining_size, 8)} / ${formatNumber(lot.opened_size, 8)} 张</dd></div>
+        <div><dt>原生保护</dt><dd>${formatNumber(lot.protection?.size, 8)} 张</dd></div>
+        <div><dt>止盈 / 止损</dt><dd>${formatNumber(lot.protection?.take_profit, 2)} / ${formatNumber(lot.protection?.stop_loss, 2)}</dd></div></dl>
+        <span class="lot-protection-state" data-tone="${lot.protection?.state === "native_matched" ? "good" : "warning"}">${escapeHtml(states[lot.protection?.state] || "保护待核对")}</span>
+      </li>`).join("")}</ul>
+      <p class="subtle">分单本地执行：${allocation.execution_ready ? "已启用" : "未启用"}</p>`
+      : `<p class="lot-allocation-reason">${escapeHtml(positionLotReasons[allocation.reason] || "成交归属尚未核实")}</p>`}
+    </div>`;
+}
+
 function renderPositions(rows) {
   const body = $("#positions-body");
+  const region = body.closest(".table-wrap");
+  const scroll = { top: region.scrollTop, left: region.scrollLeft };
+  const opened = new Set([...body.querySelectorAll(".position-lot-toggle[aria-expanded=true]")].map(el => el.dataset.positionKey));
+  const focused = body.contains(document.activeElement)
+    ? document.activeElement.closest(".position-lot-toggle")?.dataset.positionKey : null;
   const all = rows || [];
   setText("#ledger-count-positions", all.length);
   setText("#metric-positions", all.length);
@@ -1237,16 +1289,33 @@ function renderPositions(rows) {
     body.innerHTML = emptyRecordRow("positions", all.length > 0, "暂无本地活动持仓");
     return;
   }
-  body.innerHTML = filtered.map((row) => `
+  body.innerHTML = filtered.map((row, index) => {
+    const key = row.position_key || `${row.inst_id}:${row.pos_side}`;
+    const allocation = row.lot_allocation;
+    const panelId = `position-lots-${index}`;
+    const open = opened.has(key);
+    return `
     <tr>
       <td class="mono-cell">${escapeHtml(row.inst_id)}</td>
       <td>${escapeHtml(({ long: "多仓", short: "空仓", net: "净持仓" })[row.pos_side] || row.pos_side)}</td>
       <td class="mono-cell">${formatNumber(row.size)}</td>
       <td class="mono-cell">${formatNumber(row.entry_price, 2)}</td>
       <td class="mono-cell">${formatNumber(row.notional, 2)}</td>
-      <td class="mono-cell">${formatNumber(row.take_profit, 2)} / ${formatNumber(row.stop_loss, 2)}</td>
+      <td><span class="mono-cell">${formatNumber(row.take_profit, 2)} / ${formatNumber(row.stop_loss, 2)}</span>
+        ${allocation ? `<button type="button" class="position-lot-toggle" data-position-key="${escapeHtml(key)}"
+          aria-expanded="${open}" aria-controls="${panelId}"><i data-icon="chevron-right" aria-hidden="true"></i>
+          <span>${allocation.status === "verified" ? `${allocation.lots.length} 笔分单` : "分单待核对"}</span></button>` : ""}</td>
       <td><span class="record-state" data-tone="${statusTone(row.status)}">${escapeHtml(statusLabel(row.status))}</span></td>
-    </tr>`).join("");
+    </tr>${allocation ? `<tr id="${panelId}" class="position-lot-row" ${open ? "" : "hidden"}><td colspan="7">
+      ${renderPositionLots(row)}</td></tr>` : ""}`;
+  }).join("");
+  renderIcons(body);
+  region.scrollTop = scroll.top;
+  region.scrollLeft = scroll.left;
+  if (focused) {
+    [...body.querySelectorAll(".position-lot-toggle")].find(el => el.dataset.positionKey === focused)
+      ?.focus({ preventScroll: true });
+  }
 }
 
 function renderPnl(rows) {
@@ -2713,6 +2782,15 @@ $("#watchlist").addEventListener("click", (event) => {
 $("#orders-body").addEventListener("click", (event) => {
   const button = event.target.closest(".cancel-order");
   if (button) cancelOrder(button.dataset.clientOrderId);
+});
+$("#positions-body").addEventListener("click", event => {
+  const button = event.target.closest(".position-lot-toggle");
+  if (!button) return;
+  const panel = document.getElementById(button.getAttribute("aria-controls"));
+  if (!panel) return;
+  const open = button.getAttribute("aria-expanded") !== "true";
+  button.setAttribute("aria-expanded", String(open));
+  panel.hidden = !open;
 });
 $("#emergency-stop").addEventListener("click", () => setEmergencyStop("/api/v1/safety/emergency-stop", "web operator emergency stop"));
 $("#resume-trading").addEventListener("click", () => setEmergencyStop("/api/v1/safety/resume", "web operator resume"));

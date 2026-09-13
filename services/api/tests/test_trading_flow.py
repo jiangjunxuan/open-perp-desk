@@ -143,6 +143,45 @@ class TradingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(row["path"] == "/api/v5/trade/cancel-algos" for row in self.exchange.posts))
         self.assertEqual(self.exchange.errors, [])
 
+    async def test_merged_lots_native_close_remaining_quantity_and_restart(self):
+        first = await self.api.request("POST", "/execution/signals", await self.signal_payload())
+        self.exchange.fill(first["order"]["exchange_order_id"])
+        second = await self.api.request("POST", "/execution/signals", {**await self.signal_payload(), "size": 2})
+        self.exchange.fill(second["order"]["exchange_order_id"])
+        await self.synchronize()
+        position = (await self.api.request("GET", "/positions"))["data"][0]
+        allocation = position["lot_allocation"]
+        self.assertEqual(allocation["status"], "verified", allocation)
+        self.assertEqual([float(lot["remaining_size"]) for lot in allocation["lots"]], [1, 2])
+        self.assertTrue(all(lot["protection"]["state"] == "native_matched" for lot in allocation["lots"]))
+        self.assertFalse(allocation["execution_ready"])
+        second_algo = list(self.exchange.algos)[1]
+        self.exchange.trigger_protection(second_algo)
+        await self.synchronize()
+        position = (await self.api.request("GET", "/positions"))["data"][0]
+        self.assertEqual(position["size"], 1)
+        self.assertEqual(position["lot_allocation"]["status"], "verified", position["lot_allocation"])
+        remaining = position["lot_allocation"]["lots"]
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["opening_order_id"], first["order"]["client_order_id"])
+        self.assertEqual(float(remaining[0]["remaining_size"]), 1)
+        with self.exchange.lock:
+            manual = self.exchange._create_order({
+                "instId": SYMBOL, "side": "sell", "posSide": "net",
+                "tdMode": "isolated", "ordType": "market", "sz": ".5", "reduceOnly": True,
+            })
+            self.exchange._fill(manual["ordId"])
+        await self.synchronize()
+        remaining = (await self.api.request("GET", "/positions"))["data"][0]["lot_allocation"]["lots"]
+        self.assertEqual(float(remaining[0]["remaining_size"]), .5)
+        self.assertEqual(remaining[0]["protection"]["state"], "native_size_mismatch")
+        await self.api.stop()
+        await self.api.start()
+        remaining = (await self.api.request("GET", "/positions"))["data"][0]["lot_allocation"]["lots"]
+        self.assertEqual(float(remaining[0]["remaining_size"]), .5)
+        self.assertEqual(len(self.exchange.order_submissions), 2, "Lot reconciliation must never send an order")
+        self.assertEqual(self.exchange.errors, [])
+
     async def test_submission_crash_exact_lookup_and_no_resend(self):
         payload = await self.signal_payload()
         self.exchange.hold_order_response = True

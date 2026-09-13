@@ -8,6 +8,7 @@ import { checkManagement } from "./management-ui-checks.mjs";
 import { checkBillHistory } from "./bill-history-ui-checks.mjs";
 import { checkRealtime } from "./realtime-ui-checks.mjs";
 import { checkChartAnnotations } from "./chart-annotation-ui-checks.mjs";
+import { checkPositionLots } from "./position-lots-ui-checks.mjs";
 
 const root = process.cwd();
 const outputDirectory = path.resolve(root, process.env.OPENPERPDESK_OUTPUT_DIR || "outputs");
@@ -755,7 +756,15 @@ try {
     },
   });
   if (browserErrors.length) throw new Error(`Browser exceptions: ${JSON.stringify(browserErrors)}`);
-  const report = { results, paused, symbol, oldSignalCleared, historyPassed, deepLinkPassed, researchChecks, contrast, reducedMotion, appearance, management, billHistory, realtime, annotations, browserErrors };
+  const positionLots = await checkPositionLots({
+    evaluate, command,
+    screenshot: async name => {
+      const shot = await command("Page.captureScreenshot", { format: "png", captureBeyondViewport: true });
+      await writeFile(path.join(outputDirectory, name), Buffer.from(shot.data, "base64"));
+    },
+  });
+  if (browserErrors.length) throw new Error(`Browser exceptions: ${JSON.stringify(browserErrors)}`);
+  const report = { results, paused, symbol, oldSignalCleared, historyPassed, deepLinkPassed, researchChecks, contrast, reducedMotion, appearance, management, billHistory, realtime, annotations, positionLots, browserErrors };
   await writeFile(path.join(outputDirectory, "ui-verification.json"), JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
 } finally {

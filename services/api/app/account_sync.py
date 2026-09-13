@@ -11,6 +11,7 @@ from .okx_algo_stream import OkxAlgoOrderStream
 from .okx_account_stream import OkxAccountStream
 from .account_ledger import AccountLedgerError, parse_daily_bills
 from .position_protection import linked_protection
+from .position_lots import PositionLotReconciler
 from .state_store import OrderSnapshotConflict, StateStore
 
 
@@ -699,6 +700,11 @@ class AccountSynchronizer:
                 )
         for position in self.store.list_positions():
             self._refresh_position_protection(position["position_key"])
+        lot_results = []
+        if getattr(self.account_client, "position_fill_pages", None) is not None:
+            lot_reconciler = PositionLotReconciler(self.store, self.account_client, self._save_regular_order)
+            for position in self.store.list_positions():
+                lot_results.append(await lot_reconciler.reconcile(position))
         result: dict[str, Any] = {
             "positions": len(positions),
             "orders": len(seen_order_ids),
@@ -708,6 +714,10 @@ class AccountSynchronizer:
             "balances": balance_saved,
             "recovery": recovery,
             "algo_recovery": algo_recovery,
+            "position_lots": {
+                "verified": sum(row["status"] == "verified" for row in lot_results),
+                "unverified": sum(row["status"] != "verified" for row in lot_results),
+            },
         }
         if errors:
             result["errors"] = errors

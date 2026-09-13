@@ -4,6 +4,8 @@ import time
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
+from .position_lots import positions_with_lots
+
 
 def event_frame(event: str, payload: Any) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
@@ -55,7 +57,7 @@ async def private_events(store, account, account_client, authorized, rate_scope=
             # an order, trigger reconciliation, or multiply REST traffic per tab.
             def read_state():
                 return {
-                    "positions": {"data": store.list_positions()},
+                    "positions": {"data": positions_with_lots(store, account_scope=scope)},
                     "orders": {"data": store.list_orders()},
                     "fills": {"data": store.list_fills()},
                     "activity": {"data": store.list_audit()},

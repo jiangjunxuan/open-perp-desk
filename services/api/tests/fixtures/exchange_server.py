@@ -177,7 +177,13 @@ class ExchangeServer:
                 order for order in self.orders.values() if order["state"] in {"filled", "canceled"}
             ]
         if path == "/api/v5/trade/fills-history":
-            return list(reversed(self.fills))
+            after = query.get("after", [None])[0]
+            instrument = query.get("instId", [None])[0]
+            rows = [row for row in reversed(self.fills) if (
+                (after is None or int(row["billId"]) < int(after))
+                and (instrument is None or row["instId"] == instrument)
+            )]
+            return rows[:int(query.get("limit", ["100"])[0])]
         if path == "/api/v5/trade/orders-algo-pending":
             types = query.get("ordType", [""])[0].split(",")
             return [algo for algo in self.algos.values() if algo["state"] == "live" and algo["ordType"] in types]
@@ -252,6 +258,9 @@ class ExchangeServer:
             fillTime=now, uTime=now, fillFee="-.001", fillFeeCcy="USDT", fillPnl="0",
         )
         fill = {**order, "billId": str(6000 + len(self.fills)), "fee": "-.001", "feeCcy": "USDT", "ts": now}
+        fill["subType"] = ("5" if order["side"] == "sell" else "6") if order["reduceOnly"] else (
+            "3" if order["side"] == "buy" else "4"
+        )
         self.fills.append(fill)
         self.bills.append({
             "billId": fill["billId"], "type": "2", "subType": "1",
@@ -287,7 +296,10 @@ class ExchangeServer:
                 "tdMode": algo["tdMode"], "ordType": "market", "sz": algo["sz"], "reduceOnly": True,
             })
             self._fill(close["ordId"])
-            algo.update(state="effective", actualSz=algo["sz"], actualPx=self.price, uTime=milliseconds())
+            algo.update(
+                state="effective", actualSz=algo["sz"], actualPx=self.price,
+                uTime=milliseconds(), ordIdList=[close["ordId"]],
+            )
             self.revision += 1
 
     @property

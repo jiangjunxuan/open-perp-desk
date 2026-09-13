@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlencode
@@ -34,6 +35,8 @@ class OkxAccountClient:
         self._last_archive_request = 0.0
         self._order_request_lock = asyncio.Lock()
         self._last_order_request = 0.0
+        self._fill_request_lock = asyncio.Lock()
+        self._last_fill_request = 0.0
         self._quarter_request_lock = asyncio.Lock()
         self._last_quarter_request = 0.0
 
@@ -124,6 +127,13 @@ class OkxAccountClient:
                 if delay > 0:
                     await asyncio.sleep(delay)
                 self._last_archive_request = loop.time()
+        elif path == "/api/v5/trade/fills-history":
+            async with self._fill_request_lock:
+                loop = asyncio.get_running_loop()
+                delay = 0.21 - (loop.time() - self._last_fill_request)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                self._last_fill_request = loop.time()
         elif path.startswith("/api/v5/trade/"):
             async with self._order_request_lock:
                 loop = asyncio.get_running_loop()
@@ -326,6 +336,33 @@ class OkxAccountClient:
         if inst_id:
             params["instId"] = inst_id
         return await self._get("/api/v5/trade/fills-history", params)
+
+    async def position_fill_pages(
+        self, inst_id: str, *, page_size: int = 100,
+    ) -> AsyncIterator[list[dict[str, Any]]]:
+        if not inst_id.endswith("-SWAP"):
+            raise OkxAccountError("Position fill history requires a SWAP instrument")
+        page_size = max(1, min(page_size, 100))
+        params = {"instType": "SWAP", "instId": inst_id, "limit": str(page_size)}
+        previous: int | None = None
+        for _ in range(100):
+            page = await self._get("/api/v5/trade/fills-history", params)
+            if len(page) > page_size:
+                raise OkxAccountError("Position fill page exceeded requested size")
+            for row in page:
+                bill_id = row.get("billId")
+                if (
+                    not isinstance(bill_id, str) or not bill_id.isascii() or not bill_id.isdigit()
+                    or int(bill_id) <= 0 or (previous is not None and int(bill_id) >= previous)
+                    or row.get("instId") != inst_id or row.get("instType") != "SWAP"
+                ):
+                    raise OkxAccountError("Position fill pagination identity or ordering is invalid")
+                previous = int(bill_id)
+            yield page
+            if len(page) < page_size:
+                return
+            params["after"] = str(previous)
+        raise OkxAccountError("Position fill history exceeded pagination limit")
 
     async def pending_algo_orders(
         self,
