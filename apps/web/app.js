@@ -345,8 +345,21 @@ function renderChart(rows) {
     padding.top + chartHeight - 10,
     Math.max(padding.top + 10, latestY),
   );
-
   const colors = getComputedStyle(document.documentElement);
+  const movingAverages = [
+    { period: 5, color: "--warning" },
+    { period: 10, color: "--info" },
+    { period: 20, color: "--accent" },
+  ].map(({ period, color }) => ({
+    period,
+    color: colors?.getPropertyValue?.(color).trim() || color,
+    values: candles.map((_, index) => {
+      if (index + 1 < period) return null;
+      const window = candles.slice(index - period + 1, index + 1);
+      return window.reduce((total, candle) => total + candle.close, 0) / period;
+    }),
+  }));
+
   context.strokeStyle = colors.getPropertyValue("--border-soft").trim();
   context.lineWidth = 1;
   context.font = "10px SFMono-Regular, Consolas, monospace";
@@ -400,6 +413,42 @@ function renderChart(rows) {
       context.fillRect(x - candleWidth / 2, height - padding.bottom - volumeHeight, candleWidth, volumeHeight);
       context.globalAlpha = 1;
     }
+  });
+  context.lineWidth = 1.15;
+  movingAverages.forEach(({ period, color, values }) => {
+    context.strokeStyle = color;
+    context.beginPath();
+    let started = false;
+    values.forEach((value, index) => {
+      if (!Number.isFinite(value)) return;
+      const x = xFor(index);
+      const y = yFor(value);
+      if (!started) {
+        context.moveTo(x, y);
+        started = true;
+      } else {
+        context.lineTo(x, y);
+      }
+    });
+    if (started) context.stroke();
+  });
+  context.font = "10px SFMono-Regular, Consolas, monospace";
+  context.textAlign = "left";
+  let legendX = padding.left + 6;
+  let legendY = padding.top + 10;
+  const legendRight = padding.left + chartWidth - 6;
+  movingAverages.forEach(({ period, color, values }) => {
+    const value = [...values].reverse().find(Number.isFinite);
+    const label = `MA(${period}) ${Number.isFinite(value) ? formatNumber(value, 2) : "--"}`;
+    const labelWidth = context.measureText(label).width + 28;
+    if (legendX > padding.left + 6 && legendX + labelWidth > legendRight) {
+      legendX = padding.left + 6;
+      legendY += 14;
+    }
+    context.fillStyle = color;
+    context.fillRect(legendX, legendY - 6, 6, 6);
+    context.fillText(label, legendX + 10, legendY);
+    legendX += labelWidth;
   });
   if (state.chartMode === "line") {
     context.strokeStyle = colors.getPropertyValue("--accent").trim();
