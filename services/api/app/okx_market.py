@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import math
 import os
 import time
 from typing import Any
@@ -70,6 +71,33 @@ class OkxMarketClient:
     async def ticker(self, inst_id: str) -> dict[str, Any]:
         rows = await self.get("/api/v5/market/ticker", {"instId": inst_id})
         return rows[0] if rows else {}
+
+    async def mark_price(self, inst_id: str) -> float:
+        rows = await self.get(
+            "/api/v5/public/mark-price", {"instType": "SWAP", "instId": inst_id},
+        )
+        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+            raise OkxMarketError("mark_price_payload_invalid")
+        row = rows[0]
+        if row.get("instId") != inst_id or row.get("instType") != "SWAP":
+            raise OkxMarketError("mark_price_instrument_mismatch")
+        values = []
+        for field, reason in (("markPx", "mark_price_invalid"), ("ts", "mark_price_timestamp_invalid")):
+            raw = row.get(field)
+            if type(raw) not in {str, int, float}:
+                raise OkxMarketError(reason)
+            try:
+                value = float(raw)
+            except (ValueError, OverflowError):
+                raise OkxMarketError(reason) from None
+            if not math.isfinite(value) or value <= 0:
+                raise OkxMarketError(reason)
+            values.append(value)
+        price, timestamp_ms = values
+        age = time.time() - timestamp_ms / 1000
+        if not -5 <= age <= 30:
+            raise OkxMarketError("mark_price_stale")
+        return price
 
     async def candles(self, inst_id: str, bar: str, limit: int) -> list[list[str]]:
         return await self.get(

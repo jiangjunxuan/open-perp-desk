@@ -242,8 +242,8 @@ class FillNotificationTests(unittest.TestCase):
 
 class ProtectiveExitNotificationTests(unittest.TestCase):
     class Market:
-        async def ticker(self, _symbol):
-            return {"last": "94"}
+        async def mark_price(self, _symbol):
+            return 94.0
 
     class Account:
         configured = False

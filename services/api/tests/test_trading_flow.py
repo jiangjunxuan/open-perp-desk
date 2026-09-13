@@ -207,8 +207,23 @@ class TradingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("skip_open_existing_exposure", cycle["payload_json"])
 
         attached = self.exchange.order_submissions[0]["attachAlgoOrds"][0]
+        self.exchange.mark_price = self.exchange.price
         self.exchange.price = str(float(attached["slTriggerPx"]) - .1)
         await run_cycle(dry_run=False, expected_count=4)
+        self.assertEqual(len(self.exchange.order_submissions), 1, "last price must not trigger a mark-price stop")
+        self.exchange.fail_paths.add("/api/v5/public/mark-price")
+        await run_cycle(dry_run=False, expected_count=5)
+        self.exchange.fail_paths.clear()
+        self.assertEqual(len(self.exchange.order_submissions), 1, "unavailable mark price must not fall back to last")
+        activities = (await self.api.request("GET", "/activity"))["data"]
+        self.assertTrue(any(item["event_type"] == "worker_protection_price_unavailable" for item in activities))
+        self.exchange.mark_price = self.exchange.price
+        self.exchange.mark_timestamp = "1700000000000"
+        await run_cycle(dry_run=False, expected_count=6)
+        self.assertEqual(len(self.exchange.order_submissions), 1, "stale mark price must not trigger a stop")
+        self.exchange.mark_timestamp = None
+        self.exchange.price = self.exchange.candles[0][4]
+        await run_cycle(dry_run=False, expected_count=7)
         self.assertEqual(len(self.exchange.order_submissions), 2)
         close = self.exchange.order_submissions[1]
         self.assertTrue(close["reduceOnly"])
@@ -217,5 +232,9 @@ class TradingFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.synchronize()
         self.assertEqual((await self.api.request("GET", "/positions"))["data"], [])
         self.assertTrue(any("保护性平仓触发" in row["title"] for row in self.exchange.notifications))
+        self.assertTrue(any(
+            f"标记价格 {self.exchange.mark_price}" in row["content"]
+            for row in self.exchange.notifications if "保护性平仓触发" in row["title"]
+        ))
         self.assertFalse((await self.api.request("GET", "/worker/status"))["running"])
         self.assertEqual(self.exchange.errors, [])

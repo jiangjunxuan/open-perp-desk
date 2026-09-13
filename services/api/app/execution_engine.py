@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import math
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -337,6 +338,8 @@ class ExecutionEngine:
         inst_id: str,
         mark_price: float,
     ) -> dict[str, Any] | None:
+        if type(mark_price) not in {int, float} or not math.isfinite(mark_price) or mark_price <= 0:
+            raise ValueError("mark_price_invalid")
         for position in self.store.list_positions():
             if position["inst_id"] != inst_id:
                 continue

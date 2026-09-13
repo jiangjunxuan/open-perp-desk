@@ -63,6 +63,8 @@ class ExchangeServer:
             ])
         self.candles.reverse()
         self.price = self.candles[0][4]
+        self.mark_price = None
+        self.mark_timestamp = None
 
     def instrument(self):
         return {
@@ -131,6 +133,15 @@ class ExchangeServer:
             return [self.instrument()]
         if path == "/api/v5/market/ticker":
             return [self.ticker()]
+        if path == "/api/v5/public/mark-price":
+            if query != {"instType": ["SWAP"], "instId": [SYMBOL]}:
+                self.errors.append("mark_price_query_invalid")
+                return []
+            return [{
+                "instId": SYMBOL, "instType": "SWAP",
+                "markPx": self.mark_price if self.mark_price is not None else self.price,
+                "ts": self.mark_timestamp if self.mark_timestamp is not None else milliseconds(),
+            }]
         if path == "/api/v5/market/candles":
             return self.candles[:int(query.get("limit", ["100"])[0])]
         if path == "/api/v5/market/history-index-candles":

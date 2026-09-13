@@ -175,12 +175,34 @@ class AutomationWorker:
         current_notional = risk_context["current_notional"]
         results: list[dict[str, Any]] = []
         for symbol in _symbols():
-            ticker = await self.market_client.ticker(symbol)
-            last_price = float(ticker.get("last") or 0)
-            if last_price > 0:
+            protected = any(
+                position["inst_id"] == symbol and (position["stop_loss"] or position["take_profit"])
+                for position in self.store.list_positions()
+            )
+            if protected:
+                try:
+                    mark_price = await self.market_client.mark_price(symbol)
+                except Exception as exc:
+                    self.store.add_audit(
+                        "worker_protection_price_unavailable",
+                        "Worker skipped this instrument because its mark price is unavailable",
+                        severity="warning",
+                        payload={"inst_id": symbol, "error": type(exc).__name__},
+                    )
+                    await self._notify_event(
+                        "worker_protection_price_unavailable",
+                        "OpenPerpDesk 保护价格暂不可用",
+                        f"{symbol} 未取得有效标记价格，已暂停本轮本地保护判断和策略决策，请核对交易所原生保护单。",
+                        payload={"inst_id": symbol}, severity="warning",
+                    )
+                    results.append({
+                        "inst_id": symbol, "action": "skip_protection_price_unavailable",
+                        "accepted": False, "reasons": ["mark_price_unavailable"],
+                    })
+                    continue
                 exit_event = self.execution.protective_exit(
                     inst_id=symbol,
-                    mark_price=last_price,
+                    mark_price=mark_price,
                 )
                 if exit_event:
                     position = exit_event["position"]
@@ -218,13 +240,14 @@ class AutomationWorker:
                             "OpenPerpDesk 保护性平仓预览" if self.dry_run else "OpenPerpDesk 保护性平仓触发",
                             (
                                 f"{symbol} {exit_event['reason']} 已触发，"
-                                f"参考价格 {last_price}。"
+                                f"标记价格 {mark_price}。"
                                 + ("仅风控预览，不会向交易所发单。" if self.dry_run else "已提交平仓请求。")
                             ),
                             payload={
                                 "inst_id": symbol,
                                 "reason": exit_event["reason"],
-                                "mark_price": last_price,
+                                "mark_price": mark_price,
+                                "price_source": "mark",
                                 "size": abs(float(position["size"])),
                                 "dry_run": self.dry_run,
                             },
@@ -238,6 +261,8 @@ class AutomationWorker:
                         }
                     )
                     continue
+            ticker = await self.market_client.ticker(symbol)
+            last_price = float(ticker.get("last") or 0)
             candles = await self.market_client.candles(
                 symbol,
                 self.bar,
