@@ -3,14 +3,15 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import os
-import ssl
 import time
 from datetime import datetime, timezone
 from typing import Any
 
-import certifi
 from websockets.asyncio.client import connect
+
+from .okx_websocket import OkxAuthenticationError, OkxSubscriptionError, decode_message, socket_messages, websocket_tls
 
 
 class OkxAccountStream:
@@ -35,6 +36,7 @@ class OkxAccountStream:
         self.balance: list[dict[str, Any]] = []
         self.positions: dict[str, dict[str, Any]] = {}
         self.orders: dict[str, dict[str, Any]] = {}
+        self.fills: dict[str, dict[str, Any]] = {}
         self._task: asyncio.Task[None] | None = None
 
     @property
@@ -95,7 +97,7 @@ class OkxAccountStream:
                 async with connect(
                     self.url,
                     proxy=self.proxy_url,
-                    ssl=ssl.create_default_context(cafile=certifi.where()),
+                    ssl=websocket_tls(self.url, self.proxy_url),
                     ping_interval=20,
                     ping_timeout=20,
                     close_timeout=5,
@@ -106,12 +108,13 @@ class OkxAccountStream:
                     self.last_error = None
                     delay = 1.0
                     await socket.send(json.dumps(self.login_message()))
-                    async for raw in socket:
+                    async for raw in socket_messages(socket):
                         self.consume(raw)
-                        try:
-                            message = json.loads(raw)
-                        except (TypeError, json.JSONDecodeError):
-                            message = {}
+                        message = decode_message(raw)
+                        if message.get("event") == "error":
+                            raise OkxSubscriptionError()
+                        if message.get("event") == "login" and str(message.get("code", "")) != "0":
+                            raise OkxAuthenticationError()
                         if (
                             message.get("event") == "login"
                             and str(message.get("code", "")) == "0"
@@ -122,17 +125,15 @@ class OkxAccountStream:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                self.last_error = type(exc).__name__
+            finally:
                 self.connected = False
                 self.authenticated = False
-                self.last_error = type(exc).__name__
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 30.0)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30.0)
 
     def consume(self, raw: str | bytes) -> None:
-        try:
-            message = json.loads(raw)
-        except (TypeError, json.JSONDecodeError):
-            return
+        message = decode_message(raw)
 
         if message.get("event") == "login":
             if str(message.get("code", "")) == "0":
@@ -146,8 +147,11 @@ class OkxAccountStream:
         if message.get("event") in {"subscribe", "channel-conn-count"}:
             return
 
-        argument = message.get("arg") or {}
-        data = message.get("data") or []
+        argument = message.get("arg")
+        data = message.get("data")
+        if not isinstance(argument, dict) or not isinstance(data, list):
+            return
+        data = [item for item in data if isinstance(item, dict)]
         channel = argument.get("channel")
         if not channel or not data:
             return
@@ -169,6 +173,21 @@ class OkxAccountStream:
                 order_id = str(item.get("ordId") or item.get("clOrdId") or "")
                 if order_id:
                     self.orders[order_id] = item
+                trade_id = str(item.get("tradeId") or item.get("execId") or "")
+                try:
+                    fill_size = float(item.get("fillSz") or 0)
+                    fill_price = float(item.get("fillPx") or 0)
+                except (TypeError, ValueError):
+                    fill_size = 0
+                    fill_price = 0
+                if (
+                    trade_id
+                    and math.isfinite(fill_size)
+                    and math.isfinite(fill_price)
+                    and fill_size > 0
+                    and fill_price > 0
+                ):
+                    self.fills[trade_id] = item
 
     @staticmethod
     def _position_key(position: dict[str, Any]) -> str:
@@ -192,4 +211,5 @@ class OkxAccountStream:
             "balance": list(self.balance),
             "positions": list(self.positions.values()),
             "orders": list(self.orders.values()),
+            "fills": list(self.fills.values()),
         }

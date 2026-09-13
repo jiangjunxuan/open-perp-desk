@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 SignalAction = Literal["open_long", "open_short", "close", "hold"]
@@ -10,6 +10,7 @@ SignalAction = Literal["open_long", "open_short", "close", "hold"]
 class TradeSignal(BaseModel):
     """The only signal shape accepted by the future execution layer."""
 
+    model_config = ConfigDict(allow_inf_nan=False)
     inst_id: str = Field(min_length=3, max_length=40, pattern=r"^[A-Z0-9-]+$")
     action: SignalAction
     confidence: float = Field(ge=0.0, le=1.0)
@@ -26,6 +27,10 @@ class TradeSignal(BaseModel):
 
     @model_validator(mode="after")
     def validate_price_direction(self) -> "TradeSignal":
+        if self.created_at.tzinfo is None or (
+            self.expires_at and self.expires_at.tzinfo is None
+        ):
+            raise ValueError("signal timestamps must include a timezone")
         if self.expires_at and self.expires_at <= self.created_at:
             raise ValueError("expires_at must be after created_at")
         if self.action in {"open_long", "open_short"}:
@@ -42,4 +47,3 @@ class TradeSignal(BaseModel):
             ):
                 raise ValueError("short prices must satisfy take_profit < entry < stop_loss")
         return self
-

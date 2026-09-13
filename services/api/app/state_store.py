@@ -1,16 +1,46 @@
 import json
+import math
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from uuid import uuid4
 
+from .database_maintenance import recovery_marker
+from .historical_ledger import DAY_MS, combine_history_windows, day_ms
 from .strategy_engine import DEFAULT_STRATEGY_CONFIG
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+ACTIVE_ORDER_STATUSES = (
+    "preparing", "submitting", "submitted", "pending", "accepted", "live",
+    "partially_filled", "submission_unknown", "unknown", "cancel_failed", "canceling",
+)
+TERMINAL_ORDER_STATUSES = {
+    "filled", "canceled", "cancelled", "failed", "rejected",
+    "effective", "triggered", "order_failed", "expired", "mmp_canceled",
+}
+
+
+class ExposureSnapshotChanged(RuntimeError):
+    """A different submission reserved risk budget after the snapshot was read."""
+
+
+class OrderSnapshotConflict(ValueError):
+    """Exchange evidence does not match the durable order identity."""
+
+
+class BillImportBusy(RuntimeError):
+    """The account already has an import with a current lease."""
+
+
+class BillImportLeaseLost(RuntimeError):
+    """A stopped or superseded importer cannot publish more data."""
 
 
 class StateStore:
@@ -33,6 +63,8 @@ class StateStore:
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
+        if recovery_marker(self.path).exists():
+            raise RuntimeError("State database recovery is incomplete; API access is locked.")
         connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
         try:
@@ -83,6 +115,56 @@ class StateStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_fills_filled_at
                     ON fills(filled_at DESC);
+                CREATE TABLE IF NOT EXISTS account_bills (
+                    account_scope TEXT NOT NULL,
+                    bill_id TEXT NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    currency TEXT NOT NULL,
+                    inst_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY (account_scope, bill_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_account_bills_time
+                    ON account_bills(account_scope, timestamp_ms DESC);
+                CREATE TABLE IF NOT EXISTS account_bill_snapshots (
+                    account_scope TEXT PRIMARY KEY,
+                    captured_at TEXT NOT NULL,
+                    summary_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS account_bill_history (
+                    account_scope TEXT NOT NULL,
+                    bill_id TEXT NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY (account_scope, bill_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_bill_history_cursor
+                    ON account_bill_history(account_scope, timestamp_ms DESC, bill_id DESC);
+                CREATE TABLE IF NOT EXISTS account_bill_history_windows (
+                    account_scope TEXT NOT NULL,
+                    day_utc TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    summary_json TEXT NOT NULL,
+                    PRIMARY KEY (account_scope, day_utc)
+                );
+                CREATE TABLE IF NOT EXISTS account_bill_imports (
+                    id TEXT PRIMARY KEY,
+                    account_scope TEXT NOT NULL,
+                    start_day TEXT NOT NULL,
+                    end_day TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    total_days INTEGER NOT NULL,
+                    completed_days INTEGER NOT NULL DEFAULT 0,
+                    rows_imported INTEGER NOT NULL DEFAULT 0,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    lease_until_ms INTEGER NOT NULL,
+                    error TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_bill_import
+                    ON account_bill_imports(account_scope) WHERE status = 'running';
                 CREATE TABLE IF NOT EXISTS positions (
                     position_key TEXT PRIMARY KEY,
                     inst_id TEXT NOT NULL,
@@ -127,6 +209,12 @@ class StateStore:
                     reason TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS execution_generation (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    generation INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT OR IGNORE INTO execution_generation (singleton, generation)
+                    VALUES (1, 0);
                 """
             )
             position_columns = {
@@ -137,6 +225,29 @@ class StateStore:
                 connection.execute(
                     "ALTER TABLE positions ADD COLUMN notional REAL NOT NULL DEFAULT 0"
                 )
+            order_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(orders)")
+            }
+            if "risk_notional" not in order_columns:
+                connection.execute("ALTER TABLE orders ADD COLUMN risk_notional REAL")
+            if "account_scope" not in order_columns:
+                connection.execute("ALTER TABLE orders ADD COLUMN account_scope TEXT")
+            if "order_kind" not in order_columns:
+                connection.execute("ALTER TABLE orders ADD COLUMN order_kind TEXT NOT NULL DEFAULT 'standard'")
+                connection.execute("UPDATE orders SET order_kind = 'algo' WHERE source LIKE 'okx-algo%'")
+            if "exchange_updated_ms" not in order_columns:
+                connection.execute("ALTER TABLE orders ADD COLUMN exchange_updated_ms INTEGER")
+                for row in connection.execute("SELECT client_order_id, raw_json FROM orders").fetchall():
+                    try:
+                        timestamp = int(json.loads(row["raw_json"]).get("uTime", 0))
+                    except (ValueError, TypeError, AttributeError):
+                        continue
+                    if timestamp > 0:
+                        connection.execute(
+                            "UPDATE orders SET exchange_updated_ms = ? WHERE client_order_id = ?",
+                            (timestamp, row["client_order_id"]),
+                        )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO strategies
@@ -164,23 +275,37 @@ class StateStore:
             ).fetchone()
         return self._row(row)
 
-    def save_order(self, order: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _write_order(
+        connection: sqlite3.Connection,
+        order: dict[str, Any],
+        *,
+        replace: bool,
+    ) -> sqlite3.Cursor:
         now = order.get("updated_at") or _utc_now()
         created_at = order.get("created_at") or now
-        with self._connection() as connection:
-            connection.execute(
+        on_conflict = (
+            """
+            DO UPDATE SET
+                exchange_order_id = excluded.exchange_order_id,
+                status = excluded.status,
+                raw_json = excluded.raw_json,
+                updated_at = excluded.updated_at,
+                exchange_updated_ms = COALESCE(excluded.exchange_updated_ms, orders.exchange_updated_ms),
+                account_scope = COALESCE(orders.account_scope, excluded.account_scope),
+                order_kind = excluded.order_kind
+            """ if replace else "DO NOTHING"
+        )
+        return connection.execute(
                 """
                 INSERT INTO orders (
                     client_order_id, exchange_order_id, status, inst_id, side,
                     pos_side, ord_type, td_mode, size, price, reduce_only,
-                    stop_loss, take_profit, source, raw_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(client_order_id) DO UPDATE SET
-                    exchange_order_id = excluded.exchange_order_id,
-                    status = excluded.status,
-                    raw_json = excluded.raw_json,
-                    updated_at = excluded.updated_at
-                """,
+                    stop_loss, take_profit, source, raw_json, created_at, updated_at,
+                    risk_notional, exchange_updated_ms, account_scope, order_kind
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(client_order_id)
+                """ + on_conflict,
                 (
                     order["client_order_id"],
                     order.get("exchange_order_id"),
@@ -199,9 +324,127 @@ class StateStore:
                     json.dumps(order.get("raw", {}), ensure_ascii=True),
                     created_at,
                     now,
+                    order.get("risk_notional"),
+                    order.get("exchange_updated_ms"),
+                    order.get("account_scope"),
+                    order.get("order_kind", "standard"),
                 ),
             )
+
+    def save_order(self, order: dict[str, Any]) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            previous = connection.execute(
+                "SELECT * FROM orders WHERE client_order_id = ?", (order["client_order_id"],),
+            ).fetchone()
+            if previous and previous["status"] in TERMINAL_ORDER_STATUSES and previous["status"] != order["status"]:
+                return dict(previous)
+            self._write_order(connection, order, replace=True)
         return self.get_order(order["client_order_id"]) or order
+
+    def save_exchange_order(self, order: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        """Apply monotonic exchange snapshots atomically across REST and WS writers."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM orders WHERE client_order_id = ?", (order["client_order_id"],),
+            ).fetchone()
+            previous = dict(row) if row else None
+            if previous:
+                for field in ("inst_id", "exchange_order_id", "account_scope", "order_kind"):
+                    if previous.get(field) and order.get(field) and previous[field] != order[field]:
+                        raise OrderSnapshotConflict(f"order_{field}_mismatch")
+                old_status, new_status = previous["status"], order["status"]
+                old_time, new_time = previous["exchange_updated_ms"], order.get("exchange_updated_ms")
+                if old_time is not None and (new_time is None or new_time < old_time):
+                    return previous, False
+                if old_status in TERMINAL_ORDER_STATUSES and new_status != old_status:
+                    return previous, False
+                if old_status == "partially_filled" and new_status in {"unknown", "live", "pending", "submitted"}:
+                    return previous, False
+                if old_time == new_time and old_status == new_status and previous["raw_json"] == json.dumps(order.get("raw", {}), ensure_ascii=True):
+                    return previous, False
+            self._write_order(connection, order, replace=True)
+            if previous and previous["source"].startswith("okx-"):
+                connection.execute(
+                    """UPDATE orders SET side = ?, pos_side = ?, ord_type = ?, td_mode = ?,
+                       size = ?, price = ?, reduce_only = ?, stop_loss = ?, take_profit = ?
+                       WHERE client_order_id = ?""",
+                    (order["side"], order["pos_side"], order["ord_type"], order["td_mode"],
+                     order["size"], order.get("price"), int(bool(order.get("reduce_only"))),
+                     order.get("stop_loss"), order.get("take_profit"), order["client_order_id"]),
+                )
+            connection.execute("UPDATE execution_generation SET generation = generation + 1 WHERE singleton = 1")
+            result = connection.execute(
+                "SELECT * FROM orders WHERE client_order_id = ?", (order["client_order_id"],),
+            ).fetchone()
+            return dict(result), True
+
+    def execution_snapshot(self) -> tuple[int, list[dict[str, Any]]]:
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            generation = connection.execute(
+                "SELECT generation FROM execution_generation WHERE singleton = 1",
+            ).fetchone()[0]
+            placeholders = ",".join("?" for _ in ACTIVE_ORDER_STATUSES)
+            rows = connection.execute(
+                f"SELECT * FROM orders WHERE status IN ({placeholders})",
+                ACTIVE_ORDER_STATUSES,
+            ).fetchall()
+        return int(generation), [dict(row) for row in rows]
+
+    def claim_order(
+        self,
+        order: dict[str, Any],
+        *,
+        expected_generation: int | None = None,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Commit an intent before network I/O; one claimant wins across processes."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM orders WHERE client_order_id = ?",
+                (order["client_order_id"],),
+            ).fetchone()
+            if existing:
+                return False, dict(existing)
+            if expected_generation is not None:
+                current = connection.execute(
+                    "SELECT generation FROM execution_generation WHERE singleton = 1",
+                ).fetchone()[0]
+                if current != expected_generation:
+                    raise ExposureSnapshotChanged("execution_budget_snapshot_changed")
+            inserted = self._write_order(connection, order, replace=False).rowcount == 1
+            if inserted and order["status"] != "preview":
+                connection.execute(
+                    "UPDATE execution_generation SET generation = generation + 1 WHERE singleton = 1",
+                )
+            row = connection.execute(
+                "SELECT * FROM orders WHERE client_order_id = ?",
+                (order["client_order_id"],),
+            ).fetchone()
+        return inserted, dict(row)
+
+    def finalize_submission(
+        self,
+        client_order_id: str,
+        status: str,
+        *,
+        raw: dict[str, Any],
+        exchange_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Do not overwrite a private-stream update that raced the HTTP response."""
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE orders SET status = ?, raw_json = ?,
+                    exchange_order_id = COALESCE(?, exchange_order_id), updated_at = ?
+                WHERE client_order_id = ? AND status IN ('preparing', 'submitting', 'submission_unknown')
+                """,
+                (status, json.dumps(raw, ensure_ascii=True), exchange_order_id,
+                 _utc_now(), client_order_id),
+            )
+        return self.get_order(client_order_id) or {}
 
     def list_orders(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._connection() as connection:
@@ -218,12 +461,7 @@ class StateStore:
         reduce_only: bool = False,
     ) -> bool:
         """Check for an exchange order that has not reached a terminal state."""
-        active_statuses = (
-            "submitting",
-            "submitted",
-            "live",
-            "partially_filled",
-        )
+        active_statuses = ACTIVE_ORDER_STATUSES
         placeholders = ",".join("?" for _ in active_statuses)
         with self._connection() as connection:
             row = connection.execute(
@@ -293,8 +531,235 @@ class StateStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def save_bill_snapshot(
+        self,
+        account_scope: str,
+        bills: list[dict[str, Any]],
+        summary: dict[str, Any],
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            previous = connection.execute(
+                "SELECT captured_at FROM account_bill_snapshots WHERE account_scope = ?",
+                (account_scope,),
+            ).fetchone()
+            if previous and previous["captured_at"] > summary["captured_at"]:
+                return
+            for bill in bills:
+                connection.execute(
+                    """
+                    INSERT INTO account_bills
+                        (account_scope, bill_id, timestamp_ms, currency, inst_id, kind, record_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(account_scope, bill_id) DO UPDATE SET
+                        timestamp_ms = excluded.timestamp_ms,
+                        currency = excluded.currency, inst_id = excluded.inst_id,
+                        kind = excluded.kind, record_json = excluded.record_json
+                    """,
+                    (
+                        account_scope, bill["bill_id"], bill["timestamp_ms"], bill["currency"],
+                        bill["inst_id"], bill["kind"], json.dumps(bill, ensure_ascii=True),
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO account_bill_snapshots (account_scope, captured_at, summary_json)
+                VALUES (?, ?, ?)
+                ON CONFLICT(account_scope) DO UPDATE SET
+                    captured_at = excluded.captured_at, summary_json = excluded.summary_json
+                """,
+                (account_scope, summary["captured_at"], json.dumps(summary, ensure_ascii=True)),
+            )
+
+    def bill_snapshot(self, account_scope: str, limit: int = 100) -> dict[str, Any]:
+        with self._connection() as connection:
+            snapshot = connection.execute(
+                "SELECT summary_json FROM account_bill_snapshots WHERE account_scope = ?",
+                (account_scope,),
+            ).fetchone()
+            rows = connection.execute(
+                """SELECT record_json FROM account_bills WHERE account_scope = ?
+                   ORDER BY timestamp_ms DESC, bill_id DESC LIMIT ?""",
+                (account_scope, max(1, min(limit, 500)) + 1),
+            ).fetchall()
+        selected_limit = max(1, min(limit, 500))
+        summary = json.loads(snapshot["summary_json"]) if snapshot else None
+        now = datetime.now(timezone.utc)
+        age = (now - datetime.fromisoformat(summary["captured_at"])).total_seconds() if summary else None
+        return {
+            "data": [json.loads(row["record_json"]) for row in rows[:selected_limit]],
+            "has_more": len(rows) > selected_limit,
+            "summary": summary,
+            "fresh": bool(summary and summary["day_utc"] == now.date().isoformat() and -5 <= age <= 45),
+        }
+
+    @staticmethod
+    def _expire_bill_imports(connection: sqlite3.Connection, scope: str, now_ms: int) -> None:
+        connection.execute(
+            """UPDATE account_bill_imports SET status = 'interrupted',
+               finished_at = ?, error = 'import_lease_expired'
+               WHERE account_scope = ? AND status = 'running' AND lease_until_ms <= ?""",
+            (datetime.fromtimestamp(now_ms / 1000, timezone.utc).isoformat(), scope, now_ms),
+        )
+
+    @staticmethod
+    def _bill_import(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {key: row[key] for key in row.keys() if key not in {"account_scope", "lease_until_ms"}}
+
+    def create_bill_import(self, scope: str, days: list[date], now_ms: int) -> dict[str, Any]:
+        job_id = uuid4().hex
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_bill_imports(connection, scope, now_ms)
+            if connection.execute(
+                "SELECT 1 FROM account_bill_imports WHERE account_scope = ? AND status = 'running'",
+                (scope,),
+            ).fetchone():
+                raise BillImportBusy("history_import_already_running")
+            connection.execute(
+                """INSERT INTO account_bill_imports
+                   (id, account_scope, start_day, end_day, status, total_days, started_at, lease_until_ms)
+                   VALUES (?, ?, ?, ?, 'running', ?, ?, ?)""",
+                (job_id, scope, days[0].isoformat(), days[-1].isoformat(), len(days),
+                 datetime.fromtimestamp(now_ms / 1000, timezone.utc).isoformat(), now_ms + 120_000),
+            )
+            return self._bill_import(connection.execute(
+                "SELECT * FROM account_bill_imports WHERE id = ?", (job_id,),
+            ).fetchone())
+
+    def touch_bill_import(self, job_id: str, scope: str, now_ms: int) -> None:
+        with self._connection() as connection:
+            updated = connection.execute(
+                """UPDATE account_bill_imports SET lease_until_ms = ?
+                   WHERE id = ? AND account_scope = ? AND status = 'running' AND lease_until_ms > ?""",
+                (now_ms + 120_000, job_id, scope, now_ms),
+            ).rowcount
+            if not updated:
+                raise BillImportLeaseLost("history_import_lease_lost")
+
+    def finish_bill_import(self, job_id: str, scope: str, status: str, error: str | None = None) -> None:
+        if status not in {"completed", "failed", "interrupted"}:
+            raise ValueError("invalid_import_terminal_status")
+        with self._connection() as connection:
+            connection.execute(
+                """UPDATE account_bill_imports SET status = ?, error = ?, finished_at = ?
+                   WHERE id = ? AND account_scope = ? AND status = 'running'
+                   AND (? != 'completed' OR completed_days = total_days)""",
+                (status, error, _utc_now(), job_id, scope, status),
+            )
+
+    def commit_bill_history_window(
+        self, job_id: str, scope: str, day: date,
+        records: list[dict[str, Any]], summary: dict[str, Any], now_ms: int,
+    ) -> None:
+        begin, end = day_ms(day), day_ms(day) + DAY_MS
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            job = connection.execute(
+                """SELECT * FROM account_bill_imports WHERE id = ? AND account_scope = ?
+                   AND status = 'running' AND lease_until_ms > ?""",
+                (job_id, scope, now_ms),
+            ).fetchone()
+            if job is None:
+                raise BillImportLeaseLost("history_import_lease_lost")
+            expected = date.fromisoformat(job["start_day"]).toordinal() + job["completed_days"]
+            if day.toordinal() != expected or day.isoformat() > job["end_day"]:
+                raise ValueError("history_window_out_of_order")
+            for record in records:
+                if not begin <= record["timestamp_ms"] < end:
+                    raise ValueError("history_bill_outside_window")
+                existing = connection.execute(
+                    "SELECT timestamp_ms FROM account_bill_history WHERE account_scope = ? AND bill_id = ?",
+                    (scope, record["bill_id"]),
+                ).fetchone()
+                if existing and existing["timestamp_ms"] != record["timestamp_ms"]:
+                    raise ValueError("history_bill_identity_conflict")
+            connection.execute(
+                "DELETE FROM account_bill_history WHERE account_scope = ? AND timestamp_ms >= ? AND timestamp_ms < ?",
+                (scope, begin, end),
+            )
+            connection.executemany(
+                "INSERT INTO account_bill_history (account_scope, bill_id, timestamp_ms, record_json) VALUES (?, ?, ?, ?)",
+                [(scope, record["bill_id"], record["timestamp_ms"], json.dumps(record, ensure_ascii=True, allow_nan=False))
+                 for record in records],
+            )
+            connection.execute(
+                """INSERT INTO account_bill_history_windows (account_scope, day_utc, captured_at, job_id, summary_json)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(account_scope, day_utc) DO UPDATE SET
+                       captured_at = excluded.captured_at, job_id = excluded.job_id, summary_json = excluded.summary_json""",
+                (scope, day.isoformat(), _utc_now(), job_id, json.dumps(summary, ensure_ascii=True)),
+            )
+            connection.execute(
+                """UPDATE account_bill_imports SET completed_days = completed_days + 1,
+                   rows_imported = rows_imported + ?, lease_until_ms = ? WHERE id = ?""",
+                (len(records), now_ms + 120_000, job_id),
+            )
+
+    def bill_import(self, scope: str, job_id: str | None = None) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            self._expire_bill_imports(connection, scope, int(datetime.now(timezone.utc).timestamp() * 1000))
+            if job_id:
+                row = connection.execute(
+                    "SELECT * FROM account_bill_imports WHERE account_scope = ? AND id = ?", (scope, job_id),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT * FROM account_bill_imports WHERE account_scope = ? ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                    (scope,),
+                ).fetchone()
+            return self._bill_import(row)
+
+    def bill_history(
+        self, scope: str, days: list[date], *, limit: int = 100,
+        before_ts: int | None = None, before_id: str | None = None,
+    ) -> dict[str, Any]:
+        begin, end = day_ms(days[0]), day_ms(days[-1]) + DAY_MS
+        clause = "account_scope = ? AND timestamp_ms >= ? AND timestamp_ms < ?"
+        params: list[Any] = [scope, begin, end]
+        if (before_ts is None) != (before_id is None):
+            raise ValueError("history_cursor_pair_required")
+        cursor_clause = "" if before_ts is None else " AND (timestamp_ms < ? OR (timestamp_ms = ? AND bill_id < ?))"
+        cursor_params = [] if before_ts is None else [before_ts, before_ts, before_id]
+        limit = max(1, min(limit, 500))
+        with self._connection() as connection:
+            # Read rows, counts and coverage from one SQLite snapshot.
+            connection.execute("BEGIN")
+            rows = connection.execute(
+                f"SELECT record_json FROM account_bill_history WHERE {clause}{cursor_clause} ORDER BY timestamp_ms DESC, bill_id DESC LIMIT ?",
+                [*params, *cursor_params, limit + 1],
+            ).fetchall()
+            total = connection.execute(f"SELECT COUNT(*) FROM account_bill_history WHERE {clause}", params).fetchone()[0]
+            windows = connection.execute(
+                """SELECT day_utc, captured_at, summary_json FROM account_bill_history_windows
+                   WHERE account_scope = ? AND day_utc >= ? AND day_utc <= ? ORDER BY day_utc""",
+                (scope, days[0].isoformat(), days[-1].isoformat()),
+            ).fetchall()
+        data = [json.loads(row["record_json"]) for row in rows[:limit]]
+        covered = {row["day_utc"] for row in windows}
+        missing = [day.isoformat() for day in days if day.isoformat() not in covered]
+        return {
+            "data": data, "total": total,
+            "next_cursor": {"timestamp_ms": data[-1]["timestamp_ms"], "bill_id": data[-1]["bill_id"]} if len(rows) > limit else None,
+            "coverage": {
+                "start_day": days[0].isoformat(), "end_day": days[-1].isoformat(),
+                "complete": not missing, "completed_days": len(covered), "total_days": len(days),
+                "missing_days": missing, "last_imported_at": max((row["captured_at"] for row in windows), default=None),
+            },
+            "summary": combine_history_windows([json.loads(row["summary_json"]) for row in windows]),
+        }
+
     def pnl_summary(self, limit: int = 500) -> dict[str, Any]:
         fills = self.list_fills(limit)
+        currency, valuation = self._fill_report_currency(fills)
+        if valuation not in {"single_currency", "empty"}:
+            return {
+                "fills": len(fills), "currency": None, "valuation_status": valuation,
+                "basis": "fills_only_excludes_funding",
+                "realized_pnl": None, "fees": None, "net_pnl": None, "by_instrument": {},
+            }
         realized_pnl = sum(float(item.get("realized_pnl") or 0) for item in fills)
         fees = sum(float(item.get("fee") or 0) for item in fills)
         by_instrument: dict[str, dict[str, float | int]] = {}
@@ -309,11 +774,37 @@ class StateStore:
             bucket["fees"] += float(item.get("fee") or 0)
         return {
             "fills": len(fills),
+            "currency": currency,
+            "valuation_status": valuation,
+            "basis": "fills_only_excludes_funding",
             "realized_pnl": round(realized_pnl, 8),
             "fees": round(fees, 8),
             "net_pnl": round(realized_pnl + fees, 8),
             "by_instrument": by_instrument,
         }
+
+    @staticmethod
+    def _fill_report_currency(fills: list[dict[str, Any]]) -> tuple[str | None, str]:
+        currencies: set[str] = set()
+        for fill in fills:
+            parts = str(fill.get("inst_id") or "").split("-")
+            if len(parts) != 3 or parts[-1] != "SWAP" or parts[1] not in {"USD", "USDT", "USDC"}:
+                return None, "unresolved_currency"
+            settlement = parts[0] if parts[1] == "USD" else parts[1]
+            currencies.add(settlement)
+            try:
+                pnl, fee = float(fill.get("realized_pnl") or 0), float(fill.get("fee") or 0)
+            except (ValueError, TypeError):
+                return None, "invalid_amount"
+            if not math.isfinite(pnl) or not math.isfinite(fee):
+                return None, "invalid_amount"
+            if fee:
+                if not fill.get("fee_ccy"):
+                    return None, "unresolved_currency"
+                currencies.add(str(fill["fee_ccy"]))
+        if len(currencies) > 1:
+            return None, "mixed_currency"
+        return next(iter(currencies), None), "single_currency" if currencies else "empty"
 
     def performance_report(
         self,
@@ -322,12 +813,22 @@ class StateStore:
         limit: int = 500,
     ) -> dict[str, Any]:
         """Build realized performance metrics from the durable fill ledger."""
-        if initial_equity <= 0:
-            raise ValueError("initial_equity must be greater than zero")
+        if not math.isfinite(initial_equity) or initial_equity <= 0:
+            raise ValueError("initial_equity must be finite and greater than zero")
         fills = sorted(
             self.list_fills(limit),
             key=lambda item: str(item.get("filled_at") or ""),
         )
+        currency, valuation = self._fill_report_currency(fills)
+        if valuation not in {"single_currency", "empty"}:
+            return {
+                "fills": len(fills), "currency": None, "valuation_status": valuation,
+                "basis": "fills_only_excludes_funding",
+                "initial_equity": initial_equity, "ending_equity": None,
+                "realized_pnl": None, "fees": None, "net_pnl": None, "return_pct": None,
+                "max_drawdown": None, "max_drawdown_pct": None,
+                "daily": {}, "by_strategy": {}, "equity_curve": [],
+            }
         orders = {
             str(item["client_order_id"]): item
             for item in self.list_orders(500)
@@ -393,6 +894,9 @@ class StateStore:
 
         return {
             "fills": len(fills),
+            "currency": currency,
+            "valuation_status": valuation,
+            "basis": "fills_only_excludes_funding",
             "initial_equity": round(initial_equity, 8),
             "ending_equity": round(equity, 8),
             "realized_pnl": round(
@@ -603,6 +1107,50 @@ class StateStore:
             item["report"] = json.loads(item.pop("report_json"))
             result.append(item)
         return result
+
+    def analysis_index(
+        self,
+        limit: int = 20,
+        *,
+        before_id: int | None = None,
+        inst_id: str | None = None,
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        for column, value, operator in (
+            ("id", before_id, "<"),
+            ("inst_id", inst_id, "="),
+            ("source", source, "="),
+        ):
+            if value is not None:
+                clauses.append(f"{column} {operator} ?")
+                parameters.append(value)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        page_size = max(1, min(limit, 50))
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""SELECT id, inst_id, source, bias, created_at FROM analyses
+                    {where} ORDER BY id DESC LIMIT ?""",
+                (*parameters, page_size + 1),
+            ).fetchall()
+        page = [dict(row) for row in rows[:page_size]]
+        return {
+            "data": page,
+            "next_before_id": page[-1]["id"] if len(rows) > page_size else None,
+        }
+
+    def get_analysis(self, analysis_id: int) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM analyses WHERE id = ?", (analysis_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["signal"] = json.loads(item.pop("signal_json"))
+        item["report"] = json.loads(item.pop("report_json"))
+        return item
 
     def save_strategy(
         self,

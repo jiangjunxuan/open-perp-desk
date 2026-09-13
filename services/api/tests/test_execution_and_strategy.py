@@ -21,7 +21,8 @@ from app.strategy_engine import StrategyEngine
 from app.strategy_engine import DEFAULT_STRATEGY_CONFIG
 from app.trading_signal import TradeSignal
 from app import main as api_main
-from app.ai_analysis import TradingAgentsAdapter, _tradingagents_ticker
+from app.ai_analysis import TradingAgentsAdapter
+from app.ai_runner import _tradingagents_ticker
 
 
 def candles(count: int = 30) -> list[list[str]]:
@@ -636,6 +637,7 @@ class StateStoreFillTests(unittest.TestCase):
                     "fill_price": 99,
                     "fill_size": 1,
                     "fee": -1,
+                    "fee_ccy": "USDT",
                     "realized_pnl": -20,
                     "filled_at": "2026-01-01T02:00:00Z",
                 }
@@ -746,9 +748,9 @@ class CancelOrderRouteTests(unittest.TestCase):
             result = asyncio.run(api_main.cancel_stored_order("client-1"))
 
         self.assertTrue(result["accepted"])
-        self.assertEqual(store.order["status"], "canceled")
+        self.assertEqual(store.order["status"], "canceling")
         self.assertEqual(trade.args, ("BTC-USDT-SWAP", "exchange-1"))
-        self.assertEqual(store.audits[0][0], "order_canceled")
+        self.assertEqual(store.audits[0][0], "order_cancel_requested")
 
     def test_cancel_route_rejects_empty_exchange_result(self) -> None:
         class EmptyResultTrade(self.FakeTrade):
@@ -1125,7 +1127,7 @@ class AccountSyncTests(unittest.TestCase):
         self.assertIn("protect-history-1", orders)
         self.assertEqual(orders["protect-pending-1"]["stop_loss"], 49000)
         self.assertEqual(orders["protect-pending-1"]["take_profit"], 52000)
-        self.assertEqual(orders["protect-history-1"]["source"], "okx-algo-stream")
+        self.assertEqual(orders["protect-history-1"]["source"], "okx-algo-rest")
 
     def test_disconnected_private_stream_does_not_reapply_cached_state(self) -> None:
         class CachedButDisconnectedStream:

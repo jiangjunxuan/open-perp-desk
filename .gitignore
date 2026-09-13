@@ -18,3 +18,8 @@ work/
 outputs/
 postgres-data/
 redis-data/
+backups/
+*.sqlite3
+*.sqlite3-*
+.openperpdesk-deploy.lock
+._*

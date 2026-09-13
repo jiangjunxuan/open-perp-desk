@@ -2,12 +2,12 @@ import asyncio
 import os
 import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Path as RoutePath, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from fastapi.staticfiles import StaticFiles
 
 from .okx_account import OkxAccountClient, OkxAccountError
@@ -19,12 +19,15 @@ from .okx_trade import OkxTradeClient, OkxTradeError, OrderRequest
 from .pushplus import PushPlusClient
 from .risk_engine import RiskEngine
 from .execution_engine import ExecutionEngine
+from .order_preflight import OrderPreflight
 from .ai_analysis import AIAnalysisError, TradingAgentsAdapter
 from .account_sync import AccountSynchronizer
+from .account_history import AccountHistoryImporter
+from .historical_ledger import archive_first_day, history_days
 from .account_reconciler import AccountReconciler
 from .automation_worker import AutomationWorker
 from .backtest import BacktestEngine
-from .state_store import StateStore
+from .state_store import BillImportBusy, StateStore
 from .safety_control import SafetyController
 from .strategy_engine import StrategyEngine
 from .trading_signal import TradeSignal
@@ -44,6 +47,7 @@ pushplus_client = PushPlusClient()
 risk_engine = RiskEngine()
 trade_client = OkxTradeClient()
 state_store = StateStore()
+account_history = AccountHistoryImporter(state_store, account_client)
 safety_controller = SafetyController(state_store)
 strategy_engine = StrategyEngine()
 backtest_engine = BacktestEngine(strategy_engine)
@@ -54,14 +58,20 @@ execution_engine = ExecutionEngine(
     trade_client,
     pushplus_client,
     safety_controller,
+    preflight=OrderPreflight(account_client, market_client, state_store),
 )
 account_sync = AccountSynchronizer(
     state_store,
     account_client,
     account_stream,
     algo_stream,
+    notifier=execution_engine.notify_event,
 )
-account_reconciler = AccountReconciler(account_sync, state_store)
+account_reconciler = AccountReconciler(
+    account_sync,
+    state_store,
+    notifier=execution_engine.notify_event,
+)
 automation_worker = AutomationWorker(
     market_client,
     account_client,
@@ -72,6 +82,7 @@ automation_worker = AutomationWorker(
     state_store,
     safety_controller,
     market_data_fresh=lambda: market_stream.fresh,
+    notifier=execution_engine.notify_event,
 )
 
 
@@ -82,12 +93,16 @@ async def lifespan(_: FastAPI):
     await algo_stream.start()
     await account_reconciler.start()
     await automation_worker.start()
-    yield
-    await automation_worker.stop()
-    await account_reconciler.stop()
-    await account_stream.stop()
-    await algo_stream.stop()
-    await market_stream.stop()
+    try:
+        yield
+    finally:
+        await account_history.close()
+        await tradingagents.close()
+        await automation_worker.stop()
+        await account_reconciler.stop()
+        await account_stream.stop()
+        await algo_stream.stop()
+        await market_stream.stop()
 
 
 app = FastAPI(
@@ -229,8 +244,13 @@ def system_status() -> dict[str, object]:
             "fresh": market_stream.fresh,
             "last_message_at": market_stream.last_message_at,
             "last_error": market_stream.last_error,
+            "candles_connected": market_stream.candles_connected,
+            "candles_fresh": market_stream.candles_fresh,
+            "candles_last_message_at": market_stream.candles_last_message_at,
+            "candles_last_error": market_stream.candles_last_error,
         },
         "account_stream": {
+            "configured": account_stream.configured,
             "connected": account_stream.connected,
             "authenticated": account_stream.authenticated,
             "last_message_at": account_stream.last_message_at,
@@ -482,12 +502,78 @@ def stored_fills(
     return {"data": state_store.list_fills(limit)}
 
 
+@app.get("/api/v1/account/bills")
+def account_bills(
+    limit: int = Query(default=100, ge=1, le=500),
+    _: None = Depends(require_admin_token),
+) -> dict[str, Any]:
+    return {
+        "configured": account_client.configured,
+        **state_store.bill_snapshot(account_client.account_scope, limit),
+    }
+
+
 @app.get("/api/v1/performance/pnl")
 def performance_pnl(
     limit: int = Query(default=500, ge=1, le=500),
     _: None = Depends(require_admin_token),
 ) -> dict[str, object]:
     return {"data": state_store.pnl_summary(limit)}
+
+
+class BillImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    start_day: date
+    end_day: date
+
+
+@app.post("/api/v1/account/bills/imports", status_code=202)
+async def import_account_bills(
+    request: BillImportRequest, _: None = Depends(require_admin_token),
+) -> dict[str, Any]:
+    try:
+        return {"job": await account_history.start(request.start_day, request.end_day)}
+    except BillImportBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except OkxAccountError as exc:
+        raise HTTPException(status_code=503, detail="OKX read-only credentials are not configured") from exc
+
+
+@app.get("/api/v1/account/bills/imports")
+def latest_bill_import(_: None = Depends(require_admin_token)) -> dict[str, Any]:
+    return {"job": state_store.bill_import(account_client.account_scope)}
+
+
+@app.get("/api/v1/account/bills/imports/{job_id}")
+def bill_import_status(
+    job_id: str = RoutePath(min_length=32, max_length=32, pattern=r"^[a-f0-9]+$"),
+    _: None = Depends(require_admin_token),
+) -> dict[str, Any]:
+    job = state_store.bill_import(account_client.account_scope, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Bill import not found")
+    return {"job": job}
+
+
+@app.get("/api/v1/account/bills/history")
+def historical_account_bills(
+    start_day: date, end_day: date,
+    limit: int = Query(default=100, ge=1, le=500),
+    before_ts: int | None = Query(default=None, gt=0),
+    before_id: str | None = Query(default=None, min_length=1, max_length=128),
+    _: None = Depends(require_admin_token),
+) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    try:
+        days = history_days(start_day, end_day, now=now)
+        report = state_store.bill_history(
+            account_client.account_scope, days, limit=limit, before_ts=before_ts, before_id=before_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"configured": account_client.configured, "archive_first_day": archive_first_day(now).isoformat(), **report}
 
 
 @app.get("/api/v1/performance/report")
@@ -542,7 +628,7 @@ def safety_status() -> dict[str, object]:
 
 
 @app.post("/api/v1/safety/emergency-stop")
-def emergency_stop(
+async def emergency_stop(
     request: SafetyReasonRequest,
     _: None = Depends(require_admin_token),
 ) -> dict[str, object]:
@@ -553,11 +639,18 @@ def emergency_stop(
         severity="warning",
         payload={"reason": request.reason},
     )
+    await execution_engine.notify_event(
+        "emergency_stop",
+        "OpenPerpDesk 已触发急停",
+        f"新订单已停止放行：{request.reason}。",
+        payload={"reason": request.reason},
+        severity="warning",
+    )
     return safety_controller.snapshot()
 
 
 @app.post("/api/v1/safety/resume")
-def resume_trading(
+async def resume_trading(
     request: SafetyReasonRequest,
     _: None = Depends(require_admin_token),
 ) -> dict[str, object]:
@@ -567,11 +660,17 @@ def resume_trading(
         "Emergency stop released",
         payload={"reason": request.reason},
     )
+    await execution_engine.notify_event(
+        "emergency_resume",
+        "OpenPerpDesk 已恢复执行",
+        f"急停闸门已解除：{request.reason}。",
+        payload={"reason": request.reason},
+    )
     return safety_controller.snapshot()
 
 
 @app.post("/api/v1/safety/live/unlock")
-def unlock_live(
+async def unlock_live(
     request: LiveUnlockRequest,
     _: None = Depends(require_admin_token),
 ) -> dict[str, object]:
@@ -583,19 +682,33 @@ def unlock_live(
         "Live safety gate unlocked in process memory",
         severity="warning",
     )
+    # The gate remains process-local and is still fail-closed after restart.
+    await execution_engine.notify_event(
+        "live_safety_unlocked",
+        "OpenPerpDesk 实盘闸门已解锁",
+        "实盘安全闸门已在当前进程内人工解锁。",
+        severity="warning",
+    )
     return {"unlocked": True, "live_safety": trade_client.live_gate.snapshot()}
 
 
 @app.post("/api/v1/safety/live/lock")
-def lock_live(
+async def lock_live(
     _: None = Depends(require_admin_token),
 ) -> dict[str, object]:
     trade_client.live_gate.lock()
     state_store.add_audit("live_safety_locked", "Live safety gate locked")
+    await execution_engine.notify_event(
+        "live_safety_locked",
+        "OpenPerpDesk 实盘闸门已锁定",
+        "实盘安全闸门已锁定，后续实盘订单将被阻止。",
+        severity="warning",
+    )
     return {"unlocked": False, "live_safety": trade_client.live_gate.snapshot()}
 
 
 class RiskEvaluateRequest(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
     signal: TradeSignal
     account_equity: float = Field(gt=0.0)
     daily_pnl_pct: float
@@ -615,6 +728,7 @@ class AnalysisRequest(BaseModel):
 
 
 class BacktestRequest(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
     inst_id: str = Field(default="BTC-USDT-SWAP", min_length=9, max_length=40)
     bar: str = Field(default="15m", pattern=r"^[0-9]+[mHhDWMw]$")
     limit: int = Field(default=300, ge=30, le=300)
@@ -641,11 +755,16 @@ def _strategy_config(strategy_id: str) -> dict[str, object]:
 def analysis_status() -> dict[str, object]:
     return {
         "structured_strategy": {"available": True, "source": "structured-technical"},
-        "tradingagents": {
-            "enabled": tradingagents.enabled,
-            "configured": tradingagents.configured,
-        },
+        "tradingagents": tradingagents.status(),
     }
+
+
+@app.post("/api/v1/analysis/ai/check")
+async def check_ai_runtime(_: None = Depends(require_admin_token)) -> dict[str, object]:
+    try:
+        return {"data": await tradingagents.check_ready()}
+    except AIAnalysisError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
 
 async def _ai_market_context(
@@ -750,6 +869,8 @@ async def run_ai_analysis(
     _: None = Depends(require_admin_token),
 ) -> dict[str, object]:
     try:
+        if tradingagents.configuration_error:
+            raise AIAnalysisError(tradingagents.configuration_error)
         market_context = await _ai_market_context(
             request.inst_id,
             request.bar,
@@ -760,8 +881,13 @@ async def run_ai_analysis(
             market_context=market_context,
         )
     except AIAnalysisError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    state_store.save_analysis(
+        state_store.add_audit(
+            "ai_analysis_failed",
+            "TradingAgents research did not complete",
+            payload={"inst_id": request.inst_id, "code": exc.code},
+        )
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    saved = state_store.save_analysis(
         {
             "inst_id": request.inst_id,
             "source": "TradingAgents",
@@ -775,7 +901,7 @@ async def run_ai_analysis(
         "TradingAgents analysis completed",
         payload={"inst_id": request.inst_id},
     )
-    return {"data": analysis}
+    return {"data": {**analysis, "id": saved["id"], "created_at": saved["created_at"]}}
 
 
 @app.get("/api/v1/analysis")
@@ -786,7 +912,32 @@ def analysis_history(
     return {"data": state_store.list_analyses(limit)}
 
 
+@app.get("/api/v1/analysis/history")
+def analysis_index(
+    limit: int = Query(default=20, ge=1, le=50),
+    before_id: int | None = Query(default=None, ge=1),
+    inst_id: str | None = Query(default=None, min_length=1, max_length=64),
+    source: str | None = Query(default=None, min_length=1, max_length=64),
+    _: None = Depends(require_admin_token),
+) -> dict[str, object]:
+    return state_store.analysis_index(
+        limit, before_id=before_id, inst_id=inst_id, source=source
+    )
+
+
+@app.get("/api/v1/analysis/{analysis_id}")
+def analysis_detail(
+    analysis_id: int,
+    _: None = Depends(require_admin_token),
+) -> dict[str, object]:
+    record = state_store.get_analysis(analysis_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Analysis not found.")
+    return {"data": record}
+
+
 class SignalExecutionRequest(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
     signal: TradeSignal
     account_equity: float = Field(gt=0.0)
     daily_pnl_pct: float
@@ -883,10 +1034,12 @@ async def cancel_stored_order(
             status_code=409,
             detail="Order has no exchange order ID and cannot be canceled.",
         )
-    if order.get("status") in {"canceled", "filled", "failed", "rejected"}:
+    if order.get("status") in {"canceled", "filled", "failed", "rejected", "effective", "triggered", "expired", "order_failed", "mmp_canceled"}:
         return {"accepted": False, "idempotent": True, "order": order}
+    is_algo = order.get("order_kind") == "algo"
     try:
-        response = await trade_client.cancel_order(
+        cancel = trade_client.cancel_algo_order if is_algo else trade_client.cancel_order
+        response = await cancel(
             str(order["inst_id"]),
             exchange_order_id,
         )
@@ -897,22 +1050,36 @@ async def cancel_stored_order(
     cancel_succeeded = (
         bool(response_row)
         and str(response_row.get("sCode", "0")) == "0"
+        and str(response_row.get("algoId" if is_algo else "ordId")) == exchange_order_id
     )
     updated = {
         **order,
-        "status": "canceled" if cancel_succeeded else "cancel_failed",
+        "status": "canceling" if cancel_succeeded else "cancel_failed",
         "raw": response,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     saved = state_store.save_order(updated)
     state_store.add_audit(
-        "order_canceled" if saved["status"] == "canceled" else "order_cancel_failed",
+        "order_cancel_requested" if cancel_succeeded else "order_cancel_failed",
         "Stored order cancellation requested",
-        severity="info" if saved["status"] == "canceled" else "warning",
+        severity="info" if cancel_succeeded else "warning",
         payload={"client_order_id": client_order_id},
     )
+    await execution_engine.notify_event(
+        "order_cancel_requested" if cancel_succeeded else "order_cancel_failed",
+        "OpenPerpDesk 撤单结果",
+        (
+            f"{order['inst_id']} 客户端订单 {client_order_id} "
+            f"{'撤单请求已受理，最终状态以交易所回报为准' if cancel_succeeded else '撤单请求未确认'}。"
+        ),
+        payload={
+            "client_order_id": client_order_id,
+            "status": saved["status"],
+        },
+        severity="info" if cancel_succeeded else "warning",
+    )
     return {
-        "accepted": saved["status"] == "canceled",
+        "accepted": cancel_succeeded,
         "idempotent": False,
         "order": saved,
         "exchange": response,

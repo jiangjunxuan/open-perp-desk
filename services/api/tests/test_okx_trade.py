@@ -18,7 +18,7 @@ class OrderRequestTests(unittest.TestCase):
             side="buy",
             sz=1,
             reduce_only=True,
-            cl_ord_id="test-order-1",
+            cl_ord_id="testorder1",
         )
         self.assertEqual(
             order.okx_payload(),
@@ -30,7 +30,7 @@ class OrderRequestTests(unittest.TestCase):
                 "ordType": "market",
                 "sz": "1",
                 "reduceOnly": True,
-                "clOrdId": "test-order-1",
+                "clOrdId": "testorder1",
             },
         )
 
@@ -50,7 +50,7 @@ class OrderRequestTests(unittest.TestCase):
             sz=1,
             stop_loss=68000,
             take_profit=74000,
-            cl_ord_id="test-order-2",
+            cl_ord_id="testorder2",
         )
         attached = order.okx_payload()["attachAlgoOrds"][0]
         self.assertEqual(attached["slTriggerPx"], "68000")
@@ -94,7 +94,7 @@ class OkxTradeClientTests(unittest.TestCase):
                         sz=1,
                         stop_loss=68000,
                         take_profit=74000,
-                        cl_ord_id="client-1",
+                        cl_ord_id="client1",
                     )
                 )
             )
@@ -105,7 +105,7 @@ class OkxTradeClientTests(unittest.TestCase):
         self.assertEqual(request.headers["x-simulated-trading"], "1")
         self.assertTrue(request.headers["OK-ACCESS-SIGN"])
         self.assertEqual(response["data"][0]["ordId"], "okx-1")
-        self.assertEqual(captured["payload"]["clOrdId"], "client-1")
+        self.assertEqual(captured["payload"]["clOrdId"], "client1")
         self.assertEqual(captured["payload"]["attachAlgoOrds"][0]["slTriggerPx"], "68000")
 
     def test_demo_cancel_sends_exchange_order_id(self) -> None:
