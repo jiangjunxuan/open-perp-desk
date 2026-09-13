@@ -60,7 +60,10 @@ class FakeDeployment(deploy.Deployment):
         if args[0] == "config":
             output = json.dumps(self.model).encode()
         elif args[0] == "ps":
-            output = b"fixture-api\n" if self.running else b""
+            output = json.dumps([{
+                "ID": "fixture-api", "Service": "api",
+                "State": "running" if self.running else "exited",
+            }]).encode()
         elif args[0] == "stop":
             if not self.stays_running:
                 self.running = False
@@ -232,6 +235,54 @@ class DeploymentCommandTests(unittest.TestCase):
         with self.assertRaisesRegex(deploy.DeploymentError, "still running"):
             self.deployment.restore(self.deployment.snapshot)
         self.assertFalse(any("restore" in args for args in self.deployment.calls))
+
+    def test_stopped_container_identity_does_not_block_restore(self):
+        self.deployment.running = False
+        result = self.deployment.restore(self.deployment.snapshot)
+        self.assertTrue(result["restored"])
+        self.assertNotIn(("exec", "-T", "api", "python", "-", "info"), self.deployment.calls)
+        self.assertEqual(
+            [args for args in self.deployment.calls if args[0] == "ps"],
+            [("ps", "--all", "--format", "json", "api")] * 2,
+        )
+
+    def test_container_state_supports_compose_json_array_and_json_lines(self):
+        rows = [
+            {"ID": "first", "Service": "api", "State": "running"},
+            {"ID": "old", "Service": "api", "State": "exited"},
+        ]
+        for payload in (json.dumps(rows), "\n".join(json.dumps(row) for row in rows)):
+            with self.subTest(payload=payload), patch.object(self.deployment, "compose", return_value=subprocess.CompletedProcess(
+                [], 0, stdout=payload.encode(),
+            )):
+                self.assertEqual(self.deployment.api_containers(), rows)
+
+    def test_unverifiable_container_states_never_stop_or_restore(self):
+        for payload in (
+            b"not-json", b'{"ID":"api"}', b"null",
+            b'[{"ID":"api","Service":"web","State":"running"}]',
+            b'[{"ID":"api","Service":"api","State":"unknown"}]',
+        ):
+            original = self.deployment.compose
+            def reply(*args, **kwargs):
+                if args[0] == "ps":
+                    return subprocess.CompletedProcess(args, 0, stdout=payload)
+                return original(*args, **kwargs)
+            with self.subTest(payload=payload), patch.object(self.deployment, "compose", side_effect=reply):
+                with self.assertRaisesRegex(deploy.DeploymentError, "Cannot verify"):
+                    self.deployment.restore(self.deployment.snapshot)
+            self.assertNotIn(("stop", "api"), self.deployment.calls)
+            self.assertFalse(any("restore" in args for args in self.deployment.calls))
+
+    def test_paused_restarting_and_removing_containers_are_not_quiescent(self):
+        for state in ("paused", "restarting", "removing", "dead"):
+            with self.subTest(state=state), patch.object(self.deployment, "api_containers", return_value=[
+                {"ID": "api", "Service": "api", "State": state},
+            ]):
+                with self.assertRaisesRegex(deploy.DeploymentError, "not stable"):
+                    self.deployment.restore(self.deployment.snapshot)
+            self.assertNotIn(("stop", "api"), self.deployment.calls)
+            self.assertFalse(any("restore" in args for args in self.deployment.calls))
 
     def test_runtime_gate_failure_stops_api_and_preserves_archive(self):
         self.deployment.fail_runtime = True

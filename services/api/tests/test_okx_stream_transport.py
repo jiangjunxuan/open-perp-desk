@@ -167,7 +167,10 @@ class WebSocketTransportTests(unittest.IsolatedAsyncioTestCase):
                 account, algo = OkxAccountStream(), OkxAlgoOrderStream()
             try:
                 await asyncio.gather(account.start(), algo.start())
-                await wait_for(lambda: account.last_error and algo.last_error)
+                await wait_for(lambda: all(
+                    stream.last_error == "OkxAuthenticationError" and not stream.connected
+                    for stream in (account, algo)
+                ))
                 self.assertEqual(account.last_error, "OkxAuthenticationError")
                 self.assertEqual(algo.last_error, "OkxAuthenticationError")
                 self.assertFalse(account.authenticated or algo.authenticated)

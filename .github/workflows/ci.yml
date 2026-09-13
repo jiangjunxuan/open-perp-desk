@@ -75,6 +75,31 @@ jobs:
           docker compose exec -T api python -c \
             'from app.state_store import StateStore; assert StateStore().get_control_flag("ci_roundtrip")'
 
+  tradingagents-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: build the pinned optional research runtime
+        run: docker build --file services/api/Dockerfile.tradingagents --tag openperpdesk-ai:ci .
+      - name: offline non-root research process self-check
+        run: |
+          docker run --rm --init --network none \
+            -e DATA_DIR=/data \
+            -e TRADINGAGENTS_ENABLED=true \
+            -e TRADINGAGENTS_PATH=/opt/tradingagents \
+            -e TRADINGAGENTS_TIMEOUT_SECONDS=60 \
+            -e TRADINGAGENTS_LLM_PROVIDER=openai_compatible \
+            -e TRADINGAGENTS_LLM_BACKEND_URL=http://127.0.0.1:9/v1 \
+            -e TRADINGAGENTS_DEEP_THINK_LLM=protocol-fixture \
+            -e TRADINGAGENTS_QUICK_THINK_LLM=protocol-fixture \
+            -e OPENAI_COMPATIBLE_API_KEY=ci-not-a-real-key \
+            -e EXECUTION_ENABLED=false \
+            -e LIVE_TRADING_ENABLED=false \
+            -e AUTO_TRADING_ENABLED=false \
+            openperpdesk-ai:ci python -c \
+            'import asyncio, json, os; from app.ai_analysis import TradingAgentsAdapter; assert os.geteuid() != 0; result = asyncio.run(TradingAgentsAdapter().check_ready()); assert result["runtime_state"] == "ready"; assert result["provider_connection_verified"] is False; assert result["execution_authorized"] is False; print(json.dumps(result))'
+
   web:
     runs-on: ubuntu-latest
     timeout-minutes: 5

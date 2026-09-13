@@ -185,6 +185,30 @@ class Deployment:
         with (self.root / "services/api/app/database_maintenance.py").open("rb") as program:
             return self.compose("exec", "-T", "api", "python", "-", command, stdin=program, stdout=stdout)
 
+    def api_containers(self) -> list[dict]:
+        raw = self.compose("ps", "--all", "--format", "json", "api").stdout
+        try:
+            text = raw.decode().strip()
+            if not text:
+                return []
+            try:
+                rows = json.loads(text)
+                rows = rows if isinstance(rows, list) else [rows]
+            except json.JSONDecodeError:
+                rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+            states = {"created", "running", "paused", "restarting", "removing", "exited", "dead"}
+            if any(
+                not isinstance(row, dict) or not isinstance(row.get("ID"), str) or not row["ID"]
+                or row.get("Service") != "api" or row.get("State") not in states
+                for row in rows
+            ):
+                raise ValueError("Invalid API container state")
+            if len({row["ID"] for row in rows}) != len(rows):
+                raise ValueError("Duplicate API container identity")
+            return rows
+        except (UnicodeError, ValueError, TypeError) as error:
+            raise DeploymentError("Cannot verify API container state; recovery refused.") from error
+
     def backup(self) -> Path:
         self.backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.backup_dir, 0o700)
@@ -229,7 +253,10 @@ class Deployment:
         info = json.loads(self.compose(*helper, "info").stdout)
         if info.get("format") != 1 or info.get("database") != expected:
             raise DeploymentError("Maintenance image does not match the configured state path.")
-        running = self.compose("ps", "-q", "api").stdout.split()
+        containers = self.api_containers()
+        if any(row["State"] not in {"running", "exited", "created"} for row in containers):
+            raise DeploymentError("API container state is not stable; recovery refused.")
+        running = [row for row in containers if row["State"] == "running"]
         if running:
             if len(running) != 1:
                 raise DeploymentError("Recovery requires one API instance.")
@@ -237,7 +264,8 @@ class Deployment:
             if current.get("database") != expected:
                 raise DeploymentError("Running API uses a different database path; resolve configuration drift first.")
         self.compose("stop", "api")
-        if self.compose("ps", "-q", "api").stdout.strip():
+        # A stopped container still has an ID. Its lifecycle state proves quiescence.
+        if any(row["State"] not in {"exited", "created"} for row in self.api_containers()):
             raise DeploymentError("API is still running; recovery refused.")
         result = None
         try:
