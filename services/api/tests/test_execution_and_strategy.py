@@ -973,6 +973,8 @@ class OrderTimestampAccountClient(FakeAccountClient):
 
 
 class ProtectedPositionAccountClient(FakeAccountClient):
+    account_scope = "protected-fixture"
+
     async def positions(self):
         return [{
             "instId": "BTC-USDT-SWAP",
@@ -982,6 +984,7 @@ class ProtectedPositionAccountClient(FakeAccountClient):
             "avgPx": "50000",
             "markPx": "50010",
             "upl": "0",
+            "tradeId": "entry-trade",
         }]
 
 
@@ -1088,7 +1091,7 @@ class AccountSyncTests(unittest.TestCase):
                     "status": "filled",
                     "inst_id": "BTC-USDT-SWAP",
                     "side": "buy",
-                    "pos_side": "net",
+                    "pos_side": "long",
                     "ord_type": "market",
                     "td_mode": "isolated",
                     "size": 1,
@@ -1096,6 +1099,12 @@ class AccountSyncTests(unittest.TestCase):
                     "take_profit": 52000,
                     "source": "structured-technical",
                     "created_at": "2026-01-01T00:00:00+00:00",
+                    "account_scope": "protected-fixture",
+                    "raw": {
+                        "ordId": "exchange-1", "clOrdId": "entry-1",
+                        "instId": "BTC-USDT-SWAP", "posSide": "long", "tdMode": "isolated",
+                        "side": "buy", "tradeId": "entry-trade", "accFillSz": "1",
+                    },
                 }
             )
             synchronizer = AccountSynchronizer(

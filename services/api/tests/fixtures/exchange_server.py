@@ -253,6 +253,7 @@ class ExchangeServer:
             "pos": str(size), "availPos": str(abs(size)), "avgPx": self.price,
             "markPx": self.price, "notionalUsd": str(abs(size) * .01 * float(self.price)),
             "upl": "0", "uTime": now,
+            "tradeId": order["tradeId"],
         }
         for attached in order.get("attachAlgoOrds", []):
             algo_id = str(7000 + len(self.algos))

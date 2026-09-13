@@ -238,6 +238,15 @@ class ProtectiveMarkWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.engine.submit_signal.assert_awaited_once()
         self.assertTrue(self.engine.submit_signal.await_args.kwargs["idempotency_key"].endswith(":lifecycle:1"))
 
+    async def test_worker_passes_current_trade_identity_to_shared_execution_checks(self):
+        current = self.store.list_positions()[0]
+        self.store.upsert_position({**current, "exchange_trade_id": "verified-entry"})
+        self.client.get.return_value = [quote(markPx="94")]
+        await self.cycle()
+        self.assertEqual(
+            self.engine.submit_signal.await_args.kwargs["expected_position_trade_id"], "verified-entry",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

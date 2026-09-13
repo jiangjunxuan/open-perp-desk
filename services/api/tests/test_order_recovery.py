@@ -42,7 +42,8 @@ def exchange_order(**overrides):
     return {
         "ordId": "exchange1", "clOrdId": "local1", "instId": "BTC-USDT-SWAP",
         "side": "buy", "posSide": "net", "ordType": "market", "tdMode": "isolated",
-        "sz": "1", "state": "filled", "cTime": now, "uTime": now, **overrides,
+        "sz": "1", "state": "filled", "cTime": now, "uTime": now,
+        "tradeId": "entry-trade", "accFillSz": "1", **overrides,
     }
 
 
@@ -360,6 +361,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.account.position_rows = [{
             "instId": "BTC-USDT-SWAP", "posSide": "net", "pos": "1",
             "mgnMode": "isolated", "avgPx": "100", "markPx": "100",
+            "tradeId": "entry-trade",
         }]
         result = await self.sync.sync_rest()
         self.assertNotIn("errors", result)
@@ -370,10 +372,11 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.intent(stop_loss=95, take_profit=110)
         snapshot = {
             "configured": True, "connected": True, "authenticated": True,
-            "orders": [exchange_order(state="partially_filled")],
+            "orders": [exchange_order(state="partially_filled", accFillSz=".5")],
             "positions": [{
                 "instId": "BTC-USDT-SWAP", "posSide": "net", "pos": ".5",
                 "mgnMode": "isolated", "avgPx": "100", "markPx": "100",
+                "tradeId": "entry-trade",
             }],
         }
         self.stream.snapshot = lambda: snapshot

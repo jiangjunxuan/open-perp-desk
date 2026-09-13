@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from app.account_sync import AccountSynchronizer
 from app.execution_engine import ExecutionEngine
@@ -186,9 +187,20 @@ class ExecutionReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.trade.orders, [])
 
     async def test_preview_does_not_install_stop_loss_on_existing_position(self):
-        await self.submit(dry_run=True)
-        sync = AccountSynchronizer(self.store, object(), object())
-        self.assertEqual(sync._local_protection(self.signal.inst_id, "net", 1), (None, None))
+        record = (await self.submit(dry_run=True))["order"]
+        self.store.save_order({
+            **record, "account_scope": "preview-fixture", "exchange_order_id": "preview-exchange",
+            "raw": {
+                "ordId": "preview-exchange", "clOrdId": record["client_order_id"],
+                "instId": self.signal.inst_id, "posSide": "net", "tdMode": "isolated",
+                "side": "buy", "accFillSz": "1", "tradeId": "preview-trade",
+            },
+        })
+        sync = AccountSynchronizer(self.store, SimpleNamespace(account_scope="preview-fixture"), object())
+        self.assertEqual(sync._local_protection(
+            self.signal.inst_id, "net", 1, td_mode="isolated",
+            account_scope="preview-fixture", trade_id="preview-trade",
+        ), (None, None, None))
 
 
 class OrderBoundaryTests(unittest.TestCase):

@@ -88,6 +88,7 @@ class ExecutionEngine:
         side_override: Literal["buy", "sell"] | None = None,
         idempotency_key: str | None = None,
         market_data_fresh: bool = True,
+        expected_position_trade_id: str | None = None,
     ) -> dict[str, Any]:
         if not self.safety.execution_allowed:
             self.store.add_audit(
@@ -132,7 +133,13 @@ class ExecutionEngine:
             if not dry_run and not self.trade_client.enabled:
                 return await self._preflight_rejection(signal, "execution_disabled")
             try:
-                prepared = await self.preflight.prepare(signal, size, side_override)
+                if expected_position_trade_id is not None:
+                    prepared = await self.preflight.prepare(
+                        signal, size, side_override,
+                        expected_position_trade_id=expected_position_trade_id,
+                    )
+                else:
+                    prepared = await self.preflight.prepare(signal, size, side_override)
             except PreflightError as exc:
                 return await self._preflight_rejection(signal, str(exc))
             signal = prepared.signal
@@ -203,6 +210,7 @@ class ExecutionEngine:
             "raw": {
                 "signal": signal.model_dump(mode="json"),
                 "preflight": prepared.summary() if prepared else {"basis": "simulation"},
+                "expected_position_trade_id": expected_position_trade_id,
             },
             "risk_notional": prepared.order_notional if prepared and not reduce_only else 0.0,
             "account_scope": prepared.account_scope if prepared else None,

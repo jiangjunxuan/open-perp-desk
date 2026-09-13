@@ -123,7 +123,7 @@ class RealtimePositionTests(unittest.IsolatedAsyncioTestCase):
         self.push(position())
         self.account.rows = [position("2", "200")]
         await self.sync.sync_rest()
-        with patch.object(self.sync, "_local_protection", return_value=(90, 110)):
+        with patch.object(self.sync, "_local_protection", return_value=(90, 110, "fixture-entry")):
             self.sync.sync_stream()
         current = self.store.list_positions()[0]
         self.assertEqual(current["size"], 2)

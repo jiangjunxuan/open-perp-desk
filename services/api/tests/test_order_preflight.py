@@ -207,6 +207,18 @@ class OrderPreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await self.submit(signal))["accepted"])
         self.assertEqual(len(self.trade.orders), 1)
 
+    async def test_protective_close_rechecks_position_trade_identity_before_submitting(self):
+        self.account.position_rows = [{**position(), "tradeId": "current-trade"}]
+        signal = TradeSignal(inst_id="BTC-USDT-SWAP", action="close", confidence=1, leverage=1, position_pct=0)
+        rejected = await self.submit(signal, expected_position_trade_id="previous-trade")
+        self.assertFalse(rejected["accepted"])
+        self.assertIn("close_position_changed", rejected["reasons"])
+        self.assertEqual(self.trade.orders, [])
+        self.assertEqual(self.store.list_orders(), [])
+        accepted = await self.submit(signal, expected_position_trade_id="current-trade")
+        self.assertTrue(accepted["accepted"])
+        self.assertEqual(len(self.trade.orders), 1)
+
     async def test_pending_and_position_exposure_share_account_budget(self):
         self.account.position_rows = [position(notional="150")]
         self.account.pending_rows = [{

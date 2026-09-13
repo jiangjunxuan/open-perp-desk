@@ -268,6 +268,10 @@ class StateStore:
                     position_key TEXT PRIMARY KEY,
                     inst_id TEXT NOT NULL,
                     pos_side TEXT NOT NULL,
+                    td_mode TEXT NOT NULL DEFAULT '',
+                    account_scope TEXT,
+                    exchange_trade_id TEXT,
+                    protection_order_id TEXT,
                     size REAL NOT NULL,
                     entry_price REAL NOT NULL,
                     mark_price REAL,
@@ -329,6 +333,12 @@ class StateStore:
                 connection.execute(
                     "ALTER TABLE positions ADD COLUMN lifecycle_generation INTEGER NOT NULL DEFAULT 0"
                 )
+            for column, declaration in (
+                ("td_mode", "TEXT NOT NULL DEFAULT ''"), ("account_scope", "TEXT"),
+                ("exchange_trade_id", "TEXT"), ("protection_order_id", "TEXT"),
+            ):
+                if column not in position_columns:
+                    connection.execute(f"ALTER TABLE positions ADD COLUMN {column} {declaration}")
             order_columns = {
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(orders)")
@@ -352,6 +362,10 @@ class StateStore:
                             "UPDATE orders SET exchange_updated_ms = ? WHERE client_order_id = ?",
                             (timestamp, row["client_order_id"]),
                         )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_orders_protection_match "
+                "ON orders(account_scope, inst_id, pos_side, td_mode, order_kind, status)"
+            )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO strategies
@@ -594,6 +608,23 @@ class StateStore:
                 (inst_id, side, *ACTIVE_ORDER_STATUSES),
             ).fetchone()
         return row is not None
+
+    def protection_orders(
+        self, inst_id: str, account_scope: str, pos_side: str, td_mode: str, trade_id: str,
+    ) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM orders
+                WHERE account_scope = ? AND inst_id = ? AND pos_side = ? AND td_mode = ?
+                  AND order_kind = 'standard' AND reduce_only = 0
+                  AND status IN ('partially_filled', 'filled')
+                  AND CASE WHEN json_valid(raw_json) THEN json_extract(raw_json, '$.tradeId') END = ?
+                LIMIT 2
+                """,
+                (account_scope, inst_id, pos_side, td_mode, trade_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def save_fill(self, fill: dict[str, Any]) -> dict[str, Any]:
         with self._connection() as connection:
@@ -1640,12 +1671,15 @@ class StateStore:
                 """
                 INSERT INTO positions (
                     position_key, inst_id, pos_side, size, entry_price, mark_price,
-                    notional, stop_loss, take_profit, unrealized_pnl, status, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    notional, stop_loss, take_profit, unrealized_pnl, status, updated_at,
+                    td_mode, account_scope, exchange_trade_id, protection_order_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(position_key) DO UPDATE SET
                     lifecycle_generation = positions.lifecycle_generation + CASE
                         WHEN excluded.status = 'open' AND excluded.size != 0 AND (
                             positions.status != 'open' OR positions.size = 0
+                            OR positions.account_scope IS NOT excluded.account_scope
+                            OR positions.protection_order_id IS NOT excluded.protection_order_id
                             OR (positions.pos_side = 'net' AND (
                                 (positions.size < 0 AND excluded.size > 0)
                                 OR (positions.size > 0 AND excluded.size < 0)
@@ -1657,6 +1691,10 @@ class StateStore:
                     notional = excluded.notional,
                     stop_loss = excluded.stop_loss,
                     take_profit = excluded.take_profit,
+                    td_mode = excluded.td_mode,
+                    account_scope = excluded.account_scope,
+                    exchange_trade_id = excluded.exchange_trade_id,
+                    protection_order_id = excluded.protection_order_id,
                     unrealized_pnl = excluded.unrealized_pnl,
                     status = excluded.status,
                     updated_at = excluded.updated_at
@@ -1674,6 +1712,10 @@ class StateStore:
                     position.get("unrealized_pnl", 0),
                     position.get("status", "open"),
                     now,
+                    position.get("td_mode", ""),
+                    position.get("account_scope"),
+                    position.get("exchange_trade_id"),
+                    position.get("protection_order_id"),
                 ),
             )
         return self.get_position(position_key) or position

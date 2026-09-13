@@ -239,6 +239,7 @@ class AutomationWorker:
                         side_override=close_side,
                         idempotency_key=close_key,
                         market_data_fresh=self.market_data_fresh(),
+                        expected_position_trade_id=position.get("exchange_trade_id"),
                     )
                     if (
                         close_result.get("accepted")

@@ -163,6 +163,8 @@ class OrderPreflight:
         signal: TradeSignal,
         size: float,
         side_override: str | None = None,
+        *,
+        expected_position_trade_id: str | None = None,
     ) -> PreparedExecution:
         if not self.configured:
             raise PreflightError("private_account_not_configured")
@@ -247,6 +249,8 @@ class OrderPreflight:
             if len(candidates) != 1:
                 raise PreflightError("close_position_missing_or_ambiguous")
             position, side, position_size = candidates[0]
+            if expected_position_trade_id is not None and position.get("tradeId") != expected_position_trade_id:
+                raise PreflightError("close_position_changed")
             if quantity > position_size:
                 raise PreflightError("close_size_above_position")
             if position.get("availPos") not in (None, ""):

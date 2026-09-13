@@ -1,6 +1,7 @@
 import asyncio
 import json
 import math
+import re
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable
@@ -62,6 +63,10 @@ def _position_key(item: dict[str, Any]) -> str:
         str(item.get("posSide", "net")),
         str(item.get("mgnMode", "")),
     ))
+
+
+def _trade_id(value: Any) -> str | None:
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value) else None
 
 
 class AccountSynchronizer:
@@ -155,24 +160,61 @@ class AccountSynchronizer:
         inst_id: str,
         pos_side: str,
         size: float,
-    ) -> tuple[float | None, float | None]:
+        *,
+        td_mode: str,
+        account_scope: str | None,
+        trade_id: str | None,
+    ) -> tuple[float | None, float | None, str | None]:
+        empty = (None, None, None)
+        if (
+            not account_scope or account_scope != getattr(self.account_client, "account_scope", None)
+            or not trade_id or not math.isfinite(size) or not size
+            or pos_side not in {"net", "long", "short"} or td_mode not in {"cross", "isolated"}
+        ):
+            return empty
         expected_side = _position_side_for_order(pos_side, size)
-        for order in self.store.list_orders(500):
+        orders = self.store.protection_orders(inst_id, account_scope, pos_side, td_mode, trade_id)
+        if len(orders) != 1:
+            return empty
+        order = orders[0]
+        try:
+            raw = json.loads(order["raw_json"])
+            if not isinstance(raw, dict) or any(raw.get(field) != expected for field, expected in (
+                ("instId", inst_id), ("posSide", pos_side), ("tdMode", td_mode),
+                ("side", expected_side), ("ordId", order["exchange_order_id"]),
+                ("clOrdId", order["client_order_id"]),
+            )) or not order["exchange_order_id"] or order["side"] != expected_side:
+                return empty
+            filled = Decimal(str(raw.get("accFillSz")))
+            requested = Decimal(str(order["size"]))
             if (
-                order.get("inst_id") != inst_id
-                or order.get("reduce_only")
-                or order.get("side") != expected_side
-                or order.get("status") not in {
-                    "partially_filled",
-                    "filled",
-                }
+                not filled.is_finite() or not requested.is_finite()
+                or not 0 < abs(Decimal(str(size))) <= filled <= requested
             ):
-                continue
-            stop_loss = order.get("stop_loss")
-            take_profit = order.get("take_profit")
-            if stop_loss or take_profit:
-                return stop_loss, take_profit
-        return None, None
+                return empty
+            levels = (order.get("stop_loss"), order.get("take_profit"))
+            if not any(value is not None for value in levels) or any(
+                value is not None and (not math.isfinite(value) or value <= 0) for value in levels
+            ):
+                return empty
+        except (ValueError, TypeError, InvalidOperation):
+            return empty
+        return levels[0], levels[1], order["client_order_id"]
+
+    def _protection_unlinked(self, previous: dict[str, Any] | None, owner: str | None, size: float) -> None:
+        if not previous or owner or not size or not (previous["stop_loss"] or previous["take_profit"]):
+            return
+        payload = {"inst_id": previous["inst_id"], "reason": "position_protection_unverified"}
+        self.store.add_audit(
+            "position_protection_unverified",
+            "Local protection was not linked to the current position trade",
+            severity="warning", payload=payload,
+        )
+        self._schedule_notification(
+            "position_protection_unverified", "OpenPerpDesk 本地保护关联待核对",
+            f"{previous['inst_id']} 的当前持仓无法关联已验证开仓成交，未套用历史保护价；请核对交易所原生保护单。",
+            severity="warning", payload=payload,
+        )
 
     def _save_algo_order(self, item: dict[str, Any], *, source: str = "okx-algo-stream") -> bool:
         algo_id = str(
@@ -345,11 +387,22 @@ class AccountSynchronizer:
             return False
         size = _number(item.get("pos"))
         pos_side = str(item.get("posSide", "net"))
-        stop_loss, take_profit = self._local_protection(str(item.get("instId", "")), pos_side, size)
+        td_mode = str(item.get("mgnMode", ""))
+        scope = getattr(self.account_client, "account_scope", None)
+        trade_id = _trade_id(item.get("tradeId"))
+        stop_loss, take_profit, owner = self._local_protection(
+            str(item.get("instId", "")), pos_side, size,
+            td_mode=td_mode, account_scope=scope, trade_id=trade_id,
+        )
+        previous = self.store.get_position(key)
         self.store.upsert_position({
             "position_key": key,
             "inst_id": str(item.get("instId", "")),
             "pos_side": pos_side,
+            "td_mode": td_mode,
+            "account_scope": scope,
+            "exchange_trade_id": trade_id,
+            "protection_order_id": owner,
             "size": size,
             "entry_price": _number(item.get("avgPx") or item.get("openAvgPx")),
             "mark_price": _number(item.get("markPx")),
@@ -359,6 +412,7 @@ class AccountSynchronizer:
             "take_profit": take_profit,
             "status": "open" if abs(size) > 0 else "closed",
         })
+        self._protection_unlinked(previous, owner, size)
         if timestamp is not None:
             self._position_times[key] = timestamp
         return True
@@ -367,14 +421,20 @@ class AccountSynchronizer:
         current = self.store.get_position(key)
         if current is None or current["status"] != "open":
             return
-        stop_loss, take_profit = self._local_protection(
+        stop_loss, take_profit, owner = self._local_protection(
             current["inst_id"], current["pos_side"], current["size"],
+            td_mode=current["td_mode"], account_scope=current["account_scope"],
+            trade_id=current["exchange_trade_id"],
         )
-        if (stop_loss, take_profit) != (current["stop_loss"], current["take_profit"]):
+        if (stop_loss, take_profit, owner) != (
+            current["stop_loss"], current["take_profit"], current["protection_order_id"],
+        ):
             self.store.upsert_position({
                 **current, "stop_loss": stop_loss, "take_profit": take_profit,
+                "protection_order_id": owner,
                 "updated_at": None,
             })
+            self._protection_unlinked(current, owner, current["size"])
 
     def sync_stream(self) -> dict[str, Any]:
         snapshot = self.account_stream.snapshot()
