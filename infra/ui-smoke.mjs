@@ -751,5 +751,5 @@ try {
     delay(3000),
   ]);
   if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGKILL");
-  await rm(profile, { recursive: true, force: true });
+  await rm(profile, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 });
 }
