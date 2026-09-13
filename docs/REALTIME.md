@@ -76,3 +76,9 @@ stable focus, stale/incorrect-interval rejection and private UI fixtures.
 Private fixtures are not real OKX Demo acceptance. Actual private credentials,
 model-provider connectivity, PushPlus WeChat receipt, prolonged operation and
 target-server HTTPS/proxy acceptance still require separate verification.
+
+On 2026-09-13, commit `0c4280e` passed CI run `34750347409`: 316 API tests,
+11 Node tests, the Compose backup/restore/restart drill with SSE through Nginx
+before and after recovery, and the optional offline TradingAgents image check.
+The local browser run also passed 63 route checks and desktop/mobile live-feed
+checks. The image self-check did not connect to a real model provider.
