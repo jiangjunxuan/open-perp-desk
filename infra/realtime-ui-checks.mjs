@@ -34,7 +34,7 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
         uniqueUpdates: new Set(rows.map(row => row.receivedAt)).size,
         uniquePrices: new Set(rows.map(row => row.price)).size,
         uniqueCandles: new Set(rows.map(row => row.candle)).size,
-        liveLabel: rows.every(row => row.tag === "实时推送"),
+        liveLabel: rows.every(row => row.tag === "已连接"),
         stableWatchNode: button === $("#watchlist .watch-item"),
         focusPreserved: document.activeElement === button,
         samples: rows,
@@ -54,10 +54,10 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
     if (!paused) throw new Error(`${viewport.name}: pause did not freeze the live view`);
     await evaluate('$("#toggle-market-refresh").click()');
     for (let attempt = 0; attempt < 100; attempt++) {
-      if (await evaluate('$("#market-tag").textContent === "实时推送"')) break;
+      if (await evaluate('$("#market-tag").textContent === "已连接"')) break;
       await wait(100);
     }
-    const resumed = await evaluate('!state.marketPaused && $("#market-tag").textContent === "实时推送"');
+    const resumed = await evaluate('!state.marketPaused && $("#market-tag").textContent === "已连接"');
     if (!resumed) throw new Error(`${viewport.name}: live view did not resume`);
     const fixtures = await evaluate(`(async () => {
       marketFeed.close();
@@ -67,7 +67,7 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
       openLiveStream = (path, callbacks) => { latest = { path, ...callbacks }; return { close() {} }; };
       connectMarketFeed();
       latest.onState("offline");
-      const disconnected = !$("#market-tag").textContent.includes("实时推送");
+      const disconnected = $("#market-tag").textContent === "行情连接中断";
       const record = { fresh: true, received_at: new Date().toISOString(), data: {last: "100", bidPx: "99", askPx: "101", sodUtc8: "90"} };
       latest.onState("open");
       latest.onEvent("market", { bar: "1H", tickers: { [state.symbol]: record }, candles: {} });
@@ -79,12 +79,25 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
       api = () => new Promise(resolve => replies.push(resolve));
       const pendingSnapshot = loadMarket();
       $("#toggle-market-refresh").click();
-      replies[0]({fresh: true, tickers: {[state.symbol]: {...record, data:{last:"999"}}}});
-      replies[1]({data: [["1","999","999","999","999","1"]]});
+      replies[0]({data: [["1","999","999","999","999","1"]]});
       await pendingSnapshot;
       api = oldApi;
       const pauseRejectsPendingSnapshot = state.marketPaused && $("#market-price").textContent === "100"
         && !$("#refresh-market").hasAttribute("aria-busy");
+      const requests = [];
+      api = async path => {
+        requests.push(path);
+        return {data: [["2","999","999","999","999","1"], ["1","999","999","999","999","1"]]};
+      };
+      state.marketPaused = false;
+      state.marketFeedState = "offline";
+      await loadMarket();
+      const noSnapshotFallback = $("#market-price").textContent === "100"
+        && requests.length === 1 && requests[0].includes("/market/candles")
+        && $("#market-tag").textContent === "行情连接中断";
+      api = oldApi;
+      state.marketFeedState = "open";
+      state.marketStream = {tickers: {[state.symbol]: record}};
       const allowed = {
         ...state.status, execution_enabled: true, risk_engine_ready: true, trading_mode: "demo",
         safety_control: {execution_allowed: true, emergency_stopped: false},
@@ -101,6 +114,10 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
       const heartbeatCannotUnlock = !executionGateOpen(allowed);
       control.onEvent("status", allowed);
       const freshControlStatusAccepted = executionGateOpen(state.status);
+      state.marketFeedState = "offline";
+      updateMarketRefreshControl();
+      const marketDisconnectLocksExecution = !executionGateOpen(state.status) && $("#execute-signal").disabled;
+      state.marketFeedState = "open";
       let resolveStatus;
       api = () => new Promise(resolve => { resolveStatus = resolve; });
       const pendingStatus = loadStatus();
@@ -121,7 +138,7 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
       applyPrivateEvent("locked", {});
       const accessRevoked = state.token === "" && $("#metric-equity").textContent === "--" && $("#execute-signal").disabled;
       openLiveStream = oldOpen;
-      return { disconnected, wrongPeriodIgnored, realPriceUpdated, pauseRejectsPendingSnapshot,
+      return { disconnected, wrongPeriodIgnored, realPriceUpdated, pauseRejectsPendingSnapshot, noSnapshotFallback, marketDisconnectLocksExecution,
         disconnectedExecutionLocked, reconnectingExecutionLocked, heartbeatCannotUnlock,
         freshControlStatusAccepted, staleStatusRejected, accountUpdated, draftPreserved, accessRevoked };
     })()`);

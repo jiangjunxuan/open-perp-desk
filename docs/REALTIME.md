@@ -32,16 +32,20 @@ heartbeats, reconnect with backoff and receive a complete current snapshot.
 Background tabs close their feeds and reopen on return. Pausing the chart stops
 its live display without stopping execution or account events.
 The browser's execution controls stay locked during reconnection until a new
-control-state snapshot arrives; a heartbeat alone cannot unlock them. Late
+control-state snapshot and fresh market event arrive; a heartbeat alone cannot unlock them. Late
 REST status responses cannot replace a newer pushed safety state.
+The quote display uses SSE only. It does not substitute periodically fetched
+REST tickers when the stream is disconnected. Normal UI status is "已连接";
+disconnects are explicit and browser order submission remains locked.
 
 Private feeds require the administrator token in the `X-Admin-Token` header.
 Tokens are never put in URLs or persistent browser storage. Revocation stops
 private delivery and clears the displayed private state. Public feeds contain
 only the already-public market and system-status information.
 
-REST chart/history correction and periodic account reconciliation remain
-available to repair gaps. They are not the primary display-update mechanism.
+REST candle history loads on entry, interval changes, manual refresh and
+reconnection to repair gaps; there is no 15-second market refresh timer.
+Periodic account reconciliation remains separate from display updates.
 Position reconciliation distinguishes a newly received WebSocket message from
 a replayed cache entry. An older known exchange update time cannot replace a
 newer position, and a REST request cannot overwrite or close a position changed
@@ -73,6 +77,8 @@ ordering cases, including delayed responses, closures, replayed caches and
 protection updates.
 `infra/realtime-ui-checks.mjs` checks the running public feed, pause/resume,
 stable focus, stale/incorrect-interval rejection and private UI fixtures.
+`infra/chart-annotation-ui-checks.mjs` checks drawing, editing, deletion/undo,
+time/price anchors, persistence, corrupt-storage recovery and mobile layouts.
 
 Private fixtures are not real OKX Demo acceptance. Actual private credentials,
 model-provider connectivity, PushPlus WeChat receipt, prolonged operation and

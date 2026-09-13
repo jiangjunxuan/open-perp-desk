@@ -9,8 +9,15 @@ const state = {
   marketRequest: 0,
   marketFeedState: "connecting",
   marketStream: null,
-  marketSnapshotFresh: false,
   marketCandleKey: null,
+  chartTool: "cursor",
+  chartAnnotations: [],
+  chartDraft: null,
+  chartSelection: -1,
+  chartUndo: [],
+  chartDrag: null,
+  chartEditor: null,
+  marketHistoryNeedsSync: false,
   controlFeedState: "connecting",
   controlSnapshotFresh: false,
   controlUpdates: 0,
@@ -55,7 +62,7 @@ const views = {
 function renderIcons(root = document) {
   root.querySelectorAll("[data-icon]").forEach((icon) => {
     const name = icon.dataset.icon;
-    if (/^[a-z-]+$/.test(name)) {
+    if (/^[a-z][a-z0-9-]*$/.test(name)) {
       icon.style.setProperty("--icon", `url("/assets/icons/${name}.svg")`);
     }
   });
@@ -408,13 +415,257 @@ function renderChart(rows) {
   context.fillRect(padding.left + chartWidth + 2, priceLabelY - 9, padding.right - 4, 18);
   context.fillStyle = colors.getPropertyValue("--on-chart-label").trim();
   context.fillText(formatNumber(latest.close, 2), padding.left + chartWidth + 7, priceLabelY + 3);
-  state.chartGeometry = { candles, padding, chartWidth };
+  drawChartAnnotations(context, {
+    candles,
+    padding,
+    chartWidth,
+    chartHeight,
+    yFor,
+    xFor,
+  });
+  state.chartGeometry = { candles, padding, chartWidth, chartHeight, min, max, yFor, xFor };
   const cursorIndex = candles.findIndex(candle => candle.time === state.chartCursorTime);
   showChartCursor(cursorIndex);
   setText(
     "#chart-a11y",
     `${state.symbol} 最新收盘 ${formatNumber(latest.close, 2)}，区间高点 ${formatNumber(max, 2)}，区间低点 ${formatNumber(min, 2)}。`,
   );
+}
+
+function chartStorageKey() {
+  return `openperpdesk.chart-annotations.${state.symbol}.${state.bar}`;
+}
+
+function loadChartAnnotations() {
+  state.chartDraft = null;
+  state.chartSelection = -1;
+  state.chartUndo = [];
+  try {
+    const value = JSON.parse(localStorage.getItem(chartStorageKey()) || "[]");
+    const point = item => item && Number.isFinite(item.time) && item.time > 0
+      && item.time <= 8640000000000000 && Number.isFinite(item.price) && item.price > 0;
+    state.chartAnnotations = Array.isArray(value) ? value.slice(0, 200).filter(item =>
+      item && (
+        item.type === "horizontal" && Number.isFinite(item.price) && item.price > 0
+        || item.type === "trend" && point(item.start) && point(item.end)
+        || item.type === "text" && point(item) && typeof item.text === "string" && item.text.length <= 80
+      )) : [];
+  } catch {
+    state.chartAnnotations = [];
+  }
+  updateChartAnnotationControls();
+}
+
+function saveChartAnnotations() {
+  try {
+    localStorage.setItem(chartStorageKey(), JSON.stringify(state.chartAnnotations));
+  } catch {
+    setMessage("标记保留在当前页面；浏览器存储不可用，刷新后可能丢失。", "error");
+  }
+  updateChartAnnotationControls();
+}
+
+function rememberChartAnnotations() {
+  state.chartUndo.push(structuredClone(state.chartAnnotations));
+  if (state.chartUndo.length > 20) state.chartUndo.shift();
+}
+
+function updateChartAnnotationControls() {
+  const selected = state.chartAnnotations[state.chartSelection];
+  for (const id of ["edit-chart-annotation", "delete-chart-annotation"]) {
+    if ($(`#${id}`)) $(`#${id}`).disabled = !selected;
+  }
+  if ($("#undo-chart-annotation")) $("#undo-chart-annotation").disabled = !state.chartUndo.length;
+  if ($("#clear-chart-annotations")) $("#clear-chart-annotations").disabled = !state.chartAnnotations.length;
+  const list = $("#chart-annotation-list");
+  if (list) {
+    const names = { horizontal: "水平线", trend: "趋势线", text: "文字" };
+    list.replaceChildren(new Option("图表标记", "-1"), ...state.chartAnnotations.map((item, index) =>
+      new Option(`${index + 1}. ${names[item.type]}${item.type === "text" ? ` · ${item.text}` : ""}`, String(index))));
+    list.value = String(state.chartSelection);
+  }
+}
+
+function chartTimeToX(time, geometry) {
+  const candles = geometry.candles;
+  let right = candles.findIndex(candle => candle.time >= time);
+  if (right < 0) right = candles.length - 1;
+  right = Math.max(1, right);
+  const left = right - 1;
+  return geometry.xFor(left + (time - candles[left].time) / (candles[right].time - candles[left].time || 1));
+}
+
+function setChartTool(tool) {
+  if (!["cursor", "horizontal", "trend", "text"].includes(tool)) return;
+  state.chartTool = tool;
+  state.chartDraft = null;
+  document.querySelectorAll("[data-chart-tool]").forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.chartTool === tool));
+  });
+  const canvas = $("#price-chart");
+  if (canvas) canvas.style.cursor = tool === "cursor" ? "crosshair" : "cell";
+  if (state.lastCandles) renderChart(state.lastCandles);
+}
+
+function drawChartAnnotations(context, geometry) {
+  const colors = getComputedStyle(document.documentElement);
+  const accent = colors.getPropertyValue("--accent").trim();
+  const warning = colors.getPropertyValue("--warning").trim() || "#f0b44d";
+  const muted = colors.getPropertyValue("--muted").trim();
+  const timeToX = time => chartTimeToX(Number(time), geometry);
+  const yFor = (price) => geometry.yFor(Number(price));
+  context.save();
+  context.beginPath();
+  context.rect(geometry.padding.left, geometry.padding.top, geometry.chartWidth, geometry.chartHeight);
+  context.clip();
+  context.lineWidth = 1.2;
+  state.chartAnnotations.forEach((annotation, index) => {
+    context.lineWidth = index === state.chartSelection ? 2.5 : 1.2;
+    if (annotation.type === "horizontal") {
+      const y = yFor(annotation.price);
+      if (y < geometry.padding.top || y > geometry.padding.top + geometry.chartHeight) return;
+      context.strokeStyle = warning;
+      context.setLineDash([6, 4]);
+      context.beginPath();
+      context.moveTo(geometry.padding.left, y);
+      context.lineTo(geometry.padding.left + geometry.chartWidth, y);
+      context.stroke();
+      context.setLineDash([]);
+      context.fillStyle = warning;
+      context.font = "10px SFMono-Regular, Consolas, monospace";
+      context.textAlign = "right";
+      context.fillText(formatNumber(annotation.price, 2), geometry.padding.left + geometry.chartWidth - 8, Math.max(geometry.padding.top + 12, y - 5));
+      context.textAlign = "left";
+    } else if (annotation.type === "trend") {
+      context.strokeStyle = accent;
+      context.setLineDash([]);
+      context.beginPath();
+      context.moveTo(timeToX(annotation.start.time), yFor(annotation.start.price));
+      context.lineTo(timeToX(annotation.end.time), yFor(annotation.end.price));
+      context.stroke();
+    } else if (annotation.type === "text") {
+      const x = timeToX(annotation.time);
+      const y = yFor(annotation.price);
+      context.font = "11px -apple-system, BlinkMacSystemFont, sans-serif";
+      const width = Math.min(geometry.chartWidth - 12, context.measureText(annotation.text).width + 12);
+      const boxX = Math.max(geometry.padding.left, Math.min(x + 6, geometry.padding.left + geometry.chartWidth - width));
+      const boxY = Math.max(geometry.padding.top, y - 20);
+      if (x < geometry.padding.left || x > geometry.padding.left + geometry.chartWidth
+          || y < geometry.padding.top || y > geometry.padding.top + geometry.chartHeight) return;
+      context.fillStyle = colors.getPropertyValue("--surface-raised").trim();
+      context.strokeStyle = muted;
+      context.fillRect(boxX, boxY, width, 20);
+      context.strokeRect(boxX, boxY, width, 20);
+      context.fillStyle = colors.getPropertyValue("--text").trim();
+      let text = annotation.text;
+      if (context.measureText(text).width > width - 12) {
+        while (text.length && context.measureText(`${text}…`).width > width - 12) text = text.slice(0, -1);
+      }
+      context.fillText(text === annotation.text ? text : `${text}…`, boxX + 6, boxY + 13);
+    }
+  });
+  if (state.chartDraft?.type === "trend") {
+    context.strokeStyle = muted;
+    context.setLineDash([4, 4]);
+    context.beginPath();
+    context.moveTo(timeToX(state.chartDraft.start.time), yFor(state.chartDraft.start.price));
+    context.lineTo(timeToX(state.chartDraft.end.time), yFor(state.chartDraft.end.price));
+    context.stroke();
+  }
+  context.restore();
+}
+
+function chartPointFromEvent(event, geometry = state.chartGeometry) {
+  const canvas = $("#price-chart");
+  if (!geometry || !canvas || !geometry.candles.length) return null;
+  const rect = canvas.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  if (x < geometry.padding.left || x > geometry.padding.left + geometry.chartWidth
+      || y < geometry.padding.top || y > geometry.padding.top + geometry.chartHeight) return null;
+  const index = Math.max(0, Math.min(
+    geometry.candles.length - 1,
+    Math.floor((x - geometry.padding.left) / geometry.chartWidth * geometry.candles.length),
+  ));
+  const candle = geometry.candles[index];
+  const prices = geometry.candles.flatMap(item => [item.high, item.low]);
+  const min = Math.min(...prices);
+  const max = Math.max(...prices);
+  const range = max - min || 1;
+  return {
+    time: candle.time,
+    price: min + (1 - (y - geometry.padding.top) / geometry.chartHeight) * range,
+  };
+}
+
+function addChartAnnotation(event) {
+  const point = chartPointFromEvent(event);
+  if (!point) return;
+  addChartAnnotationAtPoint(point);
+}
+
+function addChartAnnotationAtPoint(point) {
+  if (state.chartAnnotations.length >= 200) {
+    setMessage("当前合约周期最多保留 200 个标记，请先删除部分标记。", "error");
+    return;
+  }
+  if (state.chartTool === "horizontal") {
+    rememberChartAnnotations();
+    state.chartAnnotations.push({ type: "horizontal", price: point.price });
+    state.chartSelection = state.chartAnnotations.length - 1;
+    saveChartAnnotations();
+    setChartTool("cursor");
+  } else if (state.chartTool === "trend") {
+    if (!state.chartDraft) {
+      state.chartDraft = { type: "trend", start: point, end: point };
+      renderChart(state.lastCandles);
+    } else {
+      rememberChartAnnotations();
+      state.chartAnnotations.push({
+        type: "trend",
+        start: state.chartDraft.start,
+        end: point,
+      });
+      state.chartDraft = null;
+      state.chartSelection = state.chartAnnotations.length - 1;
+      saveChartAnnotations();
+      setChartTool("cursor");
+    }
+  } else if (state.chartTool === "text") {
+    openChartAnnotationEditor({ type: "text", ...point, text: "" }, -1);
+  }
+}
+
+function openChartAnnotationEditor(annotation, index) {
+  if (!annotation) return;
+  state.chartEditor = { annotation: structuredClone(annotation), index, key: chartStorageKey() };
+  $("#chart-note-price").value = String(annotation.price ?? annotation.start.price);
+  $("#chart-note-end-price").value = String(annotation.end?.price || 1);
+  $("#chart-note-end-field").hidden = annotation.type !== "trend";
+  $("#chart-note-field").hidden = annotation.type !== "text";
+  $("#chart-note-text").required = annotation.type === "text";
+  $("#chart-note-text").value = annotation.text || "";
+  $("#chart-note-dialog").showModal();
+  $(annotation.type === "text" ? "#chart-note-text" : "#chart-note-price").focus();
+}
+
+function hitChartAnnotation(point, geometry) {
+  const x = chartTimeToX(point.time, geometry);
+  const y = geometry.yFor(point.price);
+  for (let index = state.chartAnnotations.length - 1; index >= 0; index--) {
+    const item = state.chartAnnotations[index];
+    if (item.type === "horizontal" && Math.abs(y - geometry.yFor(item.price)) < 12) return index;
+    if (item.type === "text"
+        && Math.abs(x - chartTimeToX(item.time, geometry)) < 40 && Math.abs(y - geometry.yFor(item.price)) < 24) return index;
+    if (item.type === "trend") {
+      const ax = chartTimeToX(item.start.time, geometry), ay = geometry.yFor(item.start.price);
+      const bx = chartTimeToX(item.end.time, geometry), by = geometry.yFor(item.end.price);
+      const length = (bx - ax) ** 2 + (by - ay) ** 2;
+      const position = length ? Math.max(0, Math.min(1, ((x - ax) * (bx - ax) + (y - ay) * (by - ay)) / length)) : 0;
+      if (Math.hypot(x - ax - position * (bx - ax), y - ay - position * (by - ay)) < 12) return index;
+    }
+  }
+  return -1;
 }
 
 function renderCandleReadout(candle) {
@@ -1088,6 +1339,9 @@ async function loadActivity() {
 
 function executionGateOpen(status) {
   return status?.execution_enabled === true
+    && !state.marketPaused
+    && state.marketFeedState === "open"
+    && state.marketStream?.tickers?.[state.symbol]?.fresh === true
     && state.controlFeedState === "open"
     && state.controlSnapshotFresh
     && status.risk_engine_ready === true
@@ -1312,28 +1566,14 @@ async function loadMarket() {
   const { symbol, bar } = state;
   setBusy("#refresh-market", true, "读取中...");
   try {
-    const [stream, candlePayload] = await Promise.all([
-      api(`/api/v1/market/stream?symbol=${encodeURIComponent(symbol)}`),
-      api(`/api/v1/market/candles?inst_id=${encodeURIComponent(symbol)}&bar=${encodeURIComponent(bar)}&limit=100`),
-    ]);
+    const candlePayload = await api(`/api/v1/market/candles?inst_id=${encodeURIComponent(symbol)}&bar=${encodeURIComponent(bar)}&limit=100`);
     if (request !== state.marketRequest) return;
-    state.marketSnapshotFresh = stream.tickers?.[symbol]?.fresh ?? stream.fresh;
-    if (state.marketFeedState !== "open" || state.marketPaused) renderWatchlist(stream.tickers);
     renderChart(candlePayload.data);
     state.marketCandleKey = null;
     applyLiveCandle();
-    try {
-      const overview = await api(`/api/v1/market/overview?inst_id=${encodeURIComponent(symbol)}`);
-      if (request !== state.marketRequest) return;
-      renderMarketOverview(overview);
-    } catch {
-      if (request !== state.marketRequest) return;
-      renderMarketOverview({});
-    }
     updateMarketRefreshControl();
   } catch (error) {
     if (request !== state.marketRequest) return;
-    state.marketSnapshotFresh = false;
     updateMarketRefreshControl();
     if (!state.lastCandles?.length) {
       setText("#chart-empty", error.message);
@@ -1348,7 +1588,7 @@ async function loadMarket() {
 function updateMarketRefreshControl() {
   const button = $("#toggle-market-refresh");
   if (!button) return;
-  const label = state.marketPaused ? "恢复自动刷新" : "暂停自动刷新";
+  const label = state.marketPaused ? "继续看盘" : "暂停看盘";
   button.setAttribute("aria-label", label);
   button.title = label;
   button.querySelector("[data-icon]").dataset.icon = state.marketPaused ? "play" : "pause";
@@ -1357,13 +1597,18 @@ function updateMarketRefreshControl() {
   const live = state.marketFeedState === "open";
   const fresh = state.marketStream?.tickers?.[state.symbol]?.fresh;
   const labelText = state.marketPaused ? "行情已暂停"
-    : live ? fresh ? "实时推送" : "行情延迟"
+    : live ? fresh ? "已连接" : "行情延迟"
       : state.marketFeedState === "connecting" ? "连接中"
-        : state.marketSnapshotFresh ? "推送断开 · 快照备用" : "行情连接中断";
+        : "行情连接中断";
   const tone = !state.marketPaused && live && fresh ? "good" : "warning";
   setText("#market-refresh-state", labelText);
   setState("#market-tag", labelText, tone);
   setText("#quote-refresh-label", labelText);
+  document.querySelectorAll(".watch-item-state").forEach(element => {
+    const record = state.marketStream?.tickers?.[element.closest("[data-symbol]").dataset.symbol];
+    element.textContent = !live || state.marketPaused ? "暂停" : record?.fresh ? "在线" : "延迟";
+  });
+  if (state.status) applyStatus(state.status);
 }
 
 let marketFeed;
@@ -1396,6 +1641,7 @@ function connectMarketFeed() {
   const bar = state.bar;
   marketFeed = openLiveStream(`/api/v1/market/events?bar=${encodeURIComponent(bar)}`, {
     onState(status) {
+      if (status === "offline") state.marketHistoryNeedsSync = true;
       state.marketFeedState = status;
       updateMarketRefreshControl();
     },
@@ -1407,6 +1653,10 @@ function connectMarketFeed() {
       renderMarketOverview();
       applyLiveCandle();
       updateMarketRefreshControl();
+      if (state.marketHistoryNeedsSync && snapshot.tickers[state.symbol]?.fresh) {
+        state.marketHistoryNeedsSync = false;
+        loadMarket();
+      }
     },
   });
 }
@@ -1822,6 +2072,10 @@ async function testNotification() {
 
 async function submitSignal(dryRun) {
   if (state.submitting) return;
+  if (!dryRun && !executionGateOpen(state.status)) {
+    setMessage("行情或执行连接未就绪，禁止提交新订单。", "error");
+    return;
+  }
   if (!state.analysis?.signal) {
     setMessage("请先生成策略分析", "error");
     return;
@@ -1844,7 +2098,8 @@ async function submitSignal(dryRun) {
     return;
   }
   const mode = state.status?.trading_mode === "live" ? "实盘" : "模拟盘";
-  if (!dryRun && !window.confirm(`确认提交 OKX ${mode}订单？\n${payload.signal.inst_id} · ${payload.signal.action} · ${payload.size} 张`)) return;
+  if (!dryRun && (!window.confirm(`确认提交 OKX ${mode}订单？\n${payload.signal.inst_id} · ${payload.signal.action} · ${payload.size} 张`)
+      || !executionGateOpen(state.status))) return;
   state.submitting = true;
   const draftRevision = state.draftRevision;
   const button = dryRun ? "#preview-signal" : "#execute-signal";
@@ -1880,11 +2135,14 @@ function invalidateAnalysis() {
 }
 
 function reloadSelectedMarket() {
+  if ($("#chart-note-dialog").open) $("#chart-note-dialog").close();
+  state.chartDrag = null;
   invalidateAnalysis();
   renderResearchEvidence();
   updateBacktestContext();
   if (state.token && $("#history-contract").value) loadResearchHistory({ reset: true });
   state.chartCursorTime = null;
+  loadChartAnnotations();
   renderChart([]);
   renderWatchlist({});
   renderMarketOverview({});
@@ -1924,18 +2182,161 @@ $("#chart-range").addEventListener("change", event => {
   state.chartRange = Number(event.target.value);
   renderChart(state.lastCandles);
 });
+document.querySelectorAll("[data-chart-tool]").forEach(button => {
+  button.addEventListener("click", () => setChartTool(button.dataset.chartTool));
+});
+$("#chart-annotation-list").addEventListener("change", event => {
+  state.chartSelection = Number(event.target.value);
+  setChartTool("cursor");
+  updateChartAnnotationControls();
+});
+$("#edit-chart-annotation").addEventListener("click", () => {
+  openChartAnnotationEditor(state.chartAnnotations[state.chartSelection], state.chartSelection);
+});
+$("#delete-chart-annotation").addEventListener("click", () => {
+  if (!state.chartAnnotations[state.chartSelection]) return;
+  rememberChartAnnotations();
+  state.chartAnnotations.splice(state.chartSelection, 1);
+  state.chartSelection = -1;
+  saveChartAnnotations();
+  renderChart(state.lastCandles);
+});
+$("#undo-chart-annotation").addEventListener("click", () => {
+  if (!state.chartUndo.length) return;
+  state.chartAnnotations = state.chartUndo.pop();
+  state.chartSelection = -1;
+  state.chartDraft = null;
+  saveChartAnnotations();
+  renderChart(state.lastCandles);
+});
+$("#clear-chart-annotations").addEventListener("click", () => {
+  if (!state.chartAnnotations.length) return;
+  rememberChartAnnotations();
+  state.chartAnnotations = [];
+  state.chartSelection = -1;
+  state.chartDraft = null;
+  saveChartAnnotations();
+  renderChart(state.lastCandles);
+});
+$("#close-chart-note").addEventListener("click", () => $("#chart-note-dialog").close());
+$("#chart-note-dialog").addEventListener("close", () => {
+  state.chartEditor = null;
+  setChartTool("cursor");
+  $("#price-chart").focus({ preventScroll: true });
+});
+$("#chart-note-form").addEventListener("submit", event => {
+  event.preventDefault();
+  const editor = state.chartEditor;
+  if (!editor || editor.key !== chartStorageKey()) return;
+  const annotation = structuredClone(editor.annotation);
+  const price = Number($("#chart-note-price").value);
+  const endPrice = Number($("#chart-note-end-price").value);
+  const text = $("#chart-note-text").value.trim();
+  if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(endPrice) || endPrice <= 0
+      || annotation.type === "text" && (!text || text.length > 80)) return;
+  if (annotation.type === "trend") {
+    annotation.start.price = price;
+    annotation.end.price = endPrice;
+  } else annotation.price = price;
+  if (annotation.type === "text") annotation.text = text;
+  rememberChartAnnotations();
+  if (editor.index < 0) {
+    state.chartAnnotations.push(annotation);
+    state.chartSelection = state.chartAnnotations.length - 1;
+  } else {
+    state.chartAnnotations[editor.index] = annotation;
+    state.chartSelection = editor.index;
+  }
+  saveChartAnnotations();
+  $("#chart-note-dialog").close();
+});
 $("#price-chart").addEventListener("pointermove", event => {
   const geometry = state.chartGeometry;
   if (!geometry || !$("#chart-empty").hidden) return;
+  const point = chartPointFromEvent(event, state.chartDrag?.geometry || geometry);
+  if (state.chartDrag && point) {
+    const drag = state.chartDrag;
+    const item = structuredClone(drag.original);
+    const priceDelta = point.price - drag.point.price;
+    const timeDelta = point.time - drag.point.time;
+    if (item.type === "trend") {
+      for (const endpoint of [item.start, item.end]) {
+        endpoint.price += priceDelta;
+        endpoint.time += timeDelta;
+      }
+      if (item.start.price <= 0 || item.end.price <= 0) return;
+    } else {
+      item.price += priceDelta;
+      if (item.price <= 0) return;
+      if (item.type === "text") item.time += timeDelta;
+    }
+    drag.moved = true;
+    state.chartAnnotations[drag.index] = item;
+    renderChart(state.lastCandles);
+    return;
+  }
+  if (state.chartDraft && point) {
+    state.chartDraft.end = point;
+    renderChart(state.lastCandles);
+  }
   const x = event.clientX - event.currentTarget.getBoundingClientRect().left - geometry.padding.left;
   showChartCursor(x < 0 || x > geometry.chartWidth ? -1 : Math.min(geometry.candles.length - 1, Math.floor(x / geometry.chartWidth * geometry.candles.length)));
 });
 $("#price-chart").addEventListener("pointerleave", () => showChartCursor(-1));
+$("#price-chart").addEventListener("pointerdown", event => {
+  if (event.button !== 0) return;
+  if (state.chartTool !== "cursor") {
+    event.preventDefault();
+    addChartAnnotation(event);
+  } else {
+    const point = chartPointFromEvent(event);
+    if (!point) return;
+    state.chartSelection = hitChartAnnotation(point, state.chartGeometry);
+    const selected = state.chartAnnotations[state.chartSelection];
+    if (selected) {
+      state.chartDrag = { point, index: state.chartSelection, original: structuredClone(selected),
+        before: structuredClone(state.chartAnnotations), geometry: state.chartGeometry, moved: false };
+      event.currentTarget.setPointerCapture(event.pointerId);
+    }
+    updateChartAnnotationControls();
+    renderChart(state.lastCandles);
+  }
+});
+for (const type of ["pointerup", "pointercancel"]) {
+  $("#price-chart").addEventListener(type, event => {
+    const drag = state.chartDrag;
+    if (!drag) return;
+    if (type === "pointercancel") state.chartAnnotations = drag.before;
+    else if (drag.moved) {
+      state.chartUndo.push(drag.before);
+      if (state.chartUndo.length > 20) state.chartUndo.shift();
+      saveChartAnnotations();
+    }
+    state.chartDrag = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    renderChart(state.lastCandles);
+  });
+}
 $("#price-chart").addEventListener("keydown", event => {
   const geometry = state.chartGeometry;
+  if (event.key === "Delete" || event.key === "Backspace") {
+    event.preventDefault();
+    $("#delete-chart-annotation").click();
+    return;
+  }
+  if (event.key === "Enter" && geometry) {
+    event.preventDefault();
+    const candle = geometry.candles.find(item => item.time === state.chartCursorTime) || geometry.candles.at(-1);
+    if (state.chartTool === "cursor") $("#edit-chart-annotation").click();
+    else addChartAnnotationAtPoint({ time: candle.time, price: candle.close });
+    return;
+  }
   if (!geometry || !$("#chart-empty").hidden || !["ArrowLeft", "ArrowRight", "Home", "End", "Escape"].includes(event.key)) return;
   event.preventDefault();
-  if (event.key === "Escape") return showChartCursor(-1);
+  if (event.key === "Escape") {
+    setChartTool("cursor");
+    return showChartCursor(-1);
+  }
   let index = geometry.candles.findIndex(candle => candle.time === state.chartCursorTime);
   if (index < 0) index = geometry.candles.length - 1;
   if (event.key === "Home") index = 0;
@@ -2001,7 +2402,10 @@ $("#size-input").addEventListener("input", clearPreflight);
 $(".strategy-settings").addEventListener("input", () => { state.strategyDirty = true; });
 $("#worker-dry-run").addEventListener("change", () => { state.workerModeDirty = true; });
 $("#equity-input").addEventListener("input", clearPreflight);
-$("#refresh-market").addEventListener("click", loadMarket);
+$("#refresh-market").addEventListener("click", () => {
+  if (!state.marketPaused && state.marketFeedState !== "open") connectMarketFeed();
+  loadMarket();
+});
 $("#toggle-market-details").addEventListener("click", () => {
   const collapsed = $("#market-stats").classList.toggle("is-collapsed");
   const button = $("#toggle-market-details");
@@ -2213,11 +2617,13 @@ window.addEventListener("pageshow", event => {
     connectMarketFeed();
     connectControlFeed();
     connectPrivateFeed();
+    loadMarket();
   }
 });
 
 setTheme(document.documentElement.dataset.theme, false);
 renderIcons();
+loadChartAnnotations();
 initializeResearch();
 initializeBillHistory();
 showView(location.hash.slice(1));
@@ -2230,7 +2636,4 @@ setInterval(() => {
 connectControlFeed();
 loadMarket();
 connectMarketFeed();
-setInterval(() => {
-  if (!state.marketPaused && !document.hidden) loadMarket();
-}, 15000);
 updateMarketRefreshControl();

@@ -216,6 +216,22 @@
                 <select id="chart-range"><option value="40">40 根</option><option value="80" selected>80 根</option><option value="100">100 根</option></select>
                 <button class="button secondary icon-button chart-refresh-toggle" id="toggle-market-refresh" type="button" aria-pressed="false" title="暂停自动刷新" aria-label="暂停自动刷新"><i data-icon="pause" aria-hidden="true"></i></button>
               </div>
+              <div class="annotation-toolbar" role="group" aria-label="图表标记">
+                <div class="annotation-tools">
+                  <button class="button secondary icon-button" type="button" data-chart-tool="cursor" aria-pressed="true" title="选择标记" aria-label="选择标记"><i data-icon="mouse-pointer-2" aria-hidden="true"></i></button>
+                  <button class="button secondary icon-button" type="button" data-chart-tool="horizontal" aria-pressed="false" title="水平价位线" aria-label="水平价位线"><i data-icon="minus" aria-hidden="true"></i></button>
+                  <button class="button secondary icon-button" type="button" data-chart-tool="trend" aria-pressed="false" title="趋势线" aria-label="趋势线"><i data-icon="trending-up" aria-hidden="true"></i></button>
+                  <button class="button secondary icon-button" type="button" data-chart-tool="text" aria-pressed="false" title="文字标记" aria-label="文字标记"><i data-icon="type" aria-hidden="true"></i></button>
+                </div>
+                <label class="sr-only" for="chart-annotation-list">选择图表标记</label>
+                <select id="chart-annotation-list"><option value="-1">图表标记</option></select>
+                <div class="annotation-tools">
+                  <button class="button secondary icon-button" id="edit-chart-annotation" type="button" disabled title="编辑标记" aria-label="编辑标记"><i data-icon="pencil" aria-hidden="true"></i></button>
+                  <button class="button secondary icon-button" id="delete-chart-annotation" type="button" disabled title="删除选中标记" aria-label="删除选中标记"><i data-icon="trash-2" aria-hidden="true"></i></button>
+                  <button class="button secondary icon-button" id="undo-chart-annotation" type="button" disabled title="撤销标记操作" aria-label="撤销标记操作"><i data-icon="undo-2" aria-hidden="true"></i></button>
+                  <button class="button secondary icon-button" id="clear-chart-annotations" type="button" disabled title="清除当前合约周期的全部标记" aria-label="清除全部标记"><i data-icon="eraser" aria-hidden="true"></i></button>
+                </div>
+              </div>
               <div class="ohlc-strip" aria-label="K 线读数">
                 <span id="candle-time" class="mono">--</span>
                 <span>开 <strong id="candle-open">--</strong></span>
@@ -659,6 +675,15 @@
         <p class="auth-note">令牌仅保留在当前页面内存。解锁私有数据不会开启自动交易。</p>
         <span id="auth-message" class="settings-message" role="status" aria-live="polite"></span>
         <button class="button primary" id="save-token" type="submit">解锁私有数据</button>
+      </form>
+    </dialog>
+    <dialog id="chart-note-dialog" aria-labelledby="chart-note-title">
+      <form class="auth-box" id="chart-note-form">
+        <div class="dialog-heading"><h2 id="chart-note-title">图表标记</h2><button class="button secondary icon-button" id="close-chart-note" type="button" aria-label="取消标记" title="取消标记"><i data-icon="x" aria-hidden="true"></i></button></div>
+        <label id="chart-note-field" for="chart-note-text">文字<input id="chart-note-text" type="text" maxlength="80" autocomplete="off"></label>
+        <label for="chart-note-price">价位<input id="chart-note-price" type="number" min="0.000000000001" step="any" required></label>
+        <label id="chart-note-end-field" for="chart-note-end-price">终点价位<input id="chart-note-end-price" type="number" min="0.000000000001" step="any" required></label>
+        <button class="button primary" type="submit">保存标记</button>
       </form>
     </dialog>
     <script src="/assets/reports/marked.js"></script>
