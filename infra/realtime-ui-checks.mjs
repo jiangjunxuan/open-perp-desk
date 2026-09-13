@@ -17,6 +17,30 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
       const diagnostics = await evaluate('({url: location.href, hidden: document.hidden, market: state.marketFeedState, control: state.controlFeedState, tag: $("#market-tag").textContent, candle: state.marketCandleKey, busy: $("#refresh-market").hasAttribute("aria-busy")})');
       throw new Error(`${viewport.name}: live feed did not become ready ${JSON.stringify(diagnostics)}`);
     }
+    const trades = await evaluate(`(async () => {
+      const tab = $("#orderbook-tab-trades");
+      tab.click();
+      for (let attempt = 0; attempt < 120; attempt++) {
+        if (state.marketStream?.trades?.[state.symbol]?.fresh
+            && document.querySelectorAll("#trade-tape .trade-row").length) break;
+        await new Promise(resolve => setTimeout(resolve, 125));
+      }
+      const rows = [...document.querySelectorAll("#trade-tape .trade-row")];
+      const live = state.marketStream?.trades?.[state.symbol];
+      const result = {
+        selected: tab.getAttribute("aria-selected") === "true",
+        panelVisible: !$("#orderbook-view-trades").hidden && $("#orderbook-view-book").hidden,
+        fresh: live?.fresh === true,
+        rows: rows.length,
+        hasBuyOrSellTone: rows.some(row => row.classList.contains("buy") || row.classList.contains("sell")),
+        state: $("#orderbook-state").textContent,
+      };
+      $("#orderbook-tab-book").click();
+      return result;
+    })()`);
+    if (!trades.selected || !trades.panelVisible || !trades.fresh || trades.rows < 1 || !trades.hasBuyOrSellTone) {
+      throw new Error(`${viewport.name}: live trades view failed ${JSON.stringify(trades)}`);
+    }
     const samples = await evaluate(`(async () => {
       const button = $("#watchlist .watch-item");
       button.focus();
@@ -147,7 +171,7 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
     }
     const overflow = await evaluate("document.documentElement.scrollWidth > innerWidth");
     if (overflow) throw new Error(`${viewport.name}: realtime label caused horizontal overflow`);
-    results.push({ viewport: viewport.name, ...samples, paused, resumed, ...fixtures });
+    results.push({ viewport: viewport.name, trades, ...samples, paused, resumed, ...fixtures });
   }
   return results;
 }

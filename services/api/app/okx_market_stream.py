@@ -15,7 +15,7 @@ class OkxMarketStream:
     """Read-only OKX public market stream with fail-closed reconnects."""
 
     candle_bars = ("1m", "15m", "1H", "4H")
-    public_channels = ("tickers", "books5", "open-interest", "funding-rate")
+    public_channels = ("tickers", "books5", "trades", "open-interest", "funding-rate")
 
     def __init__(self, symbols: list[str]) -> None:
         self.symbols = symbols
@@ -30,6 +30,7 @@ class OkxMarketStream:
         self.candles_last_error: str | None = None
         self.tickers: dict[str, dict[str, Any]] = {}
         self.orderbooks: dict[str, dict[str, Any]] = {}
+        self.trades: dict[str, dict[str, Any]] = {}
         self.candles: dict[str, dict[str, Any]] = {}
         self._candles_by_bar: dict[str, dict[str, dict[str, Any]]] = {
             bar: {} for bar in self.candle_bars
@@ -168,6 +169,40 @@ class OkxMarketStream:
             self._last_message_epoch = time.monotonic()
             self.orderbooks[inst_id] = record
             self._record_epochs[(channel, inst_id)] = time.monotonic()
+        elif channel == "trades":
+            trades = [
+                item for item in data
+                if isinstance(item, dict)
+                and str(item.get("px", "")).strip()
+                and str(item.get("sz", "")).strip()
+            ]
+            if not trades:
+                return
+            previous = self.trades.get(inst_id, {}).get("data", [])
+            merged = trades + (previous if isinstance(previous, list) else [])
+            unique: list[dict[str, Any]] = []
+            seen: set[tuple[str, str, str, str, str]] = set()
+            for item in merged:
+                key = (
+                    str(item.get("tradeId", "")),
+                    str(item.get("ts", "")),
+                    str(item.get("px", "")),
+                    str(item.get("sz", "")),
+                    str(item.get("side", "")),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique.append(item)
+                if len(unique) >= 80:
+                    break
+            self.last_message_at = received_at
+            self._last_message_epoch = time.monotonic()
+            self.trades[inst_id] = {
+                **record,
+                "data": unique,
+            }
+            self._record_epochs[(channel, inst_id)] = time.monotonic()
         elif channel in {f"candle{bar}" for bar in self.candle_bars} and isinstance(data[0], list):
             self.candles_last_message_at = received_at
             self._last_candle_epoch = time.monotonic()
@@ -199,6 +234,7 @@ class OkxMarketStream:
             "candles_connected": self.candles_connected,
             "tickers": self._records(self.tickers, self.connected),
             "order_books": self._records(self.orderbooks, self.connected),
+            "trades": self._records(self.trades, self.connected),
             "candles": self._records(self._candles_by_bar[bar], self.candles_connected),
             "open_interest": self._records(self.metrics["open-interest"], self.connected),
             "funding_rate": self._records(self.metrics["funding-rate"], self.connected),
@@ -231,5 +267,6 @@ class OkxMarketStream:
             "candles_last_error": self.candles_last_error,
             "tickers": self._records(self.tickers, self.connected),
             "order_books": self._records(self.orderbooks, self.connected),
+            "trades": self._records(self.trades, self.connected),
             "candles": self._records(self.candles, self.candles_connected),
         }

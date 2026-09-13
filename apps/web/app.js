@@ -6,6 +6,7 @@ const state = {
   strategy: null,
   status: null,
   marketPaused: false,
+  orderbookView: "book",
   marketRequest: 0,
   marketFeedState: "connecting",
   marketStream: null,
@@ -849,8 +850,47 @@ function renderMarketOverview(overview) {
 function renderOrderBook() {
   const asksElement = $("#orderbook-asks");
   const bidsElement = $("#orderbook-bids");
-  if (!asksElement || !bidsElement) return;
+  const bookView = $("#orderbook-view-book");
+  const tradesView = $("#orderbook-view-trades");
+  const tradeTape = $("#trade-tape");
+  const tabs = document.querySelectorAll("[data-orderbook-view]");
+  if (!asksElement || !bidsElement || !bookView || !tradesView || !tradeTape) return;
+  const showingTrades = state.orderbookView === "trades";
+  bookView.hidden = showingTrades;
+  tradesView.hidden = !showingTrades;
+  tabs.forEach(tab => {
+    tab.setAttribute("aria-selected", String(tab.dataset.orderbookView === state.orderbookView));
+  });
   const record = state.marketStream?.order_books?.[state.symbol];
+  const tradeRecord = state.marketStream?.trades?.[state.symbol];
+  if (showingTrades) {
+    const rows = (Array.isArray(tradeRecord?.data) ? tradeRecord.data : [])
+      .map((trade, index) => ({
+        price: Number(trade?.px),
+        size: Number(trade?.sz),
+        side: trade?.side === "sell" ? "sell" : "buy",
+        time: Number(trade?.ts),
+        index,
+      }))
+      .filter(trade => Number.isFinite(trade.price) && trade.price > 0
+        && Number.isFinite(trade.size) && trade.size >= 0)
+      .sort((left, right) => (right.time - left.time) || (left.index - right.index))
+      .slice(0, 40);
+    tradeTape.innerHTML = rows.length
+      ? rows.map(trade => `
+        <div class="trade-row ${trade.side}" aria-label="${trade.side === "sell" ? "卖出" : "买入"} ${formatNumber(trade.price, 2)}，数量 ${formatNumber(trade.size, 5)}">
+          <span class="mono">${trade.time > 0 ? formatTime(new Date(trade.time).toISOString()) : "--"}</span>
+          <strong class="mono">${formatNumber(trade.price, 2)}</strong>
+          <span class="mono">${formatNumber(trade.size, 5)}</span>
+        </div>`).join("")
+      : '<div class="orderbook-empty">等待逐笔成交</div>';
+    const ready = tradeRecord?.fresh === true;
+    setState("#orderbook-state", ready ? "实时逐笔" : tradeRecord ? "逐笔延迟" : "等待实时逐笔", ready ? "good" : "warning");
+    setText("#orderbook-a11y", ready && rows.length
+      ? `逐笔成交实时更新，最新成交价 ${formatNumber(rows[0].price, 2)}，数量 ${formatNumber(rows[0].size, 5)}。`
+      : "逐笔成交等待实时数据。");
+    return;
+  }
   const book = record?.data;
   const validLevels = (levels, direction) => (Array.isArray(levels) ? levels : [])
     .map((level) => ({
@@ -2497,6 +2537,24 @@ document.querySelectorAll("[data-ticket]").forEach(tab => {
     const target = event.key === "Home" ? "signal" : event.key === "End" ? "execution"
       : tab.dataset.ticket === "signal" ? "execution" : "signal";
     showTicket(target, true);
+  });
+});
+document.querySelectorAll("[data-orderbook-view]").forEach(tab => {
+  tab.addEventListener("click", () => {
+    state.orderbookView = tab.dataset.orderbookView;
+    renderOrderBook();
+  });
+  tab.addEventListener("keydown", event => {
+    const tabs = [...document.querySelectorAll("[data-orderbook-view]")];
+    let index = tabs.indexOf(tab);
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    if (event.key === "Home") index = 0;
+    else if (event.key === "End") index = tabs.length - 1;
+    else index = (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    state.orderbookView = tabs[index].dataset.orderbookView;
+    renderOrderBook();
+    tabs[index].focus();
   });
 });
 $("#review-order").addEventListener("click", () => showTicket("execution", true));

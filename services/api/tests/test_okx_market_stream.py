@@ -18,6 +18,7 @@ class OkxMarketStreamTests(unittest.TestCase):
         }
         self.assertIn(("tickers", "BTC-USDT-SWAP"), channels)
         self.assertIn(("books5", "BTC-USDT-SWAP"), channels)
+        self.assertIn(("trades", "BTC-USDT-SWAP"), channels)
         self.assertNotIn(("candle1m", "ETH-USDT-SWAP"), channels)
         candles = self.stream.subscription_message(candles=True)
         self.assertEqual(
@@ -72,6 +73,25 @@ class OkxMarketStreamTests(unittest.TestCase):
         snapshot = self.stream.browser_snapshot("15m")
         self.assertEqual(snapshot["order_books"]["BTC-USDT-SWAP"]["data"]["asks"][0][0], "101")
         self.assertTrue(snapshot["order_books"]["BTC-USDT-SWAP"]["fresh"])
+
+    def test_consume_merges_recent_trades_without_duplicates(self) -> None:
+        self.stream.connected = True
+        for payload in (
+            [{"tradeId": "2", "px": "101", "sz": "2", "side": "sell", "ts": "2"}],
+            [
+                {"tradeId": "2", "px": "101", "sz": "2", "side": "sell", "ts": "2"},
+                {"tradeId": "1", "px": "100", "sz": "1", "side": "buy", "ts": "1"},
+            ],
+        ):
+            self.stream.consume(json.dumps({
+                "arg": {"channel": "trades", "instId": "BTC-USDT-SWAP"},
+                "data": payload,
+            }))
+
+        snapshot = self.stream.browser_snapshot("15m")
+        trades = snapshot["trades"]["BTC-USDT-SWAP"]
+        self.assertEqual([item["tradeId"] for item in trades["data"]], ["2", "1"])
+        self.assertTrue(trades["fresh"])
 
     def test_invalid_messages_do_not_change_state(self) -> None:
         self.stream.consume("not-json")

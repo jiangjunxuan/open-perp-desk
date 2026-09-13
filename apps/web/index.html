@@ -263,19 +263,27 @@
 	                  <span id="orderbook-state" class="subtle">等待实时深度</span>
 	                </div>
 	                <div class="orderbook-tabs" role="tablist" aria-label="市场深度视图">
-	                  <button type="button" role="tab" aria-selected="true">盘口</button>
-	                  <button type="button" role="tab" aria-selected="false" disabled>逐笔</button>
+	                  <button id="orderbook-tab-book" type="button" role="tab" aria-selected="true" aria-controls="orderbook-view-book" data-orderbook-view="book">盘口</button>
+	                  <button id="orderbook-tab-trades" type="button" role="tab" aria-selected="false" aria-controls="orderbook-view-trades" data-orderbook-view="trades">逐笔</button>
 	                </div>
 	              </div>
-	              <div class="orderbook-header" aria-hidden="true">
-	                <span>价格(USDT)</span><span>数量(BTC)</span><span>累计</span>
+	              <div id="orderbook-view-book" role="tabpanel" aria-labelledby="orderbook-tab-book">
+	                <div class="orderbook-header" aria-hidden="true">
+	                  <span>价格(USDT)</span><span>数量(BTC)</span><span>累计</span>
+	                </div>
+	                <div id="orderbook-asks" class="orderbook-side asks" aria-label="卖盘"></div>
+	                <div class="orderbook-mid">
+	                  <strong id="orderbook-mid-price" class="mono">--</strong>
+	                  <span id="orderbook-spread" class="mono">价差 --</span>
+	                </div>
+	                <div id="orderbook-bids" class="orderbook-side bids" aria-label="买盘"></div>
 	              </div>
-	              <div id="orderbook-asks" class="orderbook-side asks" aria-label="卖盘"></div>
-	              <div class="orderbook-mid">
-	                <strong id="orderbook-mid-price" class="mono">--</strong>
-	                <span id="orderbook-spread" class="mono">价差 --</span>
+	              <div id="orderbook-view-trades" role="tabpanel" aria-labelledby="orderbook-tab-trades" hidden>
+	                <div class="trade-tape-header" aria-hidden="true">
+	                  <span>时间</span><span>价格(USDT)</span><span>数量(BTC)</span>
+	                </div>
+	                <div id="trade-tape" class="trade-tape" aria-label="逐笔成交"></div>
 	              </div>
-	              <div id="orderbook-bids" class="orderbook-side bids" aria-label="买盘"></div>
 	              <p id="orderbook-a11y" class="sr-only" role="status" aria-live="polite">盘口等待实时数据。</p>
 	            </article>
 

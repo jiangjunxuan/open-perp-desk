@@ -204,6 +204,11 @@ async function exerciseManagement() {
 
 export async function checkManagement({ evaluate, command, screenshot }) {
   const results = [];
+  for (let attempt = 0; attempt < 120; attempt++) {
+    if (await evaluate('typeof state !== "undefined" && state.status !== null')) break;
+    await new Promise(resolve => setTimeout(resolve, 100));
+    if (attempt === 119) throw new Error("Management checks: system status did not load");
+  }
   for (const theme of ["dark", "light"]) {
     for (const viewport of [
       { name: "wide", width: 1920, height: 1080 },
