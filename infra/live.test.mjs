@@ -129,3 +129,68 @@ test("broken transport and malformed data reconnect before publishing", async ()
   assert.equal(states.filter(value => value === "offline").length, 2);
   assert.equal(states.filter(value => value === "open").length, 1);
 });
+
+test("repeated 503 responses keep retrying with capped backoff and recover", async () => {
+  const states = [];
+  const delays = [];
+  let calls = 0;
+  const open = runtime(async (_path, options) => {
+    calls++;
+    if (calls <= 10 || calls === 12) return new Response("", { status: 503 });
+    return new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`event: market\ndata: {"attempt":${calls}}\n\n`));
+        if (calls === 11) controller.close();
+        else options.signal.addEventListener("abort", () => {
+          controller.error(new DOMException("Aborted", "AbortError"));
+        }, { once: true });
+      },
+    }), { headers: { "Content-Type": "text/event-stream" } });
+  }, {
+    setTimeout(callback, delay) {
+      delays.push(delay);
+      return setTimeout(callback, 1);
+    },
+  });
+  const events = [];
+  let feed;
+  try {
+    await new Promise(resolve => {
+      feed = open("/api/v1/market/events", {
+        onState(value) { states.push(value); },
+        onEvent(_event, payload) {
+          events.push(payload.attempt);
+          if (payload.attempt === 13) resolve();
+        },
+      });
+    });
+    assert.equal(calls, 13);
+    assert.deepEqual(events, [11, 13]);
+    assert.deepEqual(delays.slice(0, 10), [1000, 2000, 4000, 8000, 15000, 15000, 15000, 15000, 15000, 15000]);
+    assert.deepEqual(delays.slice(10), [1000, 2000]);
+    assert.equal(states.filter(value => value === "offline").length, 12);
+    assert.equal(states.filter(value => value === "open").length, 2);
+  } finally {
+    feed.close();
+  }
+});
+
+test("closing a 503 retry cancels the pending reconnect", async () => {
+  let calls = 0;
+  let scheduled;
+  let cleared;
+  const open = runtime(async () => {
+    calls++;
+    return new Response("", { status: 503 });
+  }, {
+    setTimeout(callback) { scheduled = callback; return 42; },
+    clearTimeout(id) { cleared = id; },
+  });
+  const feed = open("/api/v1/market/events", { onState() {}, onEvent() {} });
+  await nextTurn();
+  assert.equal(typeof scheduled, "function");
+  feed.close();
+  assert.equal(cleared, 42);
+  await scheduled();
+  assert.equal(calls, 1);
+});

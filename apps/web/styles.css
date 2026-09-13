@@ -270,12 +270,14 @@ input::placeholder { color: var(--muted); }
 .orderbook-tabs { display: flex; align-self: stretch; gap: 12px; }
 .orderbook-tabs button { border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--muted); font-size: 11px; padding: 4px 0; }
 .orderbook-tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+#orderbook-view-book, #orderbook-view-trades { height: 420px; overflow-y: auto; scrollbar-gutter: stable; }
 .orderbook-header, .orderbook-row { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1fr); align-items: center; gap: 8px; }
 .orderbook-header { min-height: 30px; color: var(--muted); font-size: 10px; text-align: right; }
 .orderbook-header span:first-child, .orderbook-row strong { text-align: left; }
 .orderbook-side { display: grid; gap: 1px; }
 .orderbook-row { position: relative; min-height: 27px; padding: 0 4px; font-size: 10px; text-align: right; font-variant-numeric: tabular-nums; overflow: hidden; border-radius: 2px; }
 .orderbook-row > *:not(.depth-bar) { position: relative; z-index: 1; }
+.orderbook-row > *:not(.depth-bar), .trade-row > * { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .orderbook-row .depth-bar { position: absolute; top: 2px; bottom: 2px; width: var(--depth); opacity: .2; pointer-events: none; transition: width 180ms ease; }
 .orderbook-row.ask .depth-bar { right: 0; background: var(--danger); }
 .orderbook-row.bid .depth-bar { right: 0; background: var(--accent); }
@@ -285,12 +287,12 @@ input::placeholder { color: var(--muted); }
 .orderbook-mid strong { color: var(--accent); font: 600 16px var(--mono); }
 .orderbook-mid span { color: var(--muted); font-size: 10px; }
 .orderbook-empty { min-height: 50px; display: grid; place-items: center; color: var(--muted); font-size: 11px; }
-.trade-tape-header, .trade-row { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1fr); align-items: center; gap: 8px; }
-.trade-tape-header { min-height: 30px; color: var(--muted); font-size: 10px; text-align: right; }
-.trade-tape-header span:first-child, .trade-row strong { text-align: left; }
-.trade-tape { display: grid; gap: 1px; }
+.trade-tape-header, .trade-row { display: grid; grid-template-columns: 62px minmax(0, 1fr) minmax(0, 1fr); align-items: center; gap: 8px; }
+.trade-tape-header { position: sticky; top: 0; z-index: 2; min-height: 30px; background: var(--surface); color: var(--muted); font-size: 10px; text-align: right; }
+.trade-tape-header span:first-child, .trade-row time { text-align: left; }
+.trade-tape { display: grid; align-content: start; gap: 1px; }
 .trade-row { min-height: 27px; padding: 0 4px; font-size: 10px; text-align: right; font-variant-numeric: tabular-nums; }
-.trade-row span:first-child { color: var(--muted); }
+.trade-row time { color: var(--muted); }
 .trade-row.buy strong { color: var(--accent); font-weight: 500; }
 .trade-row.sell strong { color: var(--danger); font-weight: 500; }
 
@@ -396,6 +398,8 @@ tbody tr:hover { background: var(--surface); }
 .bill-history-form input { width: 180px; max-width: 100%; font: 12px var(--mono); }
 .bill-history-form select { width: 180px; max-width: 100%; }
 .bill-archive-section { padding-block: 16px; border-block: 1px solid var(--border-soft); }
+.equity-baseline-table { max-height: 320px; scrollbar-gutter: stable; }
+.equity-baseline-table:focus-visible { outline-offset: -2px; }
 .bill-archive-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .bill-archive-heading h3 { margin: 0; font-size: 14px; }
 .bill-archive-list { padding: 0; margin: 0; list-style: none; }

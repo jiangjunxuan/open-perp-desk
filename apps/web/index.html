@@ -260,16 +260,16 @@
 	              <div class="panel-heading orderbook-heading">
 	                <div>
 	                  <h2 id="orderbook-title">盘口</h2>
-	                  <span id="orderbook-state" class="subtle">等待实时深度</span>
+	                  <span id="orderbook-state" class="subtle">连接中</span>
 	                </div>
 	                <div class="orderbook-tabs" role="tablist" aria-label="市场深度视图">
 	                  <button id="orderbook-tab-book" type="button" role="tab" aria-selected="true" aria-controls="orderbook-view-book" data-orderbook-view="book">盘口</button>
-	                  <button id="orderbook-tab-trades" type="button" role="tab" aria-selected="false" aria-controls="orderbook-view-trades" data-orderbook-view="trades">逐笔</button>
+	                  <button id="orderbook-tab-trades" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="orderbook-view-trades" data-orderbook-view="trades">逐笔</button>
 	                </div>
 	              </div>
-	              <div id="orderbook-view-book" role="tabpanel" aria-labelledby="orderbook-tab-book">
+	              <div id="orderbook-view-book" role="tabpanel" tabindex="0" aria-labelledby="orderbook-tab-book">
 	                <div class="orderbook-header" aria-hidden="true">
-	                  <span>价格(USDT)</span><span>数量(BTC)</span><span>累计</span>
+	                  <span>价格(USDT)</span><span>数量(张)</span><span>累计(张)</span>
 	                </div>
 	                <div id="orderbook-asks" class="orderbook-side asks" aria-label="卖盘"></div>
 	                <div class="orderbook-mid">
@@ -278,9 +278,9 @@
 	                </div>
 	                <div id="orderbook-bids" class="orderbook-side bids" aria-label="买盘"></div>
 	              </div>
-	              <div id="orderbook-view-trades" role="tabpanel" aria-labelledby="orderbook-tab-trades" hidden>
+	              <div id="orderbook-view-trades" role="tabpanel" tabindex="0" aria-labelledby="orderbook-tab-trades" hidden>
 	                <div class="trade-tape-header" aria-hidden="true">
-	                  <span>时间</span><span>价格(USDT)</span><span>数量(BTC)</span>
+	                  <span title="北京时间 UTC+8">时间(UTC+8)</span><span>价格(USDT)</span><span>数量(张)</span>
 	                </div>
 	                <div id="trade-tape" class="trade-tape" aria-label="逐笔成交"></div>
 	              </div>
@@ -665,6 +665,17 @@
               </div>
               <p id="bill-valuation-message" class="settings-message" role="status" aria-live="polite">尚无查询结果</p>
               <div id="bill-valuation-summary" class="bill-currency-summary"></div>
+            </section>
+            <section class="bill-archive-section" aria-labelledby="equity-baseline-title">
+              <div class="bill-archive-heading"><h3 id="equity-baseline-title">日界线权益 · USD</h3></div>
+              <p id="equity-baseline-status" class="settings-message" role="status" aria-live="polite">管理员未解锁</p>
+              <div class="table-wrap equity-baseline-table" tabindex="0" role="region" aria-label="日界线权益基准表">
+                <table>
+                  <caption class="sr-only">UTC 日界线附近的账户总权益观测，包含期末下一日基准；采集窗口并非零点精确估值</caption>
+                  <thead><tr><th>基准日 · UTC</th><th>总权益 · USD</th><th>请求起止 · UTC</th><th>状态</th></tr></thead>
+                  <tbody id="equity-baseline-body"><tr><td colspan="4" class="table-empty">权益基准尚未读取</td></tr></tbody>
+                </table>
+              </div>
             </section>
             <div class="table-wrap" tabindex="0" role="region" aria-label="历史账单表">
               <table>

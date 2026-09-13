@@ -28,6 +28,7 @@ from .account_valuation import AccountValuationWorker
 from .quarterly_history import QuarterlyHistoryImporter
 from .historical_ledger import archive_first_day, history_days
 from .account_reconciler import AccountReconciler
+from .equity_baseline import EquityBaselineSampler
 from .automation_worker import AutomationWorker
 from .backtest import BacktestEngine
 from .state_store import BillImportBusy, StateStore
@@ -54,6 +55,7 @@ state_store = StateStore()
 account_history = AccountHistoryImporter(state_store, account_client)
 quarterly_history = QuarterlyHistoryImporter(state_store, account_client)
 account_valuation = AccountValuationWorker(state_store, account_client, market_client)
+equity_baseline = EquityBaselineSampler(state_store, account_client)
 safety_controller = SafetyController(state_store)
 strategy_engine = StrategyEngine()
 backtest_engine = BacktestEngine(strategy_engine)
@@ -100,12 +102,14 @@ async def lifespan(_: FastAPI):
     await account_stream.start()
     await algo_stream.start()
     await account_reconciler.start()
+    await equity_baseline.start()
     await quarterly_history.start()
     await account_valuation.start()
     await automation_worker.start()
     try:
         yield
     finally:
+        await equity_baseline.stop()
         await account_valuation.close()
         await quarterly_history.close()
         await account_history.close()
@@ -212,6 +216,7 @@ def health_metrics() -> dict[str, object]:
         },
         "automation_worker": automation_worker.snapshot(),
         "account_reconciler": account_reconciler.snapshot(),
+        "equity_baseline": equity_baseline.snapshot(),
         "quarterly_history": quarterly_history.snapshot(),
         "execution": {
             "enabled": trade_client.enabled,

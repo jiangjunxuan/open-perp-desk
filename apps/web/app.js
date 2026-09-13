@@ -847,6 +847,34 @@ function renderMarketOverview(overview) {
   renderOrderBook();
 }
 
+const tradeClock = new Intl.DateTimeFormat("zh-CN", {
+  timeZone: "Asia/Shanghai", hourCycle: "h23",
+  hour: "2-digit", minute: "2-digit", second: "2-digit",
+});
+const tradeTimestamp = new Intl.DateTimeFormat("zh-CN", {
+  timeZone: "Asia/Shanghai", hourCycle: "h23",
+  year: "numeric", month: "2-digit", day: "2-digit",
+  hour: "2-digit", minute: "2-digit", second: "2-digit",
+});
+
+function updateOrderBookState() {
+  const showingTrades = state.orderbookView === "trades";
+  const name = showingTrades ? "逐笔成交" : "盘口";
+  const record = (showingTrades ? state.marketStream?.trades : state.marketStream?.order_books)?.[state.symbol];
+  const hasRows = showingTrades
+    ? Boolean($("#trade-tape .trade-row"))
+    : Boolean($("#orderbook-asks .orderbook-row") && $("#orderbook-bids .orderbook-row"));
+  const ready = !state.marketPaused && state.marketFeedState === "open" && record?.fresh === true && hasRows;
+  const label = state.marketPaused ? "行情已暂停"
+    : state.marketFeedState === "connecting" ? "连接中"
+      : state.marketFeedState !== "open" ? "行情连接中断"
+        : ready ? "已连接"
+          : record?.fresh === false ? showingTrades ? "逐笔延迟" : "深度延迟"
+            : showingTrades ? "等待成交" : "等待深度";
+  setState("#orderbook-state", label, ready ? "good" : "warning");
+  setText("#orderbook-a11y", ready ? `${name}已连接，数量单位为张。` : `${name}：${label}。`);
+}
+
 function renderOrderBook() {
   const asksElement = $("#orderbook-asks");
   const bidsElement = $("#orderbook-bids");
@@ -859,7 +887,9 @@ function renderOrderBook() {
   bookView.hidden = showingTrades;
   tradesView.hidden = !showingTrades;
   tabs.forEach(tab => {
-    tab.setAttribute("aria-selected", String(tab.dataset.orderbookView === state.orderbookView));
+    const selected = tab.dataset.orderbookView === state.orderbookView;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
   });
   const record = state.marketStream?.order_books?.[state.symbol];
   const tradeRecord = state.marketStream?.trades?.[state.symbol];
@@ -868,27 +898,25 @@ function renderOrderBook() {
       .map((trade, index) => ({
         price: Number(trade?.px),
         size: Number(trade?.sz),
-        side: trade?.side === "sell" ? "sell" : "buy",
+        side: trade?.side,
         time: Number(trade?.ts),
         index,
       }))
       .filter(trade => Number.isFinite(trade.price) && trade.price > 0
-        && Number.isFinite(trade.size) && trade.size >= 0)
+        && Number.isFinite(trade.size) && trade.size > 0
+        && ["buy", "sell"].includes(trade.side)
+        && Number.isSafeInteger(trade.time) && trade.time > 0 && trade.time <= 8.64e15)
       .sort((left, right) => (right.time - left.time) || (left.index - right.index))
       .slice(0, 40);
     tradeTape.innerHTML = rows.length
       ? rows.map(trade => `
-        <div class="trade-row ${trade.side}" aria-label="${trade.side === "sell" ? "卖出" : "买入"} ${formatNumber(trade.price, 2)}，数量 ${formatNumber(trade.size, 5)}">
-          <span class="mono">${trade.time > 0 ? formatTime(new Date(trade.time).toISOString()) : "--"}</span>
-          <strong class="mono">${formatNumber(trade.price, 2)}</strong>
-          <span class="mono">${formatNumber(trade.size, 5)}</span>
+        <div class="trade-row ${trade.side}" aria-label="${trade.side === "sell" ? "卖出" : "买入"} ${formatNumber(trade.price, 2)} USDT，数量 ${formatNumber(trade.size, 5)} 张">
+          <time class="mono" datetime="${new Date(trade.time).toISOString()}" title="${tradeTimestamp.format(trade.time)} UTC+8">${tradeClock.format(trade.time)}</time>
+          <strong class="mono" title="${formatNumber(trade.price, 2)} USDT">${formatNumber(trade.price, 2)}</strong>
+          <span class="mono" title="${formatNumber(trade.size, 5)} 张">${formatNumber(trade.size, 5)}</span>
         </div>`).join("")
       : '<div class="orderbook-empty">等待逐笔成交</div>';
-    const ready = tradeRecord?.fresh === true;
-    setState("#orderbook-state", ready ? "实时逐笔" : tradeRecord ? "逐笔延迟" : "等待实时逐笔", ready ? "good" : "warning");
-    setText("#orderbook-a11y", ready && rows.length
-      ? `逐笔成交实时更新，最新成交价 ${formatNumber(rows[0].price, 2)}，数量 ${formatNumber(rows[0].size, 5)}。`
-      : "逐笔成交等待实时数据。");
+    updateOrderBookState();
     return;
   }
   const book = record?.data;
@@ -920,11 +948,11 @@ function renderOrderBook() {
   const renderSide = (element, rows, side) => {
     element.innerHTML = rows.length
       ? rows.map((row) => `
-        <div class="orderbook-row ${side}" aria-label="${side === "ask" ? "卖盘" : "买盘"} ${formatNumber(row.price, 2)}，数量 ${formatNumber(row.size, 5)}">
+        <div class="orderbook-row ${side}" aria-label="${side === "ask" ? "卖盘" : "买盘"} ${formatNumber(row.price, 2)} USDT，数量 ${formatNumber(row.size, 5)} 张，累计 ${formatNumber(row.total, 5)} 张">
           <span class="depth-bar" style="--depth:${Math.min(100, row.total / maxTotal * 100)}%"></span>
-          <strong class="mono">${formatNumber(row.price, 2)}</strong>
-          <span class="mono">${formatNumber(row.size, 5)}</span>
-          <span class="mono">${formatNumber(row.total, 5)}</span>
+          <strong class="mono" title="${formatNumber(row.price, 2)} USDT">${formatNumber(row.price, 2)}</strong>
+          <span class="mono" title="${formatNumber(row.size, 5)} 张">${formatNumber(row.size, 5)}</span>
+          <span class="mono" title="${formatNumber(row.total, 5)} 张">${formatNumber(row.total, 5)}</span>
         </div>`).join("")
       : '<div class="orderbook-empty">等待深度数据</div>';
   };
@@ -941,11 +969,7 @@ function renderOrderBook() {
     : NaN;
   setText("#orderbook-mid-price", formatNumber(mid, 2));
   setText("#orderbook-spread", Number.isFinite(spread) ? `价差 ${formatNumber(spread, 2)}` : "价差 --");
-  const ready = record?.fresh === true;
-  setState("#orderbook-state", ready ? "实时深度" : record ? "深度延迟" : "等待实时深度", ready ? "good" : "warning");
-  setText("#orderbook-a11y", ready && askRows.length && bidRows.length
-    ? `盘口实时更新，卖一 ${formatNumber(bestAsk, 2)}，买一 ${formatNumber(bestBid, 2)}，价差 ${formatNumber(spread, 2)}。`
-    : "盘口等待实时数据。");
+  updateOrderBookState();
 }
 
 function renderAnalysis(analysis) {
@@ -1774,8 +1798,9 @@ function updateMarketRefreshControl() {
   setText("#quote-refresh-label", labelText);
   document.querySelectorAll(".watch-item-state").forEach(element => {
     const record = state.marketStream?.tickers?.[element.closest("[data-symbol]").dataset.symbol];
-    element.textContent = !live || state.marketPaused ? "暂停" : record?.fresh ? "在线" : "延迟";
+    element.textContent = state.marketPaused ? "暂停" : !live ? "离线" : record?.fresh ? "在线" : "延迟";
   });
+  updateOrderBookState();
   if (state.status) applyStatus(state.status);
 }
 
@@ -1802,7 +1827,7 @@ function connectMarketFeed() {
   marketFeed?.close();
   marketFeed = null;
   state.marketFeedState = "connecting";
-  state.marketStream = null;
+  if (!state.marketPaused) state.marketStream = null;
   state.marketCandleKey = null;
   updateMarketRefreshControl();
   if (state.marketPaused || document.hidden) return;
@@ -1915,11 +1940,9 @@ function applyPrivateEvent(event, payload) {
     setState("#positions-tag", ready ? "实时同步" : payload.configured ? "账户回报断开" : "私有凭据未配置", ready ? "good" : "warning");
     const balance = payload.balance?.[0];
     if (ready && balance) {
-      const equity = balance.totalEq ?? balance.adjEq ?? balance.eq;
-      if (equity !== undefined) {
-        setText("#metric-equity", formatNumber(equity, 2));
-        setText("#metric-equity-note", "OKX 账户实时回报");
-      }
+      const equity = formatNumber(balance.totalEq, 2);
+      setText("#metric-equity", equity);
+      setText("#metric-equity-note", equity === "--" ? "账户总权益缺失" : "OKX 账户实时回报");
     }
   } else if (event === "bill_import") {
     const previous = billHistoryState.job?.status;
@@ -1938,6 +1961,8 @@ function applyPrivateEvent(event, payload) {
     billHistoryState.valuationUpdates += 1;
     billHistoryState.valuationRequest += 1;
     renderBillValuationJob(payload.job);
+  } else if (event === "equity_baseline") {
+    applyEquityBaseline(payload);
   } else if (event === "strategies") {
     const strategy = payload.data?.find(item => item.strategy_id === "structured-technical");
     if (strategy && !state.strategyDirty && !$("#save-strategy").hasAttribute("aria-busy")) {
@@ -2001,7 +2026,7 @@ async function loadPrivate() {
     if (token !== state.token) return false;
     if (privateUpdates !== state.privateUpdates && state.privateFeedState === "open") return true;
     const accountRow = account.balance?.[0] || {};
-    const equity = accountRow.totalEq || accountRow.adjEq || accountRow.eq;
+    const equity = accountRow.totalEq;
     setText("#metric-equity", formatNumber(equity, 2));
     setText("#metric-equity-note", account.configured ? "OKX 账户快照" : "OKX 私有凭据未配置");
     renderPositions(positions.data);

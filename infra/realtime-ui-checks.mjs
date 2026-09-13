@@ -4,6 +4,7 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
   for (const viewport of [
     { name: "desktop", width: 1440, height: 1000 },
     { name: "mobile", width: 390, height: 844 },
+    { name: "narrow-mobile", width: 320, height: 740 },
   ]) {
     await command("Emulation.setDeviceMetricsOverride", { ...viewport, deviceScaleFactor: 1, mobile: viewport.width < 768 });
     await command("Page.navigate", { url: `${origin}/?realtime-check=${viewport.name}#markets` });
@@ -19,6 +20,7 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
     }
     const trades = await evaluate(`(async () => {
       const tab = $("#orderbook-tab-trades");
+      const bookHeight = $("#orderbook").getBoundingClientRect().height;
       tab.click();
       for (let attempt = 0; attempt < 120; attempt++) {
         if (state.marketStream?.trades?.[state.symbol]?.fresh
@@ -34,13 +36,22 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
         rows: rows.length,
         hasBuyOrSellTone: rows.some(row => row.classList.contains("buy") || row.classList.contains("sell")),
         state: $("#orderbook-state").textContent,
+        stableHeight: $("#orderbook").getBoundingClientRect().height === bookHeight,
+        compactTimes: rows.every(row => /^\\d{2}:\\d{2}:\\d{2}$/.test(row.querySelector("time")?.textContent)
+          && row.querySelector("time").title.endsWith("UTC+8")),
+        columnsFit: rows.every(row => [...row.children].every(cell => cell.scrollWidth <= cell.clientWidth + 1)),
+        units: $(".trade-tape-header").textContent.includes("数量(张)")
+          && $(".orderbook-header").textContent.includes("累计(张)"),
       };
-      $("#orderbook-tab-book").click();
       return result;
     })()`);
-    if (!trades.selected || !trades.panelVisible || !trades.fresh || trades.rows < 1 || !trades.hasBuyOrSellTone) {
+    if (!trades.selected || !trades.panelVisible || !trades.fresh || trades.rows < 1 || !trades.hasBuyOrSellTone
+        || trades.state !== "已连接" || !trades.stableHeight || !trades.compactTimes || !trades.columnsFit || !trades.units) {
       throw new Error(`${viewport.name}: live trades view failed ${JSON.stringify(trades)}`);
     }
+    await evaluate('$("#orderbook").scrollIntoView({ block: "start", behavior: "instant" })');
+    await screenshot(`openperpdesk-trades-${viewport.name}.png`);
+    await evaluate('$("#orderbook-tab-book").click(); window.scrollTo({ top: 0, behavior: "instant" })');
     const samples = await evaluate(`(async () => {
       const button = $("#watchlist .watch-item");
       button.focus();
@@ -73,7 +84,8 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
       const price = $("#market-price").textContent;
       await new Promise(resolve => setTimeout(resolve, 600));
       return state.marketPaused && price === $("#market-price").textContent
-        && $("#market-tag").textContent === "行情已暂停";
+        && $("#market-tag").textContent === "行情已暂停"
+        && $("#orderbook-state").textContent === "行情已暂停";
     })()`);
     if (!paused) throw new Error(`${viewport.name}: pause did not freeze the live view`);
     await evaluate('$("#toggle-market-refresh").click()');
@@ -83,9 +95,97 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
     }
     const resumed = await evaluate('!state.marketPaused && $("#market-tag").textContent === "已连接"');
     if (!resumed) throw new Error(`${viewport.name}: live view did not resume`);
-    const fixtures = await evaluate(`(async () => {
+    const orderbook = await evaluate(`(() => {
       marketFeed.close();
       controlFeed.close();
+      const snapshot = state.marketStream;
+      const time = Date.parse("2026-09-13T00:00:01Z");
+      const valid = { px: "100", sz: "2.5", side: "sell", ts: String(time) };
+      const invalid = [
+        null, {...valid, side: "unknown"}, {...valid, side: undefined},
+        {...valid, sz: "0"}, {...valid, sz: "-1"}, {...valid, sz: "Infinity"},
+        {...valid, px: "NaN"}, {...valid, px: "0"},
+        {...valid, ts: "0"}, {...valid, ts: "-1"}, {...valid, ts: "invalid"},
+        {...valid, ts: "Infinity"}, {...valid, ts: "8640000000000001"},
+      ];
+      const tradeRecord = { fresh: true, data: [valid, ...invalid, {...valid, side: "buy", ts: String(time + 1000)}] };
+      const bookRecord = { fresh: true, data: { asks: [["101", "2"]], bids: [["99", "3"]] } };
+      state.marketStream = {
+        ...snapshot, trades: {[state.symbol]: tradeRecord}, order_books: {[state.symbol]: bookRecord},
+      };
+      state.marketFeedState = "open";
+      $("#orderbook-tab-trades").click();
+      const rows = [...document.querySelectorAll("#trade-tape .trade-row")];
+      const invalidRowsRejected = rows.length === 2 && rows[0].classList.contains("buy")
+        && rows[1].classList.contains("sell") && rows.every(row => row.getAttribute("aria-label").endsWith("张"));
+      const timestampsCorrect = rows[0]?.querySelector("time").textContent === "08:00:02"
+        && rows[0]?.querySelector("time").dateTime === "2026-09-13T00:00:02.000Z"
+        && rows[0]?.querySelector("time").title.includes("2026");
+      const originalHeight = $("#orderbook").getBoundingClientRect().height;
+      const originalRows = $("#trade-tape").innerHTML;
+      $("#toggle-market-refresh").click();
+      const pauseRetainsTrades = state.marketPaused && state.marketStream.trades[state.symbol] === tradeRecord
+        && $("#trade-tape").innerHTML === originalRows && $("#orderbook-state").textContent === "行情已暂停";
+      state.marketPaused = false;
+      const statusChecks = ["book", "trades"].every(view => {
+        state.orderbookView = view;
+        state.marketFeedState = "open";
+        renderOrderBook();
+        const ready = $("#orderbook-state").textContent === "已连接";
+        state.marketFeedState = "offline";
+        updateMarketRefreshControl();
+        const disconnected = $("#orderbook-state").textContent === "行情连接中断"
+          && $("#orderbook-state").dataset.tone === "warning";
+        state.marketFeedState = "connecting";
+        updateMarketRefreshControl();
+        const connecting = $("#orderbook-state").textContent === "连接中";
+        state.marketFeedState = "open";
+        const record = view === "book" ? bookRecord : tradeRecord;
+        record.fresh = false;
+        updateMarketRefreshControl();
+        const stale = $("#orderbook-state").textContent === (view === "book" ? "深度延迟" : "逐笔延迟");
+        record.fresh = true;
+        return ready && disconnected && connecting && stale;
+      });
+      tradeRecord.data = invalid;
+      renderOrderBook();
+      const emptyNotConnected = !$("#trade-tape .trade-row") && $("#orderbook-state").textContent === "等待成交";
+      const emptyHeightStable = $("#orderbook").getBoundingClientRect().height === originalHeight;
+      tradeRecord.data = Array.from({length: 80}, (_, index) => ({...valid, ts: String(time + index)}));
+      renderOrderBook();
+      const tradePanel = $("#orderbook-view-trades");
+      const tapeBounded = document.querySelectorAll("#trade-tape .trade-row").length === 40
+        && tradePanel.scrollHeight > tradePanel.clientHeight && tradePanel.clientHeight === 420
+        && $("#orderbook").getBoundingClientRect().height === originalHeight;
+      tradePanel.scrollTop = 100;
+      const scrollTop = tradePanel.scrollTop;
+      renderOrderBook();
+      const scrollPreserved = tradePanel.scrollTop === scrollTop && scrollTop > 0;
+      const bookTab = $("#orderbook-tab-book");
+      const tradesTab = $("#orderbook-tab-trades");
+      bookTab.click();
+      bookTab.focus();
+      bookTab.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true }));
+      const endKey = document.activeElement === tradesTab && tradesTab.tabIndex === 0 && bookTab.tabIndex === -1;
+      tradesTab.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true }));
+      const homeKey = document.activeElement === bookTab && bookTab.tabIndex === 0 && tradesTab.tabIndex === -1;
+      bookTab.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true }));
+      const wrapKey = document.activeElement === tradesTab && state.orderbookView === "trades";
+      tradesTab.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+      const keyboardTabs = endKey && homeKey && wrapKey && document.activeElement === bookTab;
+      const tabHeightStable = $("#orderbook").getBoundingClientRect().height === originalHeight;
+      state.marketStream = snapshot;
+      renderOrderBook();
+      updateMarketRefreshControl();
+      return { invalidRowsRejected, timestampsCorrect, pauseRetainsTrades, statusChecks, emptyNotConnected,
+        emptyHeightStable, tapeBounded, scrollPreserved, keyboardTabs, tabHeightStable };
+    })()`);
+    if (Object.values(orderbook).some(value => value !== true)) {
+      throw new Error(`${viewport.name}: orderbook state fixtures failed ${JSON.stringify(orderbook)}`);
+    }
+    const fixtures = await evaluate(`(async () => {
+      marketFeed?.close();
+      controlFeed?.close();
       const oldOpen = openLiveStream;
       let latest;
       openLiveStream = (path, callbacks) => { latest = { path, ...callbacks }; return { close() {} }; };
@@ -155,6 +255,11 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
       state.privateFeedState = "open";
       applyPrivateEvent("account", { configured: true, connected: true, authenticated: true, balance: [{totalEq: "4321"}] });
       const accountUpdated = $("#metric-equity").textContent === "4,321" && $("#positions-tag").textContent === "实时同步";
+      applyPrivateEvent("account", { configured: true, connected: true, authenticated: true, balance: [{adjEq: "999"}] });
+      const adjustedEquityNotTotal = $("#metric-equity").textContent === "--"
+        && $("#metric-equity-note").textContent === "账户总权益缺失";
+      applyPrivateEvent("account", { configured: true, connected: true, authenticated: true, balance: [{totalEq: "0", adjEq: "999"}] });
+      const zeroEquityPreserved = $("#metric-equity").textContent === "0";
       $("#fast-period").value = "17";
       state.strategyDirty = true;
       applyPrivateEvent("strategies", {data: [{strategy_id:"structured-technical", enabled:true, config:{fast_period:9}}]});
@@ -164,14 +269,15 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
       openLiveStream = oldOpen;
       return { disconnected, wrongPeriodIgnored, realPriceUpdated, pauseRejectsPendingSnapshot, noSnapshotFallback, marketDisconnectLocksExecution,
         disconnectedExecutionLocked, reconnectingExecutionLocked, heartbeatCannotUnlock,
-        freshControlStatusAccepted, staleStatusRejected, accountUpdated, draftPreserved, accessRevoked };
+        freshControlStatusAccepted, staleStatusRejected, accountUpdated, adjustedEquityNotTotal, zeroEquityPreserved,
+        draftPreserved, accessRevoked };
     })()`);
     if (Object.values(fixtures).some(value => value !== true)) {
       throw new Error(`${viewport.name}: realtime state fixtures failed ${JSON.stringify(fixtures)}`);
     }
     const overflow = await evaluate("document.documentElement.scrollWidth > innerWidth");
     if (overflow) throw new Error(`${viewport.name}: realtime label caused horizontal overflow`);
-    results.push({ viewport: viewport.name, trades, ...samples, paused, resumed, ...fixtures });
+    results.push({ viewport: viewport.name, trades, orderbook, ...samples, paused, resumed, ...fixtures });
   }
   return results;
 }

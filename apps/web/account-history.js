@@ -4,6 +4,7 @@ const billHistoryState = {
   loading: false, starting: false, importAction: 0,
   archives: null, archiveRequest: 0, archiveUpdates: 0, archiveAction: 0, archiveBusy: false, archiveTimer: null,
   valuationJob: null, valuationRequest: 0, valuationAction: 0, valuationUpdates: 0, valuationBusy: false, valuationTimer: null,
+  baselineUpdates: 0, latestBaseline: null,
 };
 
 function billHistoryRange() {
@@ -59,6 +60,10 @@ function resetBillHistoryAccess() {
   billHistoryState.valuationRequest += 1;
   billHistoryState.valuationAction += 1;
   billHistoryState.valuationBusy = false;
+  billHistoryState.baselineUpdates += 1;
+  billHistoryState.latestBaseline = null;
+  setText("#equity-baseline-status", "管理员未解锁");
+  $("#equity-baseline-body").innerHTML = '<tr><td colspan="4" class="table-empty">权益基准已锁定</td></tr>';
   clearTimeout(billHistoryState.valuationTimer);
   billHistoryState.valuationTimer = null;
   $("#bill-valuation-progress").hidden = true;
@@ -123,6 +128,7 @@ function renderBillHistory(payload, range, page) {
     `${payload.valuation?.status === "valued" ? "历史账单已估值；缺少权益基准，不计算账户总收益" : "未完成历史汇率估值，不计算账户总收益"}${unclassified ? ` · ${unclassified} 条账单待分类` : ""}${!payload.configured ? " · OKX 私有凭据未配置" : ""}`,
     unclassified ? "warning" : "neutral");
   renderBillValuation(payload.valuation);
+  renderEquityBaselines(payload.equity_baselines);
   billHistoryState.report = payload;
   billHistoryState.range = range;
   billHistoryState.page = page;
@@ -134,6 +140,7 @@ async function loadBillHistory({ reset = false, page = billHistoryState.page } =
   if (!state.token) return;
   if (!$("#bill-history-form").reportValidity()) return;
   const request = ++billHistoryState.request;
+  const baselineUpdates = billHistoryState.baselineUpdates;
   const token = state.token;
   const range = billHistoryRange();
   if (reset) page = 0;
@@ -150,6 +157,7 @@ async function loadBillHistory({ reset = false, page = billHistoryState.page } =
   try {
     const payload = await api(`/api/v1/account/bills/history?${params}`);
     if (request !== billHistoryState.request || token !== state.token) return;
+    if (baselineUpdates !== billHistoryState.baselineUpdates) return loadBillHistory({ reset, page });
     renderBillHistory(payload, range, page);
     if (reset) billHistoryState.cursors = [null];
   } catch (error) {
@@ -164,6 +172,36 @@ async function loadBillHistory({ reset = false, page = billHistoryState.page } =
       updateBillHistoryAvailability();
     }
   }
+}
+
+function renderEquityBaselines(report) {
+  const rows = Array.isArray(report?.data) ? report.data : [];
+  const timestamp = value => Number.isSafeInteger(value) && value > 0 && value <= 8.64e15
+    ? new Date(value).toISOString().replace("T", " ").replace("Z", "") : null;
+  let captured = 0;
+  $("#equity-baseline-body").innerHTML = rows.map(row => {
+    const start = timestamp(row.request_started_ms), end = timestamp(row.received_at_ms);
+    const valid = row.status === "captured" && row.equity_usd != null && start && end;
+    if (valid) captured++;
+    return `<tr>
+      <td class="mono-cell">${escapeHtml(row.day_utc || "--")}</td>
+      <td class="mono-cell">${escapeHtml(valid ? row.equity_usd : "--")}</td>
+      <td class="mono-cell">${valid ? `<time>${escapeHtml(start)}</time><br><time>${escapeHtml(end)}</time>` : "--"}</td>
+      <td><span data-tone="${valid ? "good" : "warning"}">${valid ? "已采集" : "缺失"}</span></td>
+    </tr>`;
+  }).join("") || '<tr><td colspan="4" class="table-empty">暂无日界线权益基准</td></tr>';
+  setState("#equity-baseline-status", rows.length
+    ? `${captured} / ${rows.length} 个基准 · 零点后观测值，非零点精确估值`
+    : "尚无基准数据", captured && captured === rows.length ? "neutral" : "warning");
+}
+
+function applyEquityBaseline(payload) {
+  const previous = JSON.stringify(billHistoryState.latestBaseline);
+  billHistoryState.latestBaseline = payload.latest || null;
+  billHistoryState.baselineUpdates += 1;
+  if (previous !== JSON.stringify(billHistoryState.latestBaseline) && billHistoryState.report
+      && !billHistoryState.loading && !billHistoryRangeChanged() && $("#bill-history").open
+      && document.body.dataset.view === "performance") loadBillHistory();
 }
 
 function renderBillImport(job) {

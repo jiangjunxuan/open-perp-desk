@@ -12,6 +12,12 @@ async function exerciseBillHistory() {
     kind: "trade", currency: "USDT", inst_id: "BTC-USDT-SWAP",
     realized_pnl: "0.00000000000000001", fees: "-0.1", funding: null, cash_flow: null,
   };
+  const baseline = {
+    day_utc: range.start_day, target_ms: Date.parse(range.start_day), status: "captured",
+    request_started_ms: Date.parse(range.start_day) + 100,
+    received_at_ms: Date.parse(range.start_day) + 500,
+    equity_usd: "1000.00000000000000001",
+  };
   const report = {
     configured: true, total: 101, data: [record],
     coverage: { complete: false, completed_days: 1, total_days: 7, last_imported_at: "2026-09-13T05:00:00Z" },
@@ -20,6 +26,9 @@ async function exerciseBillHistory() {
       trading_account_transfers: { USDT: "500" }, counts: { unclassified: 1 }, valuation_status: "not_valued",
     },
     next_cursor: { timestamp_ms: record.timestamp_ms, bill_id: "101" },
+    equity_baselines: { data: [baseline, {
+      day_utc: range.end_day, target_ms: Date.parse(range.end_day), status: "missing", equity_usd: null,
+    }] },
   };
   let handler = async url => url.includes("/archives") ? { data: [] } : url.includes("/history?")
     ? { ...report, data: url.includes("before_id=") ? [{ ...record, bill_id: "100", currency: "BTC", realized_pnl: null }] : report.data,
@@ -62,6 +71,12 @@ async function exerciseBillHistory() {
       && $("#bill-history-summary").textContent.includes("-0.09999999999999999");
     checks.transfersSeparate = $("#bill-history-summary").textContent.includes("账户划转")
       && $("#bill-history-summary").textContent.includes("500");
+    checks.baselineEvidence = $("#equity-baseline-status").textContent.includes("1 / 2")
+      && $("#equity-baseline-status").textContent.includes("非零点精确估值")
+      && $("#equity-baseline-body").textContent.includes("1000.00000000000000001")
+      && $("#equity-baseline-body").textContent.includes("00:00:00.100")
+      && $("#equity-baseline-body").textContent.includes("缺失")
+      && $("#equity-baseline-body").textContent.includes("--");
     checks.captureDateVisible = $("#bill-history-range").textContent.includes("采集于 2026-09-13 05:00:00");
     billHistoryState.cursors[1] = billHistoryState.nextCursor;
     await loadBillHistory({ page: 1 });
@@ -87,6 +102,22 @@ async function exerciseBillHistory() {
     pending[0](report);
     await first;
     checks.lateQueryIgnored = billHistoryState.report.total === 202 && !billHistoryState.loading;
+    let resolveBaselineQuery;
+    handler = () => new Promise(resolve => { resolveBaselineQuery = resolve; });
+    const olderBaselineQuery = loadBillHistory();
+    const newest = {...report, equity_baselines: {data: [{...baseline, equity_usd: "0"}]}};
+    applyPrivateEvent("equity_baseline", {latest: {...baseline, equity_usd: "0"}});
+    handler = async () => newest;
+    resolveBaselineQuery(report);
+    await olderBaselineQuery;
+    checks.baselinePushRejectsOldQuery = billHistoryState.report === newest
+      && $("#equity-baseline-body tr").children[1].textContent === "0";
+    const beforeBaselinePush = calls.length;
+    applyPrivateEvent("equity_baseline", {latest: {...baseline, received_at_ms: baseline.received_at_ms + 1}});
+    await new Promise(resolve => setTimeout(resolve, 0));
+    checks.baselinePushRefreshesVisibleRange = calls.length === beforeBaselinePush + 1;
+    handler = async () => report;
+    await loadBillHistory();
     $("#bill-history-start").value = range.end_day;
     updateBillHistoryAvailability();
     checks.rangeChangeBlocksOldCursor = $("#bill-history-next").disabled
@@ -123,7 +154,8 @@ async function exerciseBillHistory() {
     handler = async () => { const error = new Error("Invalid admin token."); error.status = 401; throw error; };
     await loadBillHistory();
     checks.unauthorizedClears = state.token === "" && billHistoryState.report === null
-      && $("#bill-history-body").textContent.includes("已锁定") && $("#bill-import-progress").hidden;
+      && $("#bill-history-body").textContent.includes("已锁定") && $("#bill-import-progress").hidden
+      && $("#equity-baseline-body").textContent.includes("已锁定");
     checks.busyStateCleared = !$("#query-bill-history").hasAttribute("aria-busy")
       && !$("#import-bill-history").hasAttribute("aria-busy");
 

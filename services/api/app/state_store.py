@@ -10,6 +10,7 @@ from typing import Any, Iterator
 from uuid import uuid4
 
 from .database_maintenance import recovery_marker
+from .equity_baseline import BASELINE_POLICY, CAPTURE_WINDOW_MS, baseline_window, total_equity
 from .historical_ledger import DAY_MS, combine_history_windows, day_ms
 from .historical_valuation import MINUTE_MS, required_rates, value_history
 from .strategy_engine import DEFAULT_STRATEGY_CONFIG
@@ -211,6 +212,15 @@ class StateStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_equity_snapshots_time
                     ON account_equity_snapshots(account_scope, captured_at_ms);
+                CREATE TABLE IF NOT EXISTS account_equity_baselines (
+                    account_scope TEXT NOT NULL,
+                    target_ms INTEGER NOT NULL,
+                    request_started_ms INTEGER NOT NULL,
+                    received_at_ms INTEGER NOT NULL,
+                    equity_usd TEXT NOT NULL,
+                    balance_json TEXT NOT NULL,
+                    PRIMARY KEY (account_scope, target_ms)
+                );
                 CREATE TABLE IF NOT EXISTS account_bill_valuations (
                     id TEXT PRIMARY KEY,
                     account_scope TEXT NOT NULL,
@@ -941,6 +951,14 @@ class StateStore:
                    WHERE account_scope = ? AND day_utc >= ? AND day_utc <= ? ORDER BY day_utc""",
                 (scope, days[0].isoformat(), days[-1].isoformat()),
             ).fetchall()
+            baselines = {
+                row["target_ms"]: self._equity_baseline(row)
+                for row in connection.execute(
+                    """SELECT * FROM account_equity_baselines
+                       WHERE account_scope = ? AND target_ms >= ? AND target_ms <= ? ORDER BY target_ms""",
+                    (scope, begin, end),
+                )
+            }
             valuation = None
             if rate_scope is not None:
                 if total > 100_000:
@@ -976,6 +994,16 @@ class StateStore:
                 "missing_days": missing, "last_imported_at": max((row["captured_at"] for row in windows), default=None),
             },
             "summary": combine_history_windows([json.loads(row["summary_json"]) for row in windows]),
+            "equity_baselines": {
+                "policy": BASELINE_POLICY, "capture_window_ms": CAPTURE_WINDOW_MS,
+                "currency": "USD", "required": len(days) + 1, "captured": len(baselines),
+                "data": [
+                    baselines.get(target) or {
+                        "target_ms": target, "day_utc": datetime.fromtimestamp(target / 1000, timezone.utc).date().isoformat(),
+                        "equity_usd": None, "status": "missing",
+                    } for target in range(begin, end + 1, DAY_MS)
+                ],
+            },
             **({"valuation": valuation} if valuation is not None else {}),
         }
 
@@ -1156,26 +1184,9 @@ class StateStore:
         self, scope: str, captured_at_ms: int, source: str,
         balance: list[dict[str, Any]],
     ) -> bool:
-        from .account_ledger import amount
-
-        if not scope or captured_at_ms <= 0 or source not in {"private_stream", "rest_reconcile"}:
+        if not scope or type(captured_at_ms) is not int or captured_at_ms <= 0 or source not in {"private_stream", "rest_reconcile"}:
             raise ValueError("equity_snapshot_identity_invalid")
-        if not isinstance(balance, list) or not balance:
-            raise ValueError("equity_snapshot_balance_invalid")
-        total = None
-        for item in balance:
-            if not isinstance(item, dict):
-                raise ValueError("equity_snapshot_balance_invalid")
-            candidate = item.get("totalEq") or item.get("adjEq")
-            if candidate not in (None, ""):
-                parsed = amount(candidate, "equity_usd")
-                if parsed <= 0:
-                    raise ValueError("equity_snapshot_equity_invalid")
-                if total is not None and total != parsed:
-                    raise ValueError("equity_snapshot_conflict")
-                total = parsed
-        if total is None:
-            raise ValueError("equity_snapshot_equity_missing")
+        total = total_equity(balance)
         encoded = json.dumps(balance, separators=(",", ":"), sort_keys=True, allow_nan=False)
         with self._connection() as connection:
             cursor = connection.execute(
@@ -1185,6 +1196,45 @@ class StateStore:
                 (scope, captured_at_ms, source, str(total), encoded),
             )
         return cursor.rowcount == 1
+
+    @staticmethod
+    def _equity_baseline(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {
+            "day_utc": datetime.fromtimestamp(row["target_ms"] / 1000, timezone.utc).date().isoformat(),
+            "target_ms": row["target_ms"], "request_started_ms": row["request_started_ms"],
+            "received_at_ms": row["received_at_ms"], "equity_usd": row["equity_usd"],
+            "status": "captured",
+        }
+
+    def save_equity_baseline(
+        self, scope: str, target_ms: int, request_started_ms: int, received_at_ms: int,
+        balance: list[dict[str, Any]],
+    ) -> bool:
+        if not isinstance(scope, str) or not scope:
+            raise ValueError("equity_baseline_scope_invalid")
+        baseline_window(target_ms, request_started_ms, received_at_ms)
+        equity = total_equity(balance)
+        encoded = json.dumps(balance, separators=(",", ":"), sort_keys=True, allow_nan=False)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """INSERT INTO account_equity_baselines
+                   (account_scope, target_ms, request_started_ms, received_at_ms, equity_usd, balance_json)
+                   VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
+                (scope, target_ms, request_started_ms, received_at_ms, equity, encoded),
+            )
+        return cursor.rowcount == 1
+
+    def equity_baseline(self, scope: str, target_ms: int | None = None) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT * FROM account_equity_baselines WHERE account_scope = ?"""
+                + (" AND target_ms = ?" if target_ms is not None else "")
+                + " ORDER BY target_ms DESC LIMIT 1",
+                (scope, target_ms) if target_ms is not None else (scope,),
+            ).fetchone()
+        return self._equity_baseline(row)
 
     def equity_snapshots(
         self, scope: str, start_ms: int, end_ms: int, limit: int = 10_000,
