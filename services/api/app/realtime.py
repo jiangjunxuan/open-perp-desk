@@ -63,6 +63,7 @@ async def private_events(store, account, account_client, authorized) -> AsyncIte
                         **store.bill_snapshot(account_client.account_scope),
                     },
                     "bill_import": {"job": store.bill_import(account_client.account_scope)},
+                    "bill_archives": {"data": store.bill_archives(account_client.account_scope)},
                     "strategies": {"data": store.list_strategies()},
                     "analyses": {"data": store.analysis_index(limit=1)},
                 }

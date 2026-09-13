@@ -357,6 +357,16 @@ tbody tr:hover { background: var(--surface); }
 .bill-history-form { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; padding-block: 16px; }
 .bill-history-form label { display: grid; gap: 8px; color: var(--muted); font-size: 12px; min-width: 0; }
 .bill-history-form input { width: 180px; max-width: 100%; font: 12px var(--mono); }
+.bill-history-form select { width: 180px; max-width: 100%; }
+.bill-archive-section { padding-block: 16px; border-block: 1px solid var(--border-soft); }
+.bill-archive-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.bill-archive-heading h3 { margin: 0; font-size: 14px; }
+.bill-archive-list { padding: 0; margin: 0; list-style: none; }
+.bill-archive-row { display: flex; align-items: center; gap: 12px; padding-block: 12px; border-top: 1px solid var(--border-soft); font-size: 12px; }
+.bill-archive-row > div { flex: 1; display: grid; gap: 6px; min-width: 0; }
+.bill-archive-row .archive-detail { color: var(--muted); overflow-wrap: anywhere; }
+.bill-archive-row > .tag { flex-shrink: 0; }
+.bill-archive-row > button { flex: 0 0 44px; width: 44px; height: 44px; }
 .bill-history-context { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding-block: 16px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--border-soft); }
 .bill-history-context strong { font-size: 12px; font-weight: 500; }
 .bill-import-progress { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; padding: 12px; background: var(--surface); font-size: 12px; }
@@ -779,7 +789,7 @@ dialog::backdrop { background: #000a; }
   .backtest-form > .button { grid-column: 1; grid-row: auto; }
   .backtest-form input { font-size: 16px; }
   .bill-history-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .bill-history-form input { width: 100%; font-size: 14px; padding-inline: 6px; }
+  .bill-history-form input, .bill-history-form select { width: 100%; font-size: 14px; padding-inline: 6px; }
   .bill-history-form .button { min-width: 0; padding-inline: 8px; }
   .bill-import-progress > div { min-width: 0; flex-basis: 100%; }
   .bill-import-progress progress { width: 100%; }

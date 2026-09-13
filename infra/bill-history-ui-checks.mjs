@@ -21,7 +21,7 @@ async function exerciseBillHistory() {
     },
     next_cursor: { timestamp_ms: record.timestamp_ms, bill_id: "101" },
   };
-  let handler = async url => url.includes("/history?")
+  let handler = async url => url.includes("/archives") ? { data: [] } : url.includes("/history?")
     ? { ...report, data: url.includes("before_id=") ? [{ ...record, bill_id: "100", currency: "BTC", realized_pnl: null }] : report.data,
       next_cursor: url.includes("before_id=") ? null : report.next_cursor }
     : { job: null };
@@ -45,6 +45,7 @@ async function exerciseBillHistory() {
     updatePrivateActionAvailability();
     await loadBillHistory();
     await startBillImport();
+    await changeBillArchive();
     checks.lockedNoRequests = calls.length === 0 && $("#import-bill-history").disabled;
     state.token = "local-bill-history-fixture";
     state.status = { ...original.status, integrations: { ...original.status.integrations, okx_credentials_configured: true } };
@@ -99,11 +100,13 @@ async function exerciseBillHistory() {
     const starting = startBillImport();
     await startBillImport();
     checks.duplicateImportBlocked = calls.filter(call => call.options?.method === "POST").length === postsBefore + 1;
+    applyPrivateEvent("bill_import", { job: { ...job, completed_days: 2 } });
     resolveImport({ job });
     await starting;
     checks.acceptanceNotCompletion = billHistoryState.job.status === "running"
       && $("#bill-history-message").textContent.includes("尚未完成")
-      && $("#bill-import-meter").value === 1 && $("#import-bill-history").disabled;
+      && $("#bill-import-meter").value === 2 && $("#import-bill-history").disabled;
+    checks.importPushDoesNotLeaveBusy = !billHistoryState.starting && !$("#import-bill-history").hasAttribute("aria-busy");
     clearTimeout(billHistoryState.timer);
     handler = async url => url.includes("/history?") ? { ...report, coverage: { ...report.coverage, complete: true, completed_days: 7 } }
       : { job: { ...job, status: "completed", completed_days: 7 } };
@@ -141,8 +144,44 @@ async function exerciseBillHistory() {
     await loadBillHistory({ reset: true });
     checks.reauthenticationWorks = billHistoryState.report !== null && !$("#query-bill-history").disabled;
     checks.tradingDraftUntouched = state.analysis === original.analysis && state.draftRevision === original.revision;
+    const archive = { id: "b".repeat(32), year: 2024, quarter: "Q1", state: "waiting", next_attempt_ms: Date.now() + 60000 };
+    $("#bill-archive-year").value = "2024";
+    $("#bill-archive-quarter").value = "Q1";
+    handler = async () => {
+      applyPrivateEvent("bill_archives", { data: [archive] });
+      return { job: { ...archive, state: "queued" } };
+    };
+    await changeBillArchive();
+    checks.archivePushWinsLateResponse = billHistoryState.archives[0].state === "waiting"
+      && !billHistoryState.archiveBusy && !$("#request-bill-archive").hasAttribute("aria-busy")
+      && $("#bill-archive-list").textContent.includes("等待文件");
+    $("#bill-archive-year").value = "2023";
+    applyPrivateEvent("bill_archives", { data: [{ ...archive, state: "downloading" }] });
+    checks.archiveDraftPreserved = $("#bill-archive-year").value === "2023";
+    handler = async () => ({ data: [{ ...archive, state: "canceled" }] });
+    await changeBillArchive("cancel", archive);
+    checks.archiveCancelIsExplicit = calls.at(-1).url.endsWith(`/${archive.id}/cancel`)
+      && $("#bill-archive-list").textContent.includes("已停止");
+    handler = async () => ({ job: { ...archive, state: "queued" } });
+    await changeBillArchive("retry", archive);
+    checks.archiveRetryKeepsQuarter = JSON.parse(calls.at(-1).options.body).retry === true
+      && JSON.parse(calls.at(-1).options.body).year === 2024;
+    let finishArchives;
+    handler = () => new Promise(resolve => { finishArchives = resolve; });
+    const pendingArchives = loadBillArchives();
+    state.token = "";
+    updatePrivateActionAvailability();
+    finishArchives({ data: [archive] });
+    await pendingArchives;
+    checks.archivePermissionLossClearsData = billHistoryState.archives === null
+      && $("#bill-archive-list").children.length === 0 && $("#request-bill-archive").disabled;
+    state.token = "local-bill-history-fixture";
+    updatePrivateActionAvailability();
+    handler = async () => report;
+    await loadBillHistory({ reset: true });
+    renderBillArchives([{ ...archive, state: "waiting" }, { ...archive, id: "c".repeat(32), year: 2023, state: "failed", error: "archive_bill_outside_quarter" }]);
     checks.onlyImportPosts = calls.filter(call => call.options?.method === "POST")
-      .every(call => call.url === "/api/v1/account/bills/imports");
+      .every(call => /^\/api\/v1\/account\/bills\/(imports|archives)/.test(call.url));
     setState("#bill-history-message", "界面回归样本（非真实账单） · 未作历史汇率估值", "neutral");
     renderBillImport({ ...job, status: "failed", completed_days: 1 });
     return checks;

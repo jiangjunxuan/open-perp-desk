@@ -1512,6 +1512,10 @@ function applyPrivateEvent(event, payload) {
     if (previous === "running" && payload.job?.status !== "running" && billHistoryState.report) {
       loadBillHistory({ reset: true });
     }
+  } else if (event === "bill_archives") {
+    billHistoryState.archiveUpdates += 1;
+    billHistoryState.archiveRequest += 1;
+    renderBillArchives(payload.data);
   } else if (event === "strategies") {
     const strategy = payload.data?.find(item => item.strategy_id === "structured-technical");
     if (strategy && !state.strategyDirty && !$("#save-strategy").hasAttribute("aria-busy")) {

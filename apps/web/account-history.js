@@ -1,7 +1,8 @@
 const billHistoryState = {
   request: 0, jobRequest: 0, report: null, range: null,
   cursors: [null], page: 0, nextCursor: null, job: null, timer: null,
-  loading: false, starting: false,
+  loading: false, starting: false, importAction: 0,
+  archives: null, archiveRequest: 0, archiveUpdates: 0, archiveAction: 0, archiveBusy: false, archiveTimer: null,
 };
 
 function billHistoryRange() {
@@ -26,6 +27,7 @@ function updateBillHistoryAvailability() {
   if (!unlocked && (billHistoryState.report || billHistoryState.job || billHistoryState.loading || billHistoryState.starting)) {
     resetBillHistoryAccess();
   }
+  updateArchiveAvailability();
 }
 
 function resetBillHistoryAccess() {
@@ -41,6 +43,16 @@ function resetBillHistoryAccess() {
   billHistoryState.nextCursor = null;
   billHistoryState.loading = false;
   billHistoryState.starting = false;
+  billHistoryState.importAction += 1;
+  billHistoryState.archives = null;
+  billHistoryState.archiveRequest += 1;
+  billHistoryState.archiveAction += 1;
+  billHistoryState.archiveBusy = false;
+  clearTimeout(billHistoryState.archiveTimer);
+  billHistoryState.archiveTimer = null;
+  $("#bill-archive-list").replaceChildren();
+  setBusy("#request-bill-archive", false);
+  setText("#bill-archive-message", "管理员未解锁");
   setBusy("#query-bill-history", false);
   setBusy("#import-bill-history", false);
   document.querySelectorAll("#bill-history input, #bill-history button").forEach(control => { control.disabled = true; });
@@ -155,6 +167,134 @@ function scheduleBillImportPoll() {
       && billHistoryState.job?.status === "running") {
     billHistoryState.timer = setTimeout(() => refreshBillImport(billHistoryState.job?.id), 1500);
   }
+  scheduleArchivePoll();
+}
+
+const archiveLabels = {
+  queued: "排队中", requesting: "申请中", waiting: "等待文件", downloading: "下载中",
+  importing: "补录中", completed: "补录完成", failed: "失败", canceled: "已停止",
+};
+const archiveErrors = {
+  archive_generation_failed: "交易所文件生成失败",
+  archive_generation_timeout: "生成时间过长，需核对交易所状态",
+  archive_download_url_not_allowed: "下载域名未获服务器批准",
+  archive_download_private_address: "下载地址被安全策略拒绝",
+  archive_download_rejected: "下载链接已失效或响应不可用",
+  archive_download_failed: "下载连接失败",
+  archive_download_too_large: "下载文件超过容量限制",
+  archive_csv_too_large: "解压文件超过容量限制",
+  archive_file_invalid: "归档文件损坏或格式不支持",
+  archive_csv_columns_invalid: "CSV 字段不完整",
+  archive_bill_outside_quarter: "文件记录不属于请求季度",
+  archive_bill_type_conflict: "账单分类与交易所映射冲突",
+  archive_waiting_for_import: "等待其他账单补录完成",
+  archive_lease_or_account_changed: "任务已被替代或账户配置已变化",
+  OkxAccountError: "交易所请求失败",
+};
+
+function updateArchiveAvailability() {
+  const unlocked = Boolean(state.token);
+  const busy = billHistoryState.archiveBusy;
+  for (const selector of ["#bill-archive-year", "#bill-archive-quarter"]) $(selector).disabled = !unlocked || busy;
+  $("#request-bill-archive").disabled = !unlocked || busy || !state.status?.integrations?.okx_credentials_configured;
+  $("#refresh-bill-archives").disabled = !unlocked || busy;
+  $("#bill-archive-list").querySelectorAll("button").forEach(button => { button.disabled = !unlocked || busy; });
+  if (!unlocked && billHistoryState.archives) resetBillHistoryAccess();
+}
+
+function renderBillArchives(rows) {
+  if (!Array.isArray(rows) || rows.some(job => !/^[a-f0-9]{32}$/.test(job.id) || !archiveLabels[job.state])) {
+    throw new Error("季度归档状态格式无效");
+  }
+  const completed = rows.some(job => job.state === "completed"
+    && billHistoryState.archives?.some(previous => previous.id === job.id && previous.state !== "completed"));
+  billHistoryState.archives = rows;
+  const focused = document.activeElement?.closest("[data-archive-id]")?.dataset.archiveId;
+  $("#bill-archive-list").innerHTML = rows.map(job => {
+    const terminal = ["completed", "failed", "canceled"].includes(job.state);
+    const action = terminal ? "retry" : "cancel";
+    const label = terminal ? "重新申请归档" : "停止本地补录";
+    const details = [
+      job.total_days ? `${job.completed_days} / ${job.total_days} 天 · ${job.rows_imported} 条` : "",
+      job.error ? archiveErrors[job.error] || "归档处理失败，需核对服务端状态" : "",
+      job.state === "waiting" && job.next_attempt_ms ? `下次查询 ${formatTime(new Date(job.next_attempt_ms).toISOString())} UTC` : "",
+    ].filter(Boolean).join(" · ");
+    return `<li class="bill-archive-row">
+      <div><strong>${escapeHtml(job.year)} ${escapeHtml(job.quarter)}</strong><span class="archive-detail">${escapeHtml(details || "尚未写入账本")}</span></div>
+      <span class="tag" data-tone="${job.state === "completed" ? "good" : "warning"}">${archiveLabels[job.state]}</span>
+      <button class="button icon-button secondary" type="button" data-archive-id="${job.id}" data-archive-action="${action}" title="${label}" aria-label="${label} ${escapeHtml(job.year)} ${escapeHtml(job.quarter)}"><i data-icon="${terminal ? "refresh-cw" : "x"}" aria-hidden="true"></i></button>
+    </li>`;
+  }).join("");
+  renderIcons($("#bill-archive-list"));
+  if (focused) $("#bill-archive-list").querySelector(`[data-archive-id="${focused}"]`)?.focus({ preventScroll: true });
+  setText("#bill-archive-message", rows.length ? `${rows.length} 个季度任务` : "尚无季度归档");
+  updateArchiveAvailability();
+  scheduleArchivePoll();
+  if (completed && billHistoryState.report && !billHistoryRangeChanged()) loadBillHistory({ reset: true });
+}
+
+function scheduleArchivePoll() {
+  clearTimeout(billHistoryState.archiveTimer);
+  billHistoryState.archiveTimer = null;
+  if (state.token && state.privateFeedState !== "open" && $("#bill-history").open
+      && document.body.dataset.view === "performance") {
+    billHistoryState.archiveTimer = setTimeout(loadBillArchives, 5000);
+  }
+}
+
+async function loadBillArchives() {
+  if (!state.token) return;
+  const token = state.token;
+  const request = ++billHistoryState.archiveRequest;
+  try {
+    const payload = await api("/api/v1/account/bills/archives");
+    if (token !== state.token || request !== billHistoryState.archiveRequest) return;
+    renderBillArchives(payload.data);
+  } catch (error) {
+    if (token !== state.token || request !== billHistoryState.archiveRequest) return;
+    if (!handleBillHistoryUnauthorized(error)) setState("#bill-archive-message", "季度归档读取失败，保留上次状态", "warning");
+  } finally {
+    scheduleArchivePoll();
+  }
+}
+
+async function changeBillArchive(action = "request", job = null) {
+  if (!state.token || billHistoryState.archiveBusy) return;
+  if (action === "request" && !$("#bill-archive-form").reportValidity()) return;
+  const token = state.token;
+  const request = ++billHistoryState.archiveAction;
+  const updates = billHistoryState.archiveUpdates;
+  billHistoryState.archiveBusy = true;
+  setBusy("#request-bill-archive", true, "提交中...");
+  updateArchiveAvailability();
+  try {
+    const body = {
+      year: job?.year ?? Number($("#bill-archive-year").value),
+      quarter: job?.quarter ?? $("#bill-archive-quarter").value,
+      retry: action === "retry",
+    };
+    const payload = await api(`/api/v1/account/bills/archives${action === "cancel" ? `/${job.id}/cancel` : ""}`, {
+      method: "POST", ...(action !== "cancel" ? { body: JSON.stringify(body) } : {}),
+    });
+    if (token !== state.token || request !== billHistoryState.archiveAction) return;
+    if (updates === billHistoryState.archiveUpdates) {
+      if (payload.data) renderBillArchives(payload.data);
+      else if (payload.job) renderBillArchives([
+        payload.job, ...(billHistoryState.archives || []).filter(item => item.id !== payload.job.id),
+      ]);
+    }
+    setState("#bill-archive-message", action === "cancel" ? "本地补录已停止，已写入账本保留" : "归档申请已受理，结果以任务状态为准", "neutral");
+  } catch (error) {
+    if (token === state.token && request === billHistoryState.archiveAction && !handleBillHistoryUnauthorized(error)) {
+      setState("#bill-archive-message", "归档操作失败，请核对季度和连接状态", "danger");
+    }
+  } finally {
+    if (token === state.token && request === billHistoryState.archiveAction) {
+      billHistoryState.archiveBusy = false;
+      setBusy("#request-bill-archive", false);
+      updateArchiveAvailability();
+    }
+  }
 }
 
 async function refreshBillImport(jobId = null) {
@@ -186,23 +326,24 @@ async function startBillImport() {
   if ($("#import-bill-history").disabled || !state.token || !$("#bill-history-form").reportValidity()) return;
   const token = state.token;
   const request = ++billHistoryState.jobRequest;
+  const action = ++billHistoryState.importAction;
   billHistoryState.starting = true;
   setBusy("#import-bill-history", true, "提交中...");
   try {
     const payload = await api("/api/v1/account/bills/imports", {
       method: "POST", body: JSON.stringify(billHistoryRange()),
     });
-    if (request !== billHistoryState.jobRequest || token !== state.token) return;
+    if (action !== billHistoryState.importAction || token !== state.token) return;
     if (!payload.job) throw new Error("补录请求缺少任务记录");
-    renderBillImport(payload.job);
+    if (request === billHistoryState.jobRequest) renderBillImport(payload.job);
     setState("#bill-history-message", "补录请求已受理，尚未完成", "neutral");
   } catch (error) {
-    if (request === billHistoryState.jobRequest && token === state.token) {
+    if (action === billHistoryState.importAction && token === state.token) {
       if (handleBillHistoryUnauthorized(error)) return;
       setState("#bill-history-message", `未能开始补录：${error.message}`, "danger");
     }
   } finally {
-    if (request === billHistoryState.jobRequest) {
+    if (action === billHistoryState.importAction) {
       billHistoryState.starting = false;
       setBusy("#import-bill-history", false);
       updateBillHistoryAvailability();
@@ -222,6 +363,18 @@ function initializeBillHistory() {
   $("#bill-history-end").value = yesterday;
   $("#bill-history-start").max = yesterday;
   $("#bill-history-end").max = yesterday;
+  const previousQuarter = new Date();
+  previousQuarter.setUTCMonth(Math.floor(previousQuarter.getUTCMonth() / 3) * 3 - 3, 1);
+  $("#bill-archive-year").value = previousQuarter.getUTCFullYear();
+  $("#bill-archive-year").max = new Date().getUTCFullYear();
+  $("#bill-archive-quarter").value = `Q${Math.floor(previousQuarter.getUTCMonth() / 3) + 1}`;
+  $("#bill-archive-form").addEventListener("submit", event => { event.preventDefault(); changeBillArchive(); });
+  $("#refresh-bill-archives").addEventListener("click", loadBillArchives);
+  $("#bill-archive-list").addEventListener("click", event => {
+    const button = event.target.closest("[data-archive-id]");
+    const job = billHistoryState.archives?.find(item => item.id === button?.dataset.archiveId);
+    if (job) changeBillArchive(button.dataset.archiveAction, job);
+  });
   $("#bill-history-form").addEventListener("submit", event => {
     event.preventDefault();
     loadBillHistory({ reset: true });
@@ -237,6 +390,7 @@ function initializeBillHistory() {
     if ($("#bill-history").open && state.token) {
       if (!billHistoryState.report) loadBillHistory({ reset: true });
       refreshBillImport(billHistoryState.job?.id);
+      loadBillArchives();
     } else scheduleBillImportPoll();
   });
   updateBillHistoryAvailability();

@@ -171,6 +171,23 @@ class StateStore:
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_bill_import
                     ON account_bill_imports(account_scope) WHERE status = 'running';
+                CREATE TABLE IF NOT EXISTS account_bill_archives (
+                    id TEXT PRIMARY KEY,
+                    account_scope TEXT NOT NULL,
+                    year INTEGER NOT NULL,
+                    quarter TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    requested_at_ms INTEGER,
+                    next_attempt_ms INTEGER NOT NULL,
+                    lease_owner TEXT,
+                    lease_until_ms INTEGER NOT NULL DEFAULT 0,
+                    import_job_id TEXT,
+                    failures INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    error TEXT,
+                    UNIQUE(account_scope, year, quarter)
+                );
                 CREATE TABLE IF NOT EXISTS positions (
                     position_key TEXT PRIMARY KEY,
                     inst_id TEXT NOT NULL,
@@ -659,10 +676,13 @@ class StateStore:
     def commit_bill_history_window(
         self, job_id: str, scope: str, day: date,
         records: list[dict[str, Any]], summary: dict[str, Any], now_ms: int,
+        *, archive_lease: tuple[str, str] | None = None,
     ) -> None:
         begin, end = day_ms(day), day_ms(day) + DAY_MS
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if archive_lease is not None:
+                self._require_archive_lease(connection, archive_lease[0], scope, archive_lease[1], now_ms)
             job = connection.execute(
                 """SELECT * FROM account_bill_imports WHERE id = ? AND account_scope = ?
                    AND status = 'running' AND lease_until_ms > ?""",
@@ -717,6 +737,141 @@ class StateStore:
                     (scope,),
                 ).fetchone()
             return self._bill_import(row)
+
+    @staticmethod
+    def _bill_archive(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {key: row[key] for key in row.keys() if key not in {
+            "account_scope", "lease_owner", "lease_until_ms",
+        }}
+
+    def create_bill_archive(
+        self, scope: str, year: int, quarter: str, now_ms: int, *, retry: bool = False,
+    ) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM account_bill_archives WHERE account_scope = ? AND year = ? AND quarter = ?",
+                (scope, year, quarter),
+            ).fetchone()
+            if row:
+                if retry and row["state"] in {"completed", "failed", "canceled"}:
+                    connection.execute(
+                        """UPDATE account_bill_archives SET state = 'queued', requested_at_ms = NULL,
+                           next_attempt_ms = ?, lease_owner = NULL, lease_until_ms = 0,
+                           import_job_id = NULL, failures = 0, error = NULL, updated_at = ? WHERE id = ?""",
+                        (now_ms, _utc_now(), row["id"]),
+                    )
+                job_id = row["id"]
+            else:
+                job_id = uuid4().hex
+                connection.execute(
+                    """INSERT INTO account_bill_archives
+                       (id, account_scope, year, quarter, state, next_attempt_ms, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)""",
+                    (job_id, scope, year, quarter, now_ms, _utc_now(), _utc_now()),
+                )
+            return self._bill_archive(connection.execute(
+                "SELECT * FROM account_bill_archives WHERE id = ?", (job_id,),
+            ).fetchone())
+
+    def bill_archives(self, scope: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT a.*, i.completed_days, i.total_days, i.rows_imported
+                   FROM account_bill_archives a LEFT JOIN account_bill_imports i ON i.id = a.import_job_id
+                   WHERE a.account_scope = ? ORDER BY a.year DESC, a.quarter DESC LIMIT 100""",
+                (scope,),
+            ).fetchall()
+            return [self._bill_archive(row) for row in rows]
+
+    @staticmethod
+    def _require_archive_lease(connection, job_id: str, scope: str, owner: str, now_ms: int):
+        row = connection.execute(
+            """SELECT * FROM account_bill_archives WHERE id = ? AND account_scope = ?
+               AND lease_owner = ? AND lease_until_ms > ?
+               AND state NOT IN ('completed', 'failed', 'canceled')""",
+            (job_id, scope, owner, now_ms),
+        ).fetchone()
+        if row is None:
+            raise BillImportLeaseLost("archive_lease_lost")
+        return row
+
+    def claim_bill_archive(self, scope: str, owner: str, now_ms: int) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT * FROM account_bill_archives WHERE account_scope = ?
+                   AND state NOT IN ('completed', 'failed', 'canceled')
+                   AND next_attempt_ms <= ? AND lease_until_ms <= ?
+                   ORDER BY next_attempt_ms, created_at LIMIT 1""",
+                (scope, now_ms, now_ms),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                "UPDATE account_bill_archives SET lease_owner = ?, lease_until_ms = ? WHERE id = ?",
+                (owner, now_ms + 120_000, row["id"]),
+            )
+            return self._bill_archive(row)
+
+    def update_bill_archive(
+        self, job_id: str, scope: str, owner: str, now_ms: int, *,
+        state: str, next_attempt_ms: int | None = None, error: str | None = None,
+        requested_at_ms: int | None = None, import_job_id: str | None = None, failures: int = 0,
+        release: bool = False,
+    ) -> None:
+        if state not in {"queued", "requesting", "waiting", "downloading", "importing", "completed", "failed"}:
+            raise ValueError("archive_state_invalid")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = self._require_archive_lease(connection, job_id, scope, owner, now_ms)
+            linked = import_job_id or current["import_job_id"]
+            if state == "completed":
+                complete = connection.execute(
+                    """SELECT 1 FROM account_bill_imports WHERE id = ? AND account_scope = ?
+                       AND status = 'completed' AND completed_days = total_days""", (linked, scope),
+                ).fetchone()
+                if complete is None:
+                    raise ValueError("archive_import_incomplete")
+            connection.execute(
+                """UPDATE account_bill_archives SET state = ?, next_attempt_ms = ?, error = ?,
+                   requested_at_ms = ?, import_job_id = ?, updated_at = ?, failures = ?,
+                   lease_owner = ?, lease_until_ms = ? WHERE id = ?""",
+                (state, now_ms if next_attempt_ms is None else next_attempt_ms, error,
+                 requested_at_ms if requested_at_ms is not None else current["requested_at_ms"],
+                 linked, _utc_now(), failures,
+                 None if release else owner, 0 if release else now_ms + 120_000, job_id),
+            )
+
+    def touch_bill_archive(self, job_id: str, scope: str, owner: str, now_ms: int) -> None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_archive_lease(connection, job_id, scope, owner, now_ms)
+            connection.execute(
+                "UPDATE account_bill_archives SET lease_until_ms = ? WHERE id = ?",
+                (now_ms + 120_000, job_id),
+            )
+
+    def cancel_bill_archive(self, job_id: str, scope: str) -> bool:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM account_bill_archives WHERE id = ? AND account_scope = ?", (job_id, scope),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["state"] not in {"completed", "failed", "canceled"}:
+                connection.execute(
+                    """UPDATE account_bill_archives SET state = 'canceled', lease_owner = NULL,
+                       lease_until_ms = 0, updated_at = ? WHERE id = ?""", (_utc_now(), job_id),
+                )
+                connection.execute(
+                    """UPDATE account_bill_imports SET status = 'interrupted', error = 'archive_canceled',
+                       finished_at = ? WHERE id = ? AND status = 'running'""", (_utc_now(), row["import_job_id"]),
+                )
+            return True
 
     def bill_history(
         self, scope: str, days: list[date], *, limit: int = 100,

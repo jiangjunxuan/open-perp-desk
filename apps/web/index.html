@@ -592,6 +592,16 @@
               <span id="bill-import-count" class="mono"></span>
             </div>
             <p id="bill-history-message" class="settings-message" role="status" aria-live="polite">管理员未解锁</p>
+            <section class="bill-archive-section" aria-labelledby="bill-archive-title">
+              <div class="bill-archive-heading"><h3 id="bill-archive-title">季度归档</h3><button class="button icon-button secondary" id="refresh-bill-archives" type="button" title="刷新季度归档" aria-label="刷新季度归档" disabled><i data-icon="refresh-cw" aria-hidden="true"></i></button></div>
+              <form id="bill-archive-form" class="bill-history-form">
+                <label for="bill-archive-year">年份<input id="bill-archive-year" type="number" min="2021" step="1" required disabled></label>
+                <label for="bill-archive-quarter">季度<select id="bill-archive-quarter" required disabled><option value="Q1">第一季度</option><option value="Q2">第二季度</option><option value="Q3">第三季度</option><option value="Q4">第四季度</option></select></label>
+                <button class="button secondary" id="request-bill-archive" type="submit" disabled><i data-icon="download" aria-hidden="true"></i><span>申请归档</span></button>
+              </form>
+              <p id="bill-archive-message" class="settings-message" role="status" aria-live="polite">管理员未解锁</p>
+              <ul id="bill-archive-list" class="bill-archive-list" aria-label="季度归档任务"></ul>
+            </section>
             <div class="bill-history-context"><span id="bill-history-range">尚无查询结果</span><strong id="bill-history-coverage">覆盖情况未知</strong></div>
             <div id="bill-history-summary" class="bill-currency-summary"></div>
             <div class="table-wrap" tabindex="0" role="region" aria-label="历史账单表">

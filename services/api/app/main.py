@@ -24,6 +24,7 @@ from .order_preflight import OrderPreflight
 from .ai_analysis import AIAnalysisError, TradingAgentsAdapter
 from .account_sync import AccountSynchronizer
 from .account_history import AccountHistoryImporter
+from .quarterly_history import QuarterlyHistoryImporter
 from .historical_ledger import archive_first_day, history_days
 from .account_reconciler import AccountReconciler
 from .automation_worker import AutomationWorker
@@ -50,6 +51,7 @@ risk_engine = RiskEngine()
 trade_client = OkxTradeClient()
 state_store = StateStore()
 account_history = AccountHistoryImporter(state_store, account_client)
+quarterly_history = QuarterlyHistoryImporter(state_store, account_client)
 safety_controller = SafetyController(state_store)
 strategy_engine = StrategyEngine()
 backtest_engine = BacktestEngine(strategy_engine)
@@ -96,10 +98,12 @@ async def lifespan(_: FastAPI):
     await account_stream.start()
     await algo_stream.start()
     await account_reconciler.start()
+    await quarterly_history.start()
     await automation_worker.start()
     try:
         yield
     finally:
+        await quarterly_history.close()
         await account_history.close()
         await tradingagents.close()
         await automation_worker.stop()
@@ -205,6 +209,7 @@ def health_metrics() -> dict[str, object]:
         },
         "automation_worker": automation_worker.snapshot(),
         "account_reconciler": account_reconciler.snapshot(),
+        "quarterly_history": quarterly_history.snapshot(),
         "execution": {
             "enabled": trade_client.enabled,
             "live_allowed": trade_client.live_gate.allowed,
@@ -271,6 +276,7 @@ def system_status() -> dict[str, object]:
         "automation_worker": automation_worker.snapshot(),
         "account_reconciler": account_reconciler.snapshot(),
         "live_safety": trade_client.live_gate.snapshot(),
+        "quarterly_history": quarterly_history.snapshot(),
         "safety_control": safety_controller.snapshot(),
         "safety": {
             "live_orders_allowed": trade_client.live_gate.allowed,
@@ -565,6 +571,40 @@ class BillImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     start_day: date
     end_day: date
+
+
+class BillArchiveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    year: int = Field(ge=2021, strict=True)
+    quarter: Literal["Q1", "Q2", "Q3", "Q4"]
+    retry: bool = False
+
+
+@app.post("/api/v1/account/bills/archives", status_code=202)
+async def request_bill_archive(
+    request: BillArchiveRequest, _: None = Depends(require_admin_token),
+) -> dict[str, Any]:
+    try:
+        return {"job": await quarterly_history.request(request.year, request.quarter, retry=request.retry)}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except OkxAccountError as exc:
+        raise HTTPException(status_code=503, detail="OKX read-only credentials are not configured") from exc
+
+
+@app.get("/api/v1/account/bills/archives")
+def bill_archives(_: None = Depends(require_admin_token)) -> dict[str, Any]:
+    return {"data": state_store.bill_archives(account_client.account_scope)}
+
+
+@app.post("/api/v1/account/bills/archives/{job_id}/cancel")
+def cancel_bill_archive(
+    job_id: str = RoutePath(min_length=32, max_length=32, pattern=r"^[a-f0-9]+$"),
+    _: None = Depends(require_admin_token),
+) -> dict[str, Any]:
+    if not state_store.cancel_bill_archive(job_id, account_client.account_scope):
+        raise HTTPException(status_code=404, detail="Bill archive not found")
+    return {"data": state_store.bill_archives(account_client.account_scope)}
 
 
 @app.post("/api/v1/account/bills/imports", status_code=202)

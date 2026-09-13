@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import json
 import os
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -33,6 +34,8 @@ class OkxAccountClient:
         self._last_archive_request = 0.0
         self._order_request_lock = asyncio.Lock()
         self._last_order_request = 0.0
+        self._quarter_request_lock = asyncio.Lock()
+        self._last_quarter_request = 0.0
 
     @property
     def configured(self) -> bool:
@@ -62,14 +65,17 @@ class OkxAccountClient:
         digest = hmac.new(secret_key.encode(), message, hashlib.sha256).digest()
         return base64.b64encode(digest).decode()
 
-    def _headers(self, timestamp: str, request_path: str) -> dict[str, str]:
+    def _headers(
+        self, timestamp: str, request_path: str, *, method: str = "GET", body: str = "",
+    ) -> dict[str, str]:
         headers = {
             "Accept": "application/json",
             "OK-ACCESS-KEY": self.api_key,
             "OK-ACCESS-SIGN": self.signature(
                 timestamp,
-                "GET",
+                method,
                 request_path,
+                body=body,
                 secret_key=self.secret_key,
             ),
             "OK-ACCESS-TIMESTAMP": timestamp,
@@ -77,6 +83,8 @@ class OkxAccountClient:
         }
         if self.demo:
             headers["x-simulated-trading"] = "1"
+        if method == "POST":
+            headers["Content-Type"] = "application/json"
         return headers
 
     async def _get(
@@ -84,12 +92,25 @@ class OkxAccountClient:
         path: str,
         params: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]:
+        return await self._request(path, params)
+
+    async def _request(
+        self, path: str, params: dict[str, str] | None = None, *,
+        method: str = "GET", body: str = "",
+    ) -> list[dict[str, Any]]:
         if not self.configured:
             raise OkxAccountError("OKX read-only credentials are not configured")
 
         query = f"?{urlencode(params)}" if params else ""
         request_path = f"{path}{query}"
-        if path == "/api/v5/account/bills":
+        if path == "/api/v5/account/bills-history-archive" and method == "POST":
+            async with self._quarter_request_lock:
+                loop = asyncio.get_running_loop()
+                delay = 10.1 - (loop.time() - self._last_quarter_request)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                self._last_quarter_request = loop.time()
+        elif path == "/api/v5/account/bills":
             async with self._bill_request_lock:
                 loop = asyncio.get_running_loop()
                 delay = 0.21 - (loop.time() - self._last_bill_request)
@@ -116,9 +137,11 @@ class OkxAccountClient:
                 proxy=self.proxy_url,
                 transport=self.transport,
                 timeout=httpx.Timeout(10.0, connect=5.0),
-                headers=self._headers(timestamp, request_path),
+                headers=self._headers(timestamp, request_path, method=method, body=body),
             ) as client:
-                response = await client.get(f"{self.base_url}{path}", params=params)
+                response = await client.request(
+                    method, f"{self.base_url}{path}", params=params, content=body or None,
+                )
                 response.raise_for_status()
                 payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
@@ -135,6 +158,44 @@ class OkxAccountClient:
         if not isinstance(data, list) or any(not isinstance(row, dict) for row in data):
             raise OkxAccountError("Invalid OKX account data")
         return data
+
+    async def apply_bill_archive(self, year: int, quarter: str) -> dict[str, Any]:
+        from .bill_archive import quarter_days
+        quarter_days(year, quarter)
+        rows = await self._request(
+            "/api/v5/account/bills-history-archive", method="POST",
+            body=json.dumps({"year": str(year), "quarter": quarter}, separators=(",", ":")),
+        )
+        if len(rows) != 1 or rows[0].get("result") not in {"true", "false"}:
+            raise OkxAccountError("archive_application_invalid")
+        return rows[0]
+
+    async def bill_archive_status(self, year: int, quarter: str) -> dict[str, Any]:
+        from .bill_archive import quarter_days
+        quarter_days(year, quarter)
+        rows = await self._get(
+            "/api/v5/account/bills-history-archive", {"year": str(year), "quarter": quarter},
+        )
+        if len(rows) != 1 or rows[0].get("state") not in {"ongoing", "finished", "failed"}:
+            raise OkxAccountError("archive_status_invalid")
+        return rows[0]
+
+    async def bill_subtypes(self) -> dict[str, str]:
+        rows = await self._get("/api/v5/account/subtypes")
+        mapping: dict[str, str] = {}
+        for row in rows:
+            kind = row.get("type")
+            details = row.get("subTypeDetails")
+            if not isinstance(kind, str) or not kind.isdigit() or not isinstance(details, list):
+                raise OkxAccountError("archive_subtypes_invalid")
+            for detail in details:
+                subtype = detail.get("subType") if isinstance(detail, dict) else None
+                if not isinstance(subtype, str) or not subtype.isdigit():
+                    raise OkxAccountError("archive_subtypes_invalid")
+                if subtype in mapping and mapping[subtype] != kind:
+                    raise OkxAccountError("archive_subtypes_conflict")
+                mapping[subtype] = kind
+        return mapping
 
     async def balance(self) -> list[dict[str, Any]]:
         return await self._get("/api/v5/account/balance")
