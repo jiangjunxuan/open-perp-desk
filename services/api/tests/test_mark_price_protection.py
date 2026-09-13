@@ -14,6 +14,7 @@ from app.okx_market import OkxMarketClient, OkxMarketError
 from app.risk_engine import RiskEngine, RiskLimits
 from app.state_store import StateStore
 from app.trading_signal import TradeSignal
+from tests.test_position_lifecycle import order
 
 
 SYMBOL = "BTC-USDT-SWAP"
@@ -206,6 +207,36 @@ class ProtectiveMarkWorkerTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(price=price), self.assertRaisesRegex(ValueError, "mark_price_invalid"):
                 self.engine.protective_exit(inst_id=SYMBOL, mark_price=price)
         self.engine.submit_signal.assert_not_awaited()
+
+    async def test_reopened_position_gets_new_preview_but_repeated_snapshot_does_not(self):
+        self.client.get.return_value = [quote(markPx="94")]
+        self.engine.submit_signal = ExecutionEngine.submit_signal.__get__(self.engine)
+        await self.cycle()
+        first_id = self.store.list_orders()[0]["client_order_id"]
+        await self.cycle()
+        self.assertEqual(len(self.store.list_orders()), 1)
+        self.position()
+        await self.cycle()
+        self.assertEqual(len(self.store.list_orders()), 2)
+        self.assertNotEqual(self.store.list_orders()[0]["client_order_id"], first_id)
+        await self.cycle()
+        self.assertEqual(len(self.store.list_orders()), 2)
+
+    async def test_unconfirmed_old_close_blocks_new_lifecycle_until_reconciled(self):
+        self.worker.dry_run = False
+        self.engine.trade_client.enabled = True
+        self.worker._account_equity = AsyncMock(return_value=1000)
+        self.client.get.return_value = [quote(markPx="94")]
+        self.store.save_order(order())
+        self.position()
+        result = await self.cycle()
+        self.assertEqual(result["results"][0]["action"], "skip_pending_protective_close")
+        self.engine.submit_signal.assert_not_awaited()
+        self.store.save_order(order(status="filled"))
+        result = await self.cycle()
+        self.assertEqual(result["results"][0]["action"], "stop_loss")
+        self.engine.submit_signal.assert_awaited_once()
+        self.assertTrue(self.engine.submit_signal.await_args.kwargs["idempotency_key"].endswith(":lifecycle:1"))
 
 
 if __name__ == "__main__":

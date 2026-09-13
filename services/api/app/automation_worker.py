@@ -210,6 +210,17 @@ class AutomationWorker:
                         position["pos_side"] in {"long", "net"}
                         and position["size"] > 0
                     )
+                    close_side = "sell" if is_long else "buy"
+                    if not self.dry_run and self.store.has_active_standard_close(symbol, close_side):
+                        results.append({
+                            "inst_id": symbol, "action": "skip_pending_protective_close",
+                            "accepted": False, "reasons": ["close_order_unconfirmed"],
+                        })
+                        continue
+                    close_key = f"{symbol}:{position['position_key']}:{exit_event['reason']}"
+                    generation = position["lifecycle_generation"]
+                    if generation:
+                        close_key += f":lifecycle:{generation}"
                     close_signal = TradeSignal(
                         inst_id=symbol,
                         action="close",
@@ -225,10 +236,8 @@ class AutomationWorker:
                         current_notional=current_notional,
                         size=abs(float(position["size"])),
                         dry_run=self.dry_run,
-                        side_override="sell" if is_long else "buy",
-                        idempotency_key=(
-                            f"{symbol}:{position['position_key']}:{exit_event['reason']}"
-                        ),
+                        side_override=close_side,
+                        idempotency_key=close_key,
                         market_data_fresh=self.market_data_fresh(),
                     )
                     if (

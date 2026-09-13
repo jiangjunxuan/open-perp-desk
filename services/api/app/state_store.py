@@ -276,6 +276,7 @@ class StateStore:
                     take_profit REAL,
                     unrealized_pnl REAL NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'open',
+                    lifecycle_generation INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
@@ -323,6 +324,10 @@ class StateStore:
             if "notional" not in position_columns:
                 connection.execute(
                     "ALTER TABLE positions ADD COLUMN notional REAL NOT NULL DEFAULT 0"
+                )
+            if "lifecycle_generation" not in position_columns:
+                connection.execute(
+                    "ALTER TABLE positions ADD COLUMN lifecycle_generation INTEGER NOT NULL DEFAULT 0"
                 )
             order_columns = {
                 str(row["name"])
@@ -573,6 +578,20 @@ class StateStore:
                 LIMIT 1
                 """,
                 (inst_id, int(reduce_only), *active_statuses),
+            ).fetchone()
+        return row is not None
+
+    def has_active_standard_close(self, inst_id: str, side: str) -> bool:
+        placeholders = ",".join("?" for _ in ACTIVE_ORDER_STATUSES)
+        with self._connection() as connection:
+            row = connection.execute(
+                f"""
+                SELECT 1 FROM orders
+                WHERE inst_id = ? AND side = ? AND reduce_only = 1
+                  AND order_kind = 'standard' AND status IN ({placeholders})
+                LIMIT 1
+                """,
+                (inst_id, side, *ACTIVE_ORDER_STATUSES),
             ).fetchone()
         return row is not None
 
@@ -1624,6 +1643,14 @@ class StateStore:
                     notional, stop_loss, take_profit, unrealized_pnl, status, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(position_key) DO UPDATE SET
+                    lifecycle_generation = positions.lifecycle_generation + CASE
+                        WHEN excluded.status = 'open' AND excluded.size != 0 AND (
+                            positions.status != 'open' OR positions.size = 0
+                            OR (positions.pos_side = 'net' AND (
+                                (positions.size < 0 AND excluded.size > 0)
+                                OR (positions.size > 0 AND excluded.size < 0)
+                            ))
+                        ) THEN 1 ELSE 0 END,
                     size = excluded.size,
                     entry_price = excluded.entry_price,
                     mark_price = excluded.mark_price,

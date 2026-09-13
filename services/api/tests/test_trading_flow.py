@@ -236,5 +236,17 @@ class TradingFlowTests(unittest.IsolatedAsyncioTestCase):
             f"标记价格 {self.exchange.mark_price}" in row["content"]
             for row in self.exchange.notifications if "保护性平仓触发" in row["title"]
         ))
+        reopened = await self.api.request("POST", "/execution/signals", await self.signal_payload())
+        self.assertTrue(reopened["accepted"])
+        await self.synchronize()
+        positions = (await self.api.request("GET", "/positions"))["data"]
+        self.assertEqual(positions[0]["lifecycle_generation"], 1)
+        await run_cycle(dry_run=False, expected_count=8)
+        self.assertEqual(len(self.exchange.order_submissions), 4)
+        second_close = self.exchange.order_submissions[3]
+        self.assertTrue(second_close["reduceOnly"])
+        self.assertNotEqual(second_close["clOrdId"], close["clOrdId"])
+        await self.synchronize()
+        self.assertEqual((await self.api.request("GET", "/positions"))["data"], [])
         self.assertFalse((await self.api.request("GET", "/worker/status"))["running"])
         self.assertEqual(self.exchange.errors, [])

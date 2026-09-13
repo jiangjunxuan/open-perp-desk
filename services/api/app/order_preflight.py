@@ -257,6 +257,16 @@ class OrderPreflight:
                 raise PreflightError("close_position_mode_unknown")
             if (position_mode == "net_mode") != (pos_side == "net"):
                 raise PreflightError("position_mode_mismatch")
+            if any(
+                row.get("instId") == signal.inst_id and row.get("side") == side
+                and row.get("posSide") in {pos_side, None, ""}
+                for row in pending
+            ) or any(
+                row.get("inst_id") == signal.inst_id and row.get("side") == side
+                and row.get("reduce_only") and row.get("order_kind") != "algo"
+                for row in local_orders
+            ):
+                raise PreflightError("pending_close_order_unconfirmed")
             verified_close = True
         elif side_override is not None and side_override != side:
             raise PreflightError("signal_side_mismatch")

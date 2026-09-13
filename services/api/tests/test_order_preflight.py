@@ -156,6 +156,57 @@ class OrderPreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.trade.orders, [])
         self.assertEqual(self.store.execution_snapshot()[0], 0)
 
+    async def test_different_close_ids_do_not_bypass_an_unconfirmed_local_close(self):
+        self.account.position_rows = [position()]
+        signal = TradeSignal(inst_id="BTC-USDT-SWAP", action="close", confidence=1, leverage=1, position_pct=0)
+        first = await self.submit(signal, idempotency_key="first-close")
+        self.assertTrue(first["accepted"])
+        second = await self.submit(signal, idempotency_key="new-close")
+        self.assertFalse(second["accepted"])
+        self.assertIn("pending_close_order_unconfirmed", second["reasons"])
+        replay = await self.submit(signal, idempotency_key="first-close")
+        self.assertTrue(replay["accepted"] and replay["idempotent"])
+        self.assertEqual(len(self.trade.orders), 1)
+
+    async def test_concurrent_close_ids_cannot_both_claim_execution(self):
+        self.account.position_rows = [position()]
+        signal = TradeSignal(inst_id="BTC-USDT-SWAP", action="close", confidence=1, leverage=1, position_pct=0)
+        results = await asyncio.gather(
+            self.submit(signal, idempotency_key="concurrent-close-one"),
+            self.submit(signal, idempotency_key="concurrent-close-two"),
+        )
+        self.assertEqual(sum(result["accepted"] for result in results), 1, results)
+        rejected = next(result for result in results if not result["accepted"])
+        self.assertTrue(set(rejected["reasons"]) & {
+            "pending_close_order_unconfirmed", "execution_budget_snapshot_changed",
+        })
+        self.assertEqual(len(self.trade.orders), 1)
+
+    async def test_exchange_pending_close_blocks_net_and_hedged_close_requests(self):
+        signal = TradeSignal(inst_id="BTC-USDT-SWAP", action="close", confidence=1, leverage=1, position_pct=0)
+        for mode, side in (("net_mode", "net"), ("long_short_mode", "long")):
+            with self.subTest(mode=mode):
+                self.account.mode = mode
+                self.account.position_rows = [position(side=side)]
+                self.account.pending_rows = [{
+                    "ordId": "external-close", "instId": signal.inst_id, "side": "sell",
+                    "posSide": side, "reduceOnly": "true", "sz": ".2", "accFillSz": "0",
+                }]
+                result = await self.submit(signal)
+                self.assertFalse(result["accepted"])
+                self.assertIn("pending_close_order_unconfirmed", result["reasons"])
+        self.assertEqual(self.trade.orders, [])
+
+    async def test_native_protection_does_not_block_a_standard_protective_close(self):
+        self.account.position_rows = [position()]
+        self.account.algo_rows = [{
+            "algoId": "native-protection", "instId": "BTC-USDT-SWAP", "ordType": "oco",
+            "posSide": "net", "side": "sell", "sz": ".2", "reduceOnly": "true",
+        }]
+        signal = TradeSignal(inst_id="BTC-USDT-SWAP", action="close", confidence=1, leverage=1, position_pct=0)
+        self.assertTrue((await self.submit(signal))["accepted"])
+        self.assertEqual(len(self.trade.orders), 1)
+
     async def test_pending_and_position_exposure_share_account_budget(self):
         self.account.position_rows = [position(notional="150")]
         self.account.pending_rows = [{
