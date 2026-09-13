@@ -1050,7 +1050,7 @@ class StateStore:
                     continue
                 _, end = observation_bounds(*(self._equity_baseline(row) for row in pair))
                 existing = connection.execute(
-                    """SELECT * FROM account_performance_intervals
+                    """SELECT id, state FROM account_performance_intervals
                        WHERE account_scope = ? AND market_scope = ? AND target_ms = ?""",
                     (scope, market_scope, target),
                 ).fetchone()
