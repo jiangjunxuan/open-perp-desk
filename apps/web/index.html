@@ -601,6 +601,7 @@
               <label for="bill-history-end">结束日期 · UTC（含）<input id="bill-history-end" type="date" required disabled></label>
               <button class="button secondary" id="query-bill-history" type="submit" disabled><i data-icon="refresh-cw" aria-hidden="true"></i><span>查询账本</span></button>
               <button class="button secondary" id="import-bill-history" type="button" disabled><i data-icon="download" aria-hidden="true"></i><span>补录账单</span></button>
+              <button class="button secondary" id="value-bill-history" type="button" disabled><i data-icon="refresh-cw" aria-hidden="true"></i><span>更新估值</span></button>
             </form>
             <div id="bill-import-progress" class="bill-import-progress" hidden>
               <div><strong id="bill-import-status">尚未补录</strong><span id="bill-import-range" class="mono"></span></div>
@@ -620,11 +621,21 @@
             </section>
             <div class="bill-history-context"><span id="bill-history-range">尚无查询结果</span><strong id="bill-history-coverage">覆盖情况未知</strong></div>
             <div id="bill-history-summary" class="bill-currency-summary"></div>
+            <section class="bill-archive-section" aria-labelledby="bill-valuation-title">
+              <div class="bill-archive-heading"><h3 id="bill-valuation-title">历史估值 · USD</h3><button class="button icon-button secondary" id="cancel-bill-valuation" type="button" title="停止估值" aria-label="停止估值" disabled><i data-icon="x" aria-hidden="true"></i></button></div>
+              <div id="bill-valuation-progress" class="bill-import-progress" hidden>
+                <div><strong id="bill-valuation-job-status">尚未估值</strong><span id="bill-valuation-job-range" class="mono"></span></div>
+                <progress id="bill-valuation-meter" max="1" value="0" aria-label="历史估值进度"></progress>
+                <span id="bill-valuation-count" class="mono"></span>
+              </div>
+              <p id="bill-valuation-message" class="settings-message" role="status" aria-live="polite">尚无查询结果</p>
+              <div id="bill-valuation-summary" class="bill-currency-summary"></div>
+            </section>
             <div class="table-wrap" tabindex="0" role="region" aria-label="历史账单表">
               <table>
-                <caption class="sr-only">交易账户历史账单，原币种金额，未进行历史汇率估值</caption>
-                <thead><tr><th>时间 · UTC</th><th>分类</th><th>合约</th><th>币种</th><th>实现盈亏</th><th>手续费</th><th>资金费</th><th>账户划转</th></tr></thead>
-                <tbody id="bill-history-body"><tr><td colspan="8" class="table-empty">历史账单尚未读取</td></tr></tbody>
+                <caption class="sr-only">交易账户历史账单，原币种金额与有报价依据的美元净损益</caption>
+                <thead><tr><th>时间 · UTC</th><th>分类</th><th>合约</th><th>币种</th><th>实现盈亏</th><th>手续费</th><th>资金费</th><th>账户划转</th><th>净损益 · USD</th></tr></thead>
+                <tbody id="bill-history-body"><tr><td colspan="9" class="table-empty">历史账单尚未读取</td></tr></tbody>
               </table>
             </div>
             <div class="history-pagination">

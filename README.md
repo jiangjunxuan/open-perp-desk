@@ -77,7 +77,7 @@ API 健康检查地址为 `/api/v1/health`。
 近期历史补录通过 `POST /api/v1/account/bills/imports` 提交包含首尾日期的 UTC
 范围，202 只表示受理；历史明细、原币种汇总与覆盖缺口通过
 `GET /api/v1/account/bills/history` 查询。绩效页提供对应的查询和进度界面，
-不计算尚未完成历史估值的账户总收益。
+支持历史 USD 指数估值与报价缺口核对；尚不计算缺少权益基准的完整账户净值收益。
 账单范围、风险损益定义和当前会计限制见 [`docs/ACCOUNTING.md`](docs/ACCOUNTING.md)。
 
 ## 当前功能范围

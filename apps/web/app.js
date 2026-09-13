@@ -1766,6 +1766,10 @@ function applyPrivateEvent(event, payload) {
     billHistoryState.archiveUpdates += 1;
     billHistoryState.archiveRequest += 1;
     renderBillArchives(payload.data);
+  } else if (event === "bill_valuation") {
+    billHistoryState.valuationUpdates += 1;
+    billHistoryState.valuationRequest += 1;
+    renderBillValuationJob(payload.job);
   } else if (event === "strategies") {
     const strategy = payload.data?.find(item => item.strategy_id === "structured-technical");
     if (strategy && !state.strategyDirty && !$("#save-strategy").hasAttribute("aria-busy")) {

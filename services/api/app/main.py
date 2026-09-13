@@ -24,6 +24,7 @@ from .order_preflight import OrderPreflight
 from .ai_analysis import AIAnalysisError, TradingAgentsAdapter
 from .account_sync import AccountSynchronizer
 from .account_history import AccountHistoryImporter
+from .account_valuation import AccountValuationWorker
 from .quarterly_history import QuarterlyHistoryImporter
 from .historical_ledger import archive_first_day, history_days
 from .account_reconciler import AccountReconciler
@@ -52,6 +53,7 @@ trade_client = OkxTradeClient()
 state_store = StateStore()
 account_history = AccountHistoryImporter(state_store, account_client)
 quarterly_history = QuarterlyHistoryImporter(state_store, account_client)
+account_valuation = AccountValuationWorker(state_store, account_client, market_client)
 safety_controller = SafetyController(state_store)
 strategy_engine = StrategyEngine()
 backtest_engine = BacktestEngine(strategy_engine)
@@ -99,10 +101,12 @@ async def lifespan(_: FastAPI):
     await algo_stream.start()
     await account_reconciler.start()
     await quarterly_history.start()
+    await account_valuation.start()
     await automation_worker.start()
     try:
         yield
     finally:
+        await account_valuation.close()
         await quarterly_history.close()
         await account_history.close()
         await tradingagents.close()
@@ -649,10 +653,43 @@ def historical_account_bills(
         days = history_days(start_day, end_day, now=now)
         report = state_store.bill_history(
             account_client.account_scope, days, limit=limit, before_ts=before_ts, before_id=before_id,
+            rate_scope=market_client.rate_scope,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"configured": account_client.configured, "archive_first_day": archive_first_day(now).isoformat(), **report}
+
+
+@app.post("/api/v1/account/bills/valuation", status_code=202)
+async def request_bill_valuation(
+    request: BillImportRequest, _: None = Depends(require_admin_token),
+) -> dict[str, Any]:
+    try:
+        days = history_days(request.start_day, request.end_day, now=datetime.now(timezone.utc))
+        job = await asyncio.to_thread(
+            state_store.create_bill_valuation, account_client.account_scope, market_client.rate_scope, days,
+        )
+    except BillImportBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    account_valuation.notify()
+    return {"job": job}
+
+
+@app.get("/api/v1/account/bills/valuation")
+def latest_bill_valuation(_: None = Depends(require_admin_token)) -> dict[str, Any]:
+    return {"job": state_store.bill_valuation(account_client.account_scope)}
+
+
+@app.post("/api/v1/account/bills/valuation/{job_id}/cancel")
+def cancel_bill_valuation(
+    job_id: str = RoutePath(min_length=32, max_length=32, pattern=r"^[a-f0-9]+$"),
+    _: None = Depends(require_admin_token),
+) -> dict[str, Any]:
+    if not state_store.cancel_bill_valuation(job_id, account_client.account_scope):
+        raise HTTPException(status_code=404, detail="Valuation not found")
+    return {"job": state_store.bill_valuation(account_client.account_scope)}
 
 
 @app.get("/api/v1/performance/report")

@@ -52,9 +52,10 @@ newer position, and a REST request cannot overwrite or close a position changed
 by a push while that request was in flight unless its exchange time proves it
 is newer. Protection refreshes use the current stored size, not cached size.
 Funding, interest and historical accounting that have not reached the ledger
-are not presented as verified live values. Historical FX-valued NAV remains
-unfinished; quarterly archive tasks now publish their progress through the
-private feed but still need real OKX file acceptance.
+are not presented as verified live values. Historical ledger amounts can now be
+valued with cached, confirmed minute USD index closes; complete FX-adjusted NAV
+still requires historical equity baselines and real OKX file acceptance for
+quarterly archives. Valuation progress publishes through the private feed.
 
 ## Deployment
 

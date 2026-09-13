@@ -3,6 +3,7 @@ const billHistoryState = {
   cursors: [null], page: 0, nextCursor: null, job: null, timer: null,
   loading: false, starting: false, importAction: 0,
   archives: null, archiveRequest: 0, archiveUpdates: 0, archiveAction: 0, archiveBusy: false, archiveTimer: null,
+  valuationJob: null, valuationRequest: 0, valuationAction: 0, valuationUpdates: 0, valuationBusy: false, valuationTimer: null,
 };
 
 function billHistoryRange() {
@@ -24,10 +25,16 @@ function updateBillHistoryAvailability() {
     || billHistoryState.job?.status === "running";
   $("#bill-history-previous").disabled = !unlocked || billHistoryState.loading || billHistoryState.page === 0 || billHistoryRangeChanged();
   $("#bill-history-next").disabled = !unlocked || billHistoryState.loading || !billHistoryState.nextCursor || billHistoryRangeChanged();
-  if (!unlocked && (billHistoryState.report || billHistoryState.job || billHistoryState.loading || billHistoryState.starting)) {
+  if (!unlocked && (billHistoryState.report || billHistoryState.job || billHistoryState.loading || billHistoryState.starting
+      || billHistoryState.valuationJob || billHistoryState.valuationBusy)) {
     resetBillHistoryAccess();
   }
   updateArchiveAvailability();
+  $("#value-bill-history").disabled = !unlocked || billHistoryState.loading || billHistoryState.valuationBusy
+    || !billHistoryState.report?.coverage?.complete || billHistoryRangeChanged()
+    || ["queued", "running"].includes(billHistoryState.valuationJob?.state);
+  $("#cancel-bill-valuation").disabled = !unlocked || billHistoryState.valuationBusy
+    || !["queued", "running"].includes(billHistoryState.valuationJob?.state);
 }
 
 function resetBillHistoryAccess() {
@@ -48,6 +55,16 @@ function resetBillHistoryAccess() {
   billHistoryState.archiveRequest += 1;
   billHistoryState.archiveAction += 1;
   billHistoryState.archiveBusy = false;
+  billHistoryState.valuationJob = null;
+  billHistoryState.valuationRequest += 1;
+  billHistoryState.valuationAction += 1;
+  billHistoryState.valuationBusy = false;
+  clearTimeout(billHistoryState.valuationTimer);
+  billHistoryState.valuationTimer = null;
+  $("#bill-valuation-progress").hidden = true;
+  $("#bill-valuation-summary").replaceChildren();
+  setText("#bill-valuation-message", "管理员未解锁");
+  setBusy("#value-bill-history", false);
   clearTimeout(billHistoryState.archiveTimer);
   billHistoryState.archiveTimer = null;
   $("#bill-archive-list").replaceChildren();
@@ -63,7 +80,7 @@ function resetBillHistoryAccess() {
   setText("#bill-history-coverage", "覆盖情况未知");
   setText("#bill-history-page", "第 1 页");
   $("#bill-history-summary").replaceChildren();
-  $("#bill-history-body").innerHTML = '<tr><td colspan="8" class="table-empty">历史账单已锁定</td></tr>';
+  $("#bill-history-body").innerHTML = '<tr><td colspan="9" class="table-empty">历史账单已锁定</td></tr>';
 }
 
 function handleBillHistoryUnauthorized(error) {
@@ -87,8 +104,11 @@ function renderBillHistory(payload, range, page) {
     <td class="mono-cell">${escapeHtml(row.inst_id || "--")}</td>
     <td class="mono-cell">${escapeHtml(row.currency)}</td>
     ${["realized_pnl", "fees", "funding", "cash_flow"].map(field => `<td class="mono-cell">${escapeHtml(row[field] ?? "--")}</td>`).join("")}
+    <td class="mono-cell" title="${escapeHtml(row.historical_valuation?.index
+      ? `${row.historical_valuation.index} · ${formatTime(new Date(row.historical_valuation.candle_ms).toISOString())} UTC · ${row.historical_valuation.rate}`
+      : "")}">${escapeHtml(row.historical_valuation?.usd?.net_pnl ?? "--")}</td>
   </tr>`).join("");
-  $("#bill-history-body").innerHTML = html || '<tr><td colspan="8" class="table-empty">该日期范围暂无已补录账单</td></tr>';
+  $("#bill-history-body").innerHTML = html || '<tr><td colspan="9" class="table-empty">该日期范围暂无已补录账单</td></tr>';
   setText("#bill-history-range", `${range.start_day} 至 ${range.end_day} UTC · 共 ${payload.total} 条 · 原币种${payload.coverage.last_imported_at ? ` · 采集于 ${formatTime(payload.coverage.last_imported_at)}` : ""}`);
   const coverage = payload.coverage;
   setState("#bill-history-coverage", `已覆盖 ${coverage.completed_days} / ${coverage.total_days} 天`, coverage.complete ? "good" : "warning");
@@ -100,8 +120,9 @@ function renderBillHistory(payload, range, page) {
       .map(([ccy, value]) => `<span>${escapeHtml(ccy)} 账户划转<strong>${escapeHtml(value)}</strong></span>`).join("");
   const unclassified = summary.counts?.unclassified || 0;
   setState("#bill-history-message",
-    `未作历史汇率估值，不计算账户总收益${unclassified ? ` · ${unclassified} 条账单待分类` : ""}${!payload.configured ? " · OKX 私有凭据未配置" : ""}`,
+    `${payload.valuation?.status === "valued" ? "历史账单已估值；缺少权益基准，不计算账户总收益" : "未完成历史汇率估值，不计算账户总收益"}${unclassified ? ` · ${unclassified} 条账单待分类` : ""}${!payload.configured ? " · OKX 私有凭据未配置" : ""}`,
     unclassified ? "warning" : "neutral");
+  renderBillValuation(payload.valuation);
   billHistoryState.report = payload;
   billHistoryState.range = range;
   billHistoryState.page = page;
@@ -168,6 +189,105 @@ function scheduleBillImportPoll() {
     billHistoryState.timer = setTimeout(() => refreshBillImport(billHistoryState.job?.id), 1500);
   }
   scheduleArchivePoll();
+  scheduleBillValuationPoll();
+}
+
+const valuationLabels = {
+  queued: "排队中", running: "估值中", completed: "报价采集完成", partial: "部分报价缺失",
+  failed: "估值失败", canceled: "已停止",
+};
+const valuationErrors = {
+  valuation_history_incomplete: "历史账单存在缺口",
+  valuation_history_changed: "估值期间账单已变更",
+  valuation_day_too_large: "单日账单超过估值容量",
+  historical_rate_response_invalid: "历史报价校验未通过",
+  historical_rate_duplicate: "历史报价存在重复记录",
+  historical_currency_invalid: "账单币种无法识别",
+  market_request_failed: "历史报价连接失败",
+};
+
+function renderBillValuation(valuation) {
+  const complete = valuation?.status === "valued";
+  const labels = {
+    realized_pnl: "实现盈亏", fees: "手续费", funding: "资金费",
+    adjustments: "其他损益", net_pnl: "永续净损益", cash_flow: "账户净划入",
+  };
+  $("#bill-valuation-summary").innerHTML = Object.entries(labels).map(([field, label]) =>
+    `<span>${label}<strong>${escapeHtml(complete ? valuation.usd[field] : "--")}</strong></span>`).join("");
+  const message = complete ? "已按历史指数价估值 · 不含持仓浮盈亏及币种持有期间的汇兑损益"
+    : valuation?.status === "range_too_large" ? "估值范围超过 100,000 条账单"
+    : valuation ? `估值不完整 · ${valuation.missing_day_count || 0} 天账单缺口 · 缺少 ${valuation.missing_rate_count || 0} 组报价 · ${valuation.unclassified_rows || 0} 条未纳入账单`
+    : "尚未估值";
+  setState("#bill-valuation-message", message, complete ? "good" : "warning");
+}
+
+function renderBillValuationJob(job) {
+  if (job && (!/^[a-f0-9]{32}$/.test(job.id) || !valuationLabels[job.state])) throw new Error("历史估值状态格式无效");
+  const previous = billHistoryState.valuationJob;
+  billHistoryState.valuationJob = job;
+  $("#bill-valuation-progress").hidden = !job;
+  if (job) {
+    setState("#bill-valuation-job-status", valuationLabels[job.state], job.state === "completed" ? "good" : "warning");
+    setText("#bill-valuation-job-range", `${job.start_day} 至 ${job.end_day} UTC`);
+    $("#bill-valuation-meter").max = Math.max(1, job.total_days);
+    $("#bill-valuation-meter").value = job.completed_days;
+    setText("#bill-valuation-count", `${job.completed_days} / ${job.total_days} 天 · 新增 ${job.rates_loaded} 组报价 · 缺少 ${job.rates_missing} 组${job.error ? ` · ${valuationErrors[job.error] || "估值证据未通过校验"}` : ""}`);
+  }
+  updateBillHistoryAvailability();
+  scheduleBillValuationPoll();
+  if (job && previous && (job.completed_days !== previous.completed_days || job.state !== previous.state)
+      && billHistoryState.report && !billHistoryRangeChanged() && $("#bill-history").open
+      && document.body.dataset.view === "performance") loadBillHistory();
+}
+
+function scheduleBillValuationPoll() {
+  clearTimeout(billHistoryState.valuationTimer);
+  billHistoryState.valuationTimer = null;
+  if (state.token && state.privateFeedState !== "open" && $("#bill-history").open
+      && document.body.dataset.view === "performance" && ["queued", "running"].includes(billHistoryState.valuationJob?.state)) {
+    billHistoryState.valuationTimer = setTimeout(loadBillValuationJob, 1500);
+  }
+}
+
+async function loadBillValuationJob() {
+  if (!state.token) return;
+  const token = state.token, request = ++billHistoryState.valuationRequest;
+  try {
+    const payload = await api("/api/v1/account/bills/valuation");
+    if (token === state.token && request === billHistoryState.valuationRequest) renderBillValuationJob(payload.job);
+  } catch (error) {
+    if (token === state.token && request === billHistoryState.valuationRequest && !handleBillHistoryUnauthorized(error)) {
+      setState("#bill-valuation-message", "估值任务读取失败，保留上次状态", "warning");
+    }
+  } finally {
+    scheduleBillValuationPoll();
+  }
+}
+
+async function changeBillValuation(cancel = false) {
+  if (!state.token || billHistoryState.valuationBusy || $(cancel ? "#cancel-bill-valuation" : "#value-bill-history").disabled) return;
+  const token = state.token, action = ++billHistoryState.valuationAction, updates = billHistoryState.valuationUpdates;
+  billHistoryState.valuationBusy = true;
+  setBusy("#value-bill-history", true, "提交中...");
+  updateBillHistoryAvailability();
+  try {
+    const payload = await api(`/api/v1/account/bills/valuation${cancel ? `/${billHistoryState.valuationJob.id}/cancel` : ""}`, {
+      method: "POST", ...(!cancel ? {body: JSON.stringify(billHistoryRange())} : {}),
+    });
+    if (token !== state.token || action !== billHistoryState.valuationAction) return;
+    if (!payload.job) throw new Error("估值请求缺少任务记录");
+    if (updates === billHistoryState.valuationUpdates) renderBillValuationJob(payload.job);
+  } catch (error) {
+    if (token === state.token && action === billHistoryState.valuationAction && !handleBillHistoryUnauthorized(error)) {
+      setState("#bill-valuation-message", "估值操作失败，请核对账单覆盖和任务状态", "danger");
+    }
+  } finally {
+    if (token === state.token && action === billHistoryState.valuationAction) {
+      billHistoryState.valuationBusy = false;
+      setBusy("#value-bill-history", false);
+      updateBillHistoryAvailability();
+    }
+  }
 }
 
 const archiveLabels = {
@@ -381,6 +501,8 @@ function initializeBillHistory() {
   });
   $("#bill-history-form").addEventListener("input", updateBillHistoryAvailability);
   $("#import-bill-history").addEventListener("click", startBillImport);
+  $("#value-bill-history").addEventListener("click", () => changeBillValuation());
+  $("#cancel-bill-valuation").addEventListener("click", () => changeBillValuation(true));
   $("#bill-history-previous").addEventListener("click", () => loadBillHistory({ page: billHistoryState.page - 1 }));
   $("#bill-history-next").addEventListener("click", () => {
     billHistoryState.cursors[billHistoryState.page + 1] = billHistoryState.nextCursor;
@@ -391,6 +513,7 @@ function initializeBillHistory() {
       if (!billHistoryState.report) loadBillHistory({ reset: true });
       refreshBillImport(billHistoryState.job?.id);
       loadBillArchives();
+      loadBillValuationJob();
     } else scheduleBillImportPoll();
   });
   updateBillHistoryAvailability();

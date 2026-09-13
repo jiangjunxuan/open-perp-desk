@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from .database_maintenance import recovery_marker
 from .historical_ledger import DAY_MS, combine_history_windows, day_ms
+from .historical_valuation import MINUTE_MS, required_rates, value_history
 from .strategy_engine import DEFAULT_STRATEGY_CONFIG
 
 
@@ -42,6 +43,10 @@ class BillImportBusy(RuntimeError):
 
 class BillImportLeaseLost(RuntimeError):
     """A stopped or superseded importer cannot publish more data."""
+
+
+class ValuationLeaseLost(RuntimeError):
+    """A stale worker cannot publish valuation progress."""
 
 
 class StateStore:
@@ -188,6 +193,33 @@ class StateStore:
                     error TEXT,
                     UNIQUE(account_scope, year, quarter)
                 );
+                CREATE TABLE IF NOT EXISTS historical_fx_rates (
+                    market_scope TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    candle_ms INTEGER NOT NULL,
+                    rate TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    PRIMARY KEY (market_scope, currency, candle_ms)
+                );
+                CREATE TABLE IF NOT EXISTS account_bill_valuations (
+                    id TEXT PRIMARY KEY,
+                    account_scope TEXT NOT NULL,
+                    market_scope TEXT NOT NULL,
+                    start_day TEXT NOT NULL,
+                    end_day TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    total_days INTEGER NOT NULL,
+                    completed_days INTEGER NOT NULL DEFAULT 0,
+                    rates_loaded INTEGER NOT NULL DEFAULT 0,
+                    rates_missing INTEGER NOT NULL DEFAULT 0,
+                    lease_owner TEXT,
+                    lease_until_ms INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_bill_valuation
+                    ON account_bill_valuations(account_scope) WHERE state IN ('queued', 'running');
                 CREATE TABLE IF NOT EXISTS positions (
                     position_key TEXT PRIMARY KEY,
                     inst_id TEXT NOT NULL,
@@ -876,6 +908,7 @@ class StateStore:
     def bill_history(
         self, scope: str, days: list[date], *, limit: int = 100,
         before_ts: int | None = None, before_id: str | None = None,
+        rate_scope: str | None = None,
     ) -> dict[str, Any]:
         begin, end = day_ms(days[0]), day_ms(days[-1]) + DAY_MS
         clause = "account_scope = ? AND timestamp_ms >= ? AND timestamp_ms < ?"
@@ -898,7 +931,30 @@ class StateStore:
                    WHERE account_scope = ? AND day_utc >= ? AND day_utc <= ? ORDER BY day_utc""",
                 (scope, days[0].isoformat(), days[-1].isoformat()),
             ).fetchall()
+            valuation = None
+            if rate_scope is not None:
+                if total > 100_000:
+                    valuation = {"status": "range_too_large", "usd": None, "net_return": None}
+                else:
+                    valuation_records = [
+                        json.loads(row["record_json"]) for row in connection.execute(
+                            f"SELECT record_json FROM account_bill_history WHERE {clause}", params,
+                        )
+                    ]
+                    rates = {}
+                    for key in required_rates(valuation_records):
+                        rate = connection.execute(
+                            """SELECT rate FROM historical_fx_rates
+                               WHERE market_scope = ? AND currency = ? AND candle_ms = ?""", (rate_scope, *key),
+                        ).fetchone()
+                        if rate is not None:
+                            rates[key] = rate["rate"]
+                    valuation = value_history(valuation_records, days, {row["day_utc"] for row in windows}, rates)
         data = [json.loads(row["record_json"]) for row in rows[:limit]]
+        if valuation is not None:
+            valued_rows = valuation.pop("rows", {})
+            for record in data:
+                record["historical_valuation"] = valued_rows.get(record["bill_id"])
         covered = {row["day_utc"] for row in windows}
         missing = [day.isoformat() for day in days if day.isoformat() not in covered]
         return {
@@ -910,7 +966,181 @@ class StateStore:
                 "missing_days": missing, "last_imported_at": max((row["captured_at"] for row in windows), default=None),
             },
             "summary": combine_history_windows([json.loads(row["summary_json"]) for row in windows]),
+            **({"valuation": valuation} if valuation is not None else {}),
         }
+
+    @staticmethod
+    def _valuation_job(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {key: row[key] for key in row.keys() if key not in {
+            "account_scope", "market_scope", "lease_owner", "lease_until_ms",
+        }}
+
+    def create_bill_valuation(self, scope: str, market_scope: str, days: list[date]) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                "SELECT * FROM account_bill_valuations WHERE account_scope = ? AND state IN ('queued', 'running')", (scope,),
+            ).fetchone()
+            if active:
+                if (active["start_day"], active["end_day"], active["market_scope"]) == (
+                    days[0].isoformat(), days[-1].isoformat(), market_scope,
+                ):
+                    return self._valuation_job(active)
+                raise BillImportBusy("valuation_already_running")
+            covered = connection.execute(
+                """SELECT COUNT(*) FROM account_bill_history_windows
+                   WHERE account_scope = ? AND day_utc >= ? AND day_utc <= ?""",
+                (scope, days[0].isoformat(), days[-1].isoformat()),
+            ).fetchone()[0]
+            if covered != len(days):
+                raise ValueError("valuation_history_incomplete")
+            job_id, now = uuid4().hex, _utc_now()
+            connection.execute(
+                """INSERT INTO account_bill_valuations
+                   (id, account_scope, market_scope, start_day, end_day, state, total_days, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)""",
+                (job_id, scope, market_scope, days[0].isoformat(), days[-1].isoformat(), len(days), now, now),
+            )
+            return self._valuation_job(connection.execute("SELECT * FROM account_bill_valuations WHERE id = ?", (job_id,)).fetchone())
+
+    def bill_valuation(self, scope: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            return self._valuation_job(connection.execute(
+                "SELECT * FROM account_bill_valuations WHERE account_scope = ? ORDER BY created_at DESC, rowid DESC LIMIT 1", (scope,),
+            ).fetchone())
+
+    def claim_bill_valuation(self, scope: str, market_scope: str, owner: str, now_ms: int) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT * FROM account_bill_valuations WHERE account_scope = ? AND market_scope = ?
+                   AND (state = 'queued' OR (state = 'running' AND lease_until_ms <= ?))
+                   ORDER BY created_at LIMIT 1""", (scope, market_scope, now_ms),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """UPDATE account_bill_valuations SET state = 'running', lease_owner = ?,
+                   lease_until_ms = ?, updated_at = ? WHERE id = ?""", (owner, now_ms + 30_000, _utc_now(), row["id"]),
+            )
+            return {**self._valuation_job(row), "state": "running"}
+
+    @staticmethod
+    def _owned_valuation(connection, job_id: str, scope: str, owner: str, now_ms: int):
+        row = connection.execute(
+            """SELECT * FROM account_bill_valuations WHERE id = ? AND account_scope = ?
+               AND state = 'running' AND lease_owner = ? AND lease_until_ms > ?""",
+            (job_id, scope, owner, now_ms),
+        ).fetchone()
+        if row is None:
+            raise ValuationLeaseLost("valuation_lease_lost")
+        return row
+
+    def touch_bill_valuation(self, job_id: str, scope: str, owner: str, now_ms: int) -> None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._owned_valuation(connection, job_id, scope, owner, now_ms)
+            connection.execute(
+                "UPDATE account_bill_valuations SET lease_until_ms = ? WHERE id = ?", (now_ms + 30_000, job_id),
+            )
+
+    def valuation_day(self, scope: str, day: date) -> tuple[list[dict[str, Any]], str]:
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            window = connection.execute(
+                "SELECT captured_at FROM account_bill_history_windows WHERE account_scope = ? AND day_utc = ?",
+                (scope, day.isoformat()),
+            ).fetchone()
+            if window is None:
+                raise ValueError("valuation_history_incomplete")
+            rows = connection.execute(
+                """SELECT record_json FROM account_bill_history WHERE account_scope = ?
+                   AND timestamp_ms >= ? AND timestamp_ms < ? LIMIT 100001""", (scope, day_ms(day), day_ms(day) + DAY_MS),
+            ).fetchall()
+            if len(rows) > 100_000:
+                raise ValueError("valuation_day_too_large")
+            return [json.loads(row["record_json"]) for row in rows], window["captured_at"]
+
+    def historical_rate(self, market_scope: str, currency: str, candle_ms: int) -> str | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT rate FROM historical_fx_rates WHERE market_scope = ? AND currency = ? AND candle_ms = ?",
+                (market_scope, currency, candle_ms),
+            ).fetchone()
+            return row["rate"] if row else None
+
+    def save_historical_rate(
+        self, market_scope: str, currency: str, candle_ms: int, rate: str,
+        *, lease: tuple[str, str, str, int] | None = None,
+    ) -> None:
+        from .account_ledger import amount
+        from .historical_valuation import rate_key
+
+        rate_key(currency, candle_ms + MINUTE_MS)
+        if candle_ms % MINUTE_MS or amount(rate, "historical_rate") <= 0:
+            raise ValueError("historical_rate_invalid")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if lease is not None:
+                job = self._owned_valuation(connection, *lease)
+                if job["market_scope"] != market_scope:
+                    raise ValuationLeaseLost("valuation_market_changed")
+            connection.execute(
+                """INSERT INTO historical_fx_rates (market_scope, currency, candle_ms, rate, captured_at)
+                   VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""", (market_scope, currency, candle_ms, rate, _utc_now()),
+            )
+
+    def complete_valuation_day(
+        self, job_id: str, scope: str, owner: str, day: date, captured_at: str,
+        loaded: int, missing: int, now_ms: int,
+    ) -> None:
+        from datetime import timedelta
+
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            job = self._owned_valuation(connection, job_id, scope, owner, now_ms)
+            expected = date.fromisoformat(job["start_day"]) + timedelta(days=job["completed_days"])
+            window = connection.execute(
+                "SELECT captured_at FROM account_bill_history_windows WHERE account_scope = ? AND day_utc = ?",
+                (scope, day.isoformat()),
+            ).fetchone()
+            if day != expected or window is None or window["captured_at"] != captured_at:
+                raise ValueError("valuation_history_changed")
+            done = job["completed_days"] + 1 == job["total_days"]
+            state = ("partial" if job["rates_missing"] + missing else "completed") if done else "running"
+            connection.execute(
+                """UPDATE account_bill_valuations SET completed_days = completed_days + 1,
+                   rates_loaded = rates_loaded + ?, rates_missing = rates_missing + ?, state = ?,
+                   lease_until_ms = ?, updated_at = ? WHERE id = ?""",
+                (loaded, missing, state, now_ms + 30_000, _utc_now(), job_id),
+            )
+
+    def finish_bill_valuation(self, job_id: str, scope: str, owner: str, state: str, error: str | None = None) -> None:
+        if state not in {"queued", "failed"}:
+            raise ValueError("valuation_state_invalid")
+        with self._connection() as connection:
+            connection.execute(
+                """UPDATE account_bill_valuations SET state = ?, error = ?, lease_owner = NULL,
+                   lease_until_ms = 0, updated_at = ? WHERE id = ? AND account_scope = ?
+                   AND lease_owner = ? AND state = 'running'""", (state, error, _utc_now(), job_id, scope, owner),
+            )
+
+    def cancel_bill_valuation(self, job_id: str, scope: str) -> bool:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT state FROM account_bill_valuations WHERE id = ? AND account_scope = ?", (job_id, scope),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["state"] in {"queued", "running"}:
+                connection.execute(
+                    """UPDATE account_bill_valuations SET state = 'canceled', lease_owner = NULL,
+                       lease_until_ms = 0, updated_at = ? WHERE id = ?""", (_utc_now(), job_id),
+                )
+            return True
 
     def pnl_summary(self, limit: int = 500) -> dict[str, Any]:
         fills = self.list_fills(limit)

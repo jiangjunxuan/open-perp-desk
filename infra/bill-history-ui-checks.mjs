@@ -166,6 +166,60 @@ async function exerciseBillHistory() {
     await changeBillArchive("retry", archive);
     checks.archiveRetryKeepsQuarter = JSON.parse(calls.at(-1).options.body).retry === true
       && JSON.parse(calls.at(-1).options.body).year === 2024;
+    const valued = {
+      ...report, coverage: { ...report.coverage, complete: true, completed_days: 7 },
+      valuation: {
+        status: "valued", missing_rate_count: 0, unclassified_rows: 0,
+        usd: { realized_pnl: "9.8", fees: "-0.098", funding: "-0.98", adjustments: "0", net_pnl: "8.722", cash_flow: "490" },
+        net_return: null,
+      },
+    };
+    handler = async url => url.includes("/history?") ? valued : { job: null };
+    await loadBillHistory({ reset: true });
+    checks.valuationSeparatesTransfers = $("#bill-valuation-summary").textContent.includes("8.722")
+      && $("#bill-valuation-summary").textContent.includes("账户净划入490")
+      && $("#bill-history-message").textContent.includes("不计算账户总收益");
+    const valuationJob = {
+      id: "d".repeat(32), ...range, state: "queued", total_days: 7, completed_days: 0, rates_loaded: 0, rates_missing: 0,
+    };
+    let finishValuation;
+    handler = url => url.includes("/history?") ? Promise.resolve(valued)
+      : new Promise(resolve => { finishValuation = resolve; });
+    const beforeValuation = calls.filter(call => call.options?.method === "POST").length;
+    const startingValuation = changeBillValuation();
+    await changeBillValuation();
+    checks.duplicateValuationBlocked = calls.filter(call => call.options?.method === "POST").length === beforeValuation + 1;
+    applyPrivateEvent("bill_valuation", { job: { ...valuationJob, state: "running", completed_days: 2, rates_loaded: 4 } });
+    finishValuation({ job: valuationJob });
+    await startingValuation;
+    checks.valuationPushWins = billHistoryState.valuationJob.state === "running"
+      && $("#bill-valuation-meter").value === 2 && !billHistoryState.valuationBusy
+      && !$("#value-bill-history").hasAttribute("aria-busy");
+    const beforeQuery = calls.filter(call => call.url.includes("/history?")).length;
+    $("#bill-history-start").value = range.end_day;
+    applyPrivateEvent("bill_valuation", { job: { ...valuationJob, state: "running", completed_days: 3 } });
+    checks.valuationPreservesDraftRange = $("#bill-history-start").value === range.end_day
+      && calls.filter(call => call.url.includes("/history?")).length === beforeQuery;
+    $("#bill-history-start").value = range.start_day;
+    handler = async url => url.includes("/history?") ? valued : { job: { ...valuationJob, state: "canceled" } };
+    await changeBillValuation(true);
+    checks.valuationCancelExplicit = calls.some(call => call.options?.method === "POST"
+      && call.url.endsWith(`/valuation/${valuationJob.id}/cancel`))
+      && billHistoryState.valuationJob.state === "canceled";
+    renderBillValuation({ status: "incomplete", missing_rate_count: 3, unclassified_rows: 1 });
+    checks.valuationIncompleteHidesTotals = !$("#bill-valuation-summary").textContent.includes("8.722")
+      && $("#bill-valuation-message").textContent.includes("缺少 3 组报价");
+    let lateValuation;
+    handler = () => new Promise(resolve => { lateValuation = resolve; });
+    const loadingValuation = loadBillValuationJob();
+    state.token = "";
+    updatePrivateActionAvailability();
+    lateValuation({ job: valuationJob });
+    await loadingValuation;
+    checks.valuationRevocationClears = billHistoryState.valuationJob === null
+      && $("#bill-valuation-summary").children.length === 0 && $("#bill-valuation-progress").hidden;
+    state.token = "local-bill-history-fixture";
+    updatePrivateActionAvailability();
     let finishArchives;
     handler = () => new Promise(resolve => { finishArchives = resolve; });
     const pendingArchives = loadBillArchives();
@@ -180,9 +234,11 @@ async function exerciseBillHistory() {
     handler = async () => report;
     await loadBillHistory({ reset: true });
     renderBillArchives([{ ...archive, state: "waiting" }, { ...archive, id: "c".repeat(32), year: 2023, state: "failed", error: "archive_bill_outside_quarter" }]);
+    renderBillValuation(valued.valuation);
+    renderBillValuationJob({ ...valuationJob, state: "completed", completed_days: 7, rates_loaded: 38 });
     checks.onlyImportPosts = calls.filter(call => call.options?.method === "POST")
-      .every(call => /^\/api\/v1\/account\/bills\/(imports|archives)/.test(call.url));
-    setState("#bill-history-message", "界面回归样本（非真实账单） · 未作历史汇率估值", "neutral");
+      .every(call => /^\/api\/v1\/account\/bills\/(imports|archives|valuation)/.test(call.url));
+    setState("#bill-history-message", "界面回归样本（非真实账单） · 原币种账本与历史 USD 估值", "neutral");
     renderBillImport({ ...job, status: "failed", completed_days: 1 });
     return checks;
   } catch (error) {

@@ -34,6 +34,7 @@ class ExchangeServer:
         self.bills = []
         self.archive_bills = []
         self.archive_fail_after = False
+        self.index_rates = {"USDT-USD": "0.98", "BTC-USD": "50000", "ETH-USD": "2000"}
         self.position = None
         self.posts = []
         self.gets = []
@@ -132,6 +133,10 @@ class ExchangeServer:
             return [self.ticker()]
         if path == "/api/v5/market/candles":
             return self.candles[:int(query.get("limit", ["100"])[0])]
+        if path == "/api/v5/market/history-index-candles":
+            rate = self.index_rates.get(query.get("instId", [""])[0])
+            timestamp = int(query["after"][0]) - 60000
+            return [[str(timestamp), rate, rate, rate, rate, "1"]] if rate else []
         if path == "/api/v5/public/funding-rate":
             return [{"instId": SYMBOL, "fundingRate": ".0001"}]
         if path == "/api/v5/public/open-interest":
