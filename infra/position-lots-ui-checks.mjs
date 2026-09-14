@@ -49,9 +49,17 @@ function exercisePositionLots() {
     row.lot_allocation.lots[0].handoff.status = "native_pending";
     renderPositions([row]);
     checks.nativeGenerationPendingVisible = $("#positions-body").textContent.includes("原生保护生成待核对");
+    row.lot_allocation.lots[0].handoff.status = "native_cancel_pending";
+    renderPositions([row]);
+    checks.nativeCancellationPendingVisible = $("#positions-body").textContent.includes("原生余单撤销待确认");
     checks.protectedQuantityVisible = [...$("#positions-body").querySelectorAll("dl > div")].some(
       item => item.querySelector("dt").textContent === "原生保护" && item.querySelector("dd").textContent === "2 张",
     );
+    row.lot_allocation.lots[1].protection = {
+      state: "partially_effective", triggered: true, size: null, stop_loss: null, take_profit: null,
+    };
+    renderPositions([row]);
+    checks.partialNativeTriggerVisible = $("#positions-body").textContent.includes("原生保护部分触发");
     checks.executionRemainsOff = $("#positions-body").textContent.includes("分单本地执行：未启用");
     const paused = state.marketPaused;
     state.marketPaused = true;

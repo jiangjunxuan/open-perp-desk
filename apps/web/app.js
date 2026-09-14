@@ -1253,6 +1253,7 @@ const positionLotReasons = {
 
 const handoffStates = {
   opening_cancel_pending: "开仓余单撤销待确认", native_pending: "原生保护生成待核对",
+  native_cancel_pending: "原生余单撤销待确认",
   cancel_pending: "原生撤单待确认", ready: "本地接管待执行", closing: "分单平仓中",
   native_executing: "原生平仓核对中", review: "接管需人工核对",
 };
@@ -1286,6 +1287,7 @@ function renderPositionLots(row) {
     native_matched: "原生数量匹配", native_size_mismatch: "原生数量待调整",
     native_unverified: "原生保护待核对", external_entry: "外部开仓",
     canceled: "原生保护已撤销", effective: "原生保护已触发",
+    partially_effective: "原生保护部分触发",
     order_failed: "原生保护失败", pause: "原生保护已暂停",
   };
   const executionLabel = lotExecutionLabel(state.status);

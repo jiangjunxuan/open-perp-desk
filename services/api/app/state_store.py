@@ -310,6 +310,7 @@ class StateStore:
                     lot_id TEXT NOT NULL,
                     evidence_json TEXT NOT NULL,
                     native_evidence_json TEXT,
+                    native_settlement_json TEXT,
                     reason TEXT NOT NULL,
                     trigger_price REAL,
                     status TEXT NOT NULL DEFAULT 'cancel_pending',
@@ -380,6 +381,8 @@ class StateStore:
                 connection.execute("ALTER TABLE protection_handoffs ADD COLUMN trigger_price REAL")
             if "native_evidence_json" not in handoff_columns:
                 connection.execute("ALTER TABLE protection_handoffs ADD COLUMN native_evidence_json TEXT")
+            if "native_settlement_json" not in handoff_columns:
+                connection.execute("ALTER TABLE protection_handoffs ADD COLUMN native_settlement_json TEXT")
             if "risk_notional" not in order_columns:
                 connection.execute("ALTER TABLE orders ADD COLUMN risk_notional REAL")
             if "account_scope" not in order_columns:
@@ -615,6 +618,8 @@ class StateStore:
                     expected_context = {
                         **close_evidence, "kind": "handoff", "handoff_id": handoff["handoff_id"],
                         "lot_id": handoff["lot_id"], "close_sequence": handoff["close_sequence"] + 1,
+                        **({"native_settlement": json.loads(handoff["native_settlement_json"])}
+                           if handoff["native_settlement_json"] else {}),
                     }
                     if (
                         allocation.get("status") != "verified" or allocation.get("policy_version") != LOT_RECONSTRUCTION_VERSION
@@ -707,6 +712,24 @@ class StateStore:
                    WHERE handoff_id = ? AND version = ? AND native_evidence_json IS NULL
                    AND close_sequence = 0 AND status IN ('opening_cancel_pending', 'native_pending', 'ready')""",
                 (json.dumps(proof, sort_keys=True, allow_nan=False), _utc_now(), handoff["handoff_id"], handoff["version"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                "SELECT * FROM protection_handoffs WHERE handoff_id = ?", (handoff["handoff_id"],),
+            ).fetchone()
+        return dict(row)
+
+    def settle_handoff_native(self, handoff: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any] | None:
+        proof = json.loads(handoff["native_evidence_json"] or handoff["evidence_json"])
+        if proof["kind"] != "native" or evidence.get("algo_id") != proof["algo_id"] or evidence.get("state") not in {"effective", "canceled"}:
+            raise ValueError("handoff_native_settlement_invalid")
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """UPDATE protection_handoffs SET native_settlement_json = ?, version = version + 1,
+                   last_error = NULL, updated_at = ? WHERE handoff_id = ? AND version = ?
+                   AND native_settlement_json IS NULL AND close_sequence = 0 AND status = 'native_executing'""",
+                (json.dumps(evidence, sort_keys=True, allow_nan=False), _utc_now(), handoff["handoff_id"], handoff["version"]),
             )
             if cursor.rowcount != 1:
                 return None

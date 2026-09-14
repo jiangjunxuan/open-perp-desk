@@ -182,3 +182,23 @@ def attached_parent_evidence(
         return proof
     except (ValueError, TypeError, InvalidOperation):
         return None
+
+
+def triggered_protection_evidence(
+    opening: dict[str, Any], current: dict[str, Any], *, position_size: float,
+) -> dict[str, Any] | None:
+    children = current.get("ordIdList")
+    if (
+        current.get("state") not in {"effective", "partially_effective", "canceled"}
+        or not isinstance(children, list) or not children
+        or any(not isinstance(item, str) or not item.isascii() or not item.isalnum() for item in children)
+        or len(set(children)) != len(children)
+        or current.get("ordId") not in (None, "", *children)
+        or current.get("subAlgoIdList") not in (None, [])
+        or current.get("advanceOrdType") not in (None, "")
+    ):
+        return None
+    return protection_evidence(
+        opening, {**current, "state": "live", "actualSz": "0"},
+        native=True, position_size=position_size,
+    )

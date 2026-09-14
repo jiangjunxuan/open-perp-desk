@@ -396,7 +396,7 @@ class PositionLotTests(unittest.IsolatedAsyncioTestCase):
         await self.reconcile(1)
         protection = positions_with_lots(self.store)[0]["lot_allocation"]["lots"][0]["protection"]
         self.assertEqual(protection, {
-            "state": "canceled", "size": None, "stop_loss": None, "take_profit": None,
+            "state": "canceled", "size": None, "triggered": False, "stop_loss": None, "take_profit": None,
         })
 
     async def test_private_stream_pushes_lot_updates_without_exchange_requests(self):

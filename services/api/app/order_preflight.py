@@ -10,7 +10,7 @@ from .account_ledger import AccountLedgerError, parse_daily_bills, value_daily_r
 from .okx_market import OkxMarketClient
 from .state_store import StateStore
 from .position_protection import attached_parent_evidence, protection_evidence
-from .protection_handoff import HandoffError, close_context, effective_evidence, native_evidence, verified_lot
+from .protection_handoff import HandoffError, close_context, effective_evidence, native_evidence, native_execution_evidence, verified_lot
 from .trading_signal import TradeSignal
 
 
@@ -348,8 +348,27 @@ class OrderPreflight:
                             or self.store.get_order(proof["algo_client_id"])
                         ):
                             raise PreflightError("close_handoff_absence_unverified")
+                    elif handoff.get("native_settlement_json"):
+                        try:
+                            settlement, _ = await native_execution_evidence(self.account, opening, native_row, proof)
+                        except HandoffError as exc:
+                            raise PreflightError(str(exc)) from exc
+                        if settlement != json.loads(handoff["native_settlement_json"]):
+                            raise PreflightError("close_handoff_settlement_changed")
                     elif not native_evidence(opening, native_row, proof, canceled=True):
                         raise PreflightError("close_handoff_cancellation_unverified")
+                    current = expected_protection
+                elif expected_protection.get("native_triggered") is True and expected_protection.get("lot_id"):
+                    proof = {key: value for key, value in expected_protection.items() if key not in {"native_triggered", "lot_id"}}
+                    try:
+                        native_row = await self.account.algo_order_details(
+                            signal.inst_id, algo_id=proof["algo_id"], client_order_id=proof["algo_client_id"],
+                        )
+                        await native_execution_evidence(self.account, opening, native_row, proof, require_terminal=False)
+                    except HandoffError as exc:
+                        raise PreflightError(str(exc)) from exc
+                    except Exception as exc:
+                        raise PreflightError("close_native_execution_unavailable") from exc
                     current = expected_protection
                 elif expected_protection.get("kind") == "attached" and expected_protection.get("lot_id"):
                     try:

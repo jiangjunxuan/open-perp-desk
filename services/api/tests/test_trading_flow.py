@@ -362,3 +362,55 @@ class TradingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("保护性平仓触发" in row["title"] for row in self.exchange.notifications))
         self.assertFalse((await self.api.request("GET", "/execution/status"))["live_execution_allowed"])
         self.assertEqual(self.exchange.errors, [])
+
+    async def test_worker_native_partial_trigger_remainder_and_restart(self):
+        payload = {**await self.signal_payload(), "size": 4}
+        submitted = await self.api.request("POST", "/execution/signals", payload)
+        self.assertTrue(submitted["accepted"], submitted)
+        self.exchange.fill(submitted["order"]["exchange_order_id"])
+        algo_id = next(iter(self.exchange.algos))
+        recovered_mark = self.exchange.price
+        self.exchange.trigger_protection(
+            algo_id, filled=1, child_state="canceled", state="partially_effective",
+        )
+        self.exchange.mark_price = recovered_mark
+        await self.synchronize()
+        lot = (await self.api.request("GET", "/positions"))["data"][0]["lot_allocation"]["lots"][0]
+        self.assertEqual(lot["protection"]["state"], "partially_effective")
+        self.assertTrue(lot["protection"]["triggered"])
+        self.assertEqual(float(lot["remaining_size"]), 3)
+        await self.api.request("PUT", "/strategies/structured-technical", {
+            "name": "Native settlement acceptance", "enabled": True, "config": {},
+        })
+
+        async def run_cycle():
+            count = (await self.api.request("GET", "/worker/status"))["run_count"]
+            await self.api.request("POST", "/worker/control", {"enabled": True, "dry_run": False})
+            async def completed():
+                return (await self.api.request("GET", "/worker/status"))["run_count"] > count
+            await eventually(completed)
+            await self.api.request("POST", "/worker/control", {"enabled": False})
+
+        # The mark has recovered; the native execution evidence still requires settlement.
+        await run_cycle()
+        self.assertEqual(len(self.exchange.order_submissions), 2)
+        close = self.exchange.order_submissions[-1]
+        self.assertTrue(close["reduceOnly"])
+        self.assertEqual(close["side"], "sell")
+        self.assertEqual(float(close["sz"]), 3)
+        self.assertEqual(self.exchange.algos[algo_id]["state"], "canceled")
+        self.assertEqual((await self.api.request("GET", "/protection/handoffs"))["data"][0]["status"], "closing")
+        await self.api.stop()
+        await self.api.start()
+        await run_cycle()
+        self.assertEqual(len(self.exchange.order_submissions), 2, "An unresolved close must not be resubmitted")
+        close_id = next(key for key, row in self.exchange.orders.items() if row.get("clOrdId") == close["clOrdId"])
+        self.exchange.fill(close_id)
+        await self.synchronize()
+        await run_cycle()
+        self.assertEqual((await self.api.request("GET", "/positions"))["data"], [])
+        self.assertEqual((await self.api.request("GET", "/protection/handoffs"))["data"], [])
+        self.assertEqual(len(self.exchange.order_submissions), 2)
+        self.assertTrue(any("保护性平仓触发" in row["title"] for row in self.exchange.notifications))
+        self.assertFalse((await self.api.request("GET", "/execution/status"))["live_execution_allowed"])
+        self.assertEqual(self.exchange.errors, [])

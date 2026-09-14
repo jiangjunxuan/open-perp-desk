@@ -186,7 +186,7 @@ class ExchangeServer:
             return rows[:int(query.get("limit", ["100"])[0])]
         if path == "/api/v5/trade/orders-algo-pending":
             types = query.get("ordType", [""])[0].split(",")
-            return [algo for algo in self.algos.values() if algo["state"] == "live" and algo["ordType"] in types]
+            return [algo for algo in self.algos.values() if algo["state"] in {"live", "partially_effective"} and algo["ordType"] in types]
         if path == "/api/v5/trade/orders-algo-history":
             return [] if self.hide_algo_history else [
                 algo for algo in self.algos.values() if algo["state"] == query.get("state", [""])[0]
@@ -227,6 +227,8 @@ class ExchangeServer:
             return [{"ordId": order["ordId"], "sCode": "0"}]
         if path == "/api/v5/trade/cancel-algos":
             algo = self.algos[body[0]["algoId"]]
+            if algo["state"] in {"effective", "canceled", "order_failed"}:
+                return [{"algoId": algo["algoId"], "sCode": "51400"}]
             algo.update(state="canceled", uTime=milliseconds())
             self.revision += 1
             return [{"algoId": algo["algoId"], "sCode": "0"}]
@@ -294,7 +296,7 @@ class ExchangeServer:
         with self.lock:
             self._fill(order_id, quantity=quantity)
 
-    def trigger_protection(self, algo_id):
+    def trigger_protection(self, algo_id, *, filled=None, child_state=None, state="effective"):
         with self.lock:
             algo = self.algos[algo_id]
             self.price = algo["slTriggerPx"]
@@ -302,9 +304,12 @@ class ExchangeServer:
                 "instId": SYMBOL, "side": algo["side"], "posSide": "net",
                 "tdMode": algo["tdMode"], "ordType": "market", "sz": algo["sz"], "reduceOnly": True,
             })
-            self._fill(close["ordId"])
+            if filled is None or filled > 0:
+                self._fill(close["ordId"], quantity=filled)
+            if child_state:
+                close.update(state=child_state, uTime=milliseconds())
             algo.update(
-                state="effective", actualSz=algo["sz"], actualPx=self.price,
+                state=state, actualSz=algo["sz"], actualPx=self.price, actualSide="sl",
                 uTime=milliseconds(), ordIdList=[close["ordId"]],
             )
             self.revision += 1

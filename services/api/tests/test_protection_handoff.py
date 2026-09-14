@@ -15,6 +15,7 @@ from app.okx_account import OkxAccountClient, OkxAccountError
 from app.okx_market import OkxMarketClient
 from app.okx_trade import OkxTradeClient, OkxTradeError, OrderRequest
 from app.order_preflight import OrderPreflight
+from app.position_lots import positions_with_lots
 from app.protection_handoff import ProtectionHandoff, close_context
 from app.risk_engine import RiskEngine
 from app.state_store import StateStore
@@ -48,9 +49,9 @@ class ProtectionHandoffTests(unittest.IsolatedAsyncioTestCase):
         )
         self.manager = ProtectionHandoff(self.store, self.sync, self.engine)
 
-    async def entry(self, name="entry1", size=2, stop=90, filled=None):
+    async def entry(self, name="entry1", size=2, stop=90, filled=None, side="buy", target=120):
         order = OrderRequest(
-            inst_id=SYMBOL, side="buy", sz=size, stop_loss=stop, take_profit=120, cl_ord_id=name,
+            inst_id=SYMBOL, side=side, sz=size, stop_loss=stop, take_profit=target, cl_ord_id=name,
         )
         with self.exchange.lock:
             raw = self.exchange._create_order(order.okx_payload())
@@ -535,6 +536,7 @@ class ProtectionHandoffTests(unittest.IsolatedAsyncioTestCase):
         original = self.store.protection_handoffs(self.account.account_scope)[0]
         with closing(sqlite3.connect(self.path)) as connection:
             connection.execute("ALTER TABLE protection_handoffs DROP COLUMN native_evidence_json")
+            connection.execute("ALTER TABLE protection_handoffs DROP COLUMN native_settlement_json")
             connection.commit()
         self.reopen()
         restored = self.store.protection_handoffs(self.account.account_scope)[0]
@@ -546,6 +548,203 @@ class ProtectionHandoffTests(unittest.IsolatedAsyncioTestCase):
         result = await self.run_handoff()
         self.assertTrue(result["accepted"], result)
         self.assertEqual(len(self.cancellations()), 1)
+        self.assertEqual(len(self.exchange.order_submissions), 1)
+
+    async def native_remainder(self, *, state="effective", child_state="canceled", filled=1, side="buy"):
+        await self.entry(size=4, side=side, stop=90 if side == "buy" else 120, target=120 if side == "buy" else 90)
+        algo_id = list(self.exchange.algos)[-1]
+        self.exchange.trigger_protection(algo_id, filled=filled, child_state=child_state, state=state)
+        await self.sync.sync_rest()
+        return algo_id, self.exchange.algos[algo_id]["ordIdList"][0]
+
+    async def test_native_partial_fill_closes_only_ledger_remainder_after_price_recovers(self):
+        await self.native_remainder()
+        self.assertTrue(self.manager.has_work(SYMBOL))
+        result = await self.manager.run(SYMBOL, 105, dry_run=False, market_data_fresh=True)
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(result["order"]["size"], 3)
+        context = json.loads(result["order"]["protection_context_json"])
+        self.assertEqual(context["native_settlement"]["issued_size"], "4")
+        self.assertEqual(context["native_settlement"]["filled_size"], "1")
+        self.assertEqual(len(self.cancellations()), 0)
+        self.reopen()
+        pending = await self.run_handoff()
+        self.assertEqual(pending["reasons"], ["handoff_close_unconfirmed"])
+        self.exchange.fill(result["order"]["exchange_order_id"])
+        await self.run_handoff()
+        self.assertEqual(self.store.protection_handoffs(self.account.account_scope), [])
+        self.assertEqual(len(self.exchange.order_submissions), 1)
+
+    async def test_pending_native_child_is_never_covered_by_a_second_close(self):
+        _, child_id = await self.native_remainder(child_state="partially_filled")
+        result = await self.run_handoff()
+        self.assertEqual(result["reasons"], ["handoff_native_child_pending"])
+        self.assertEqual(self.exchange.order_submissions, [])
+        with self.exchange.lock:
+            self.exchange.orders[child_id]["state"] = "canceled"
+        await self.sync.sync_rest()
+        result = await self.run_handoff()
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(result["order"]["size"], 3)
+
+    async def test_partially_effective_native_is_canceled_before_remainder_close(self):
+        algo_id, _ = await self.native_remainder(state="partially_effective")
+        result = await self.run_handoff()
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(self.exchange.algos[algo_id]["state"], "canceled")
+        self.assertEqual(result["order"]["size"], 3)
+        self.assertEqual([row["path"] for row in self.exchange.posts], [
+            "/api/v5/trade/cancel-algos", "/api/v5/trade/order",
+        ])
+        settlement = json.loads(result["order"]["protection_context_json"])["native_settlement"]
+        self.assertEqual(settlement["state"], "canceled")
+
+    async def test_partial_native_cancel_ack_does_not_prove_terminal_state(self):
+        await self.native_remainder(state="partially_effective")
+        async def accepted_only(inst_id, algo_id):
+            return {"data": [{"algoId": algo_id, "sCode": "0"}]}
+        with patch.object(self.trade, "cancel_algo_order", side_effect=accepted_only) as cancel:
+            result = await self.run_handoff()
+            self.assertEqual(result["action"], "protection_native_cancel_pending")
+            await self.run_handoff()
+            self.assertEqual(cancel.call_count, 1)
+        self.assertEqual(self.exchange.order_submissions, [])
+        handoff = self.store.protection_handoffs(self.account.account_scope)[0]
+        self.assertEqual(handoff["status"], "native_cancel_pending")
+        self.assertIsNone(handoff["native_settlement_json"])
+
+    async def test_lost_partial_native_cancel_response_is_resolved_by_query(self):
+        await self.native_remainder(state="partially_effective")
+        cancel = self.trade.cancel_algo_order
+        async def lose(*args):
+            await cancel(*args)
+            raise OkxTradeError("fixture lost native cancellation response")
+        with patch.object(self.trade, "cancel_algo_order", side_effect=lose):
+            result = await self.run_handoff()
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(len(self.cancellations()), 1)
+        self.assertEqual(len(self.exchange.order_submissions), 1)
+
+    async def test_native_child_lookup_outage_pauses_without_local_close(self):
+        _, child_id = await self.native_remainder()
+        query = self.account.order_details
+        async def outage(*args, **kwargs):
+            if kwargs.get("ord_id") == child_id:
+                raise OkxAccountError("fixture 503")
+            return await query(*args, **kwargs)
+        with patch.object(self.account, "order_details", side_effect=outage):
+            result = await self.run_handoff()
+        self.assertEqual(result["reasons"], ["handoff_native_children_unavailable"])
+        self.assertEqual(self.exchange.posts, [])
+
+    async def test_native_child_side_and_reduce_only_must_match_the_owner(self):
+        _, child_id = await self.native_remainder()
+        query = self.account.order_details
+        async def wrong_side(*args, **kwargs):
+            raw = await query(*args, **kwargs)
+            return {**raw, "side": "buy", "reduceOnly": False} if kwargs.get("ord_id") == child_id else raw
+        with patch.object(self.account, "order_details", side_effect=wrong_side):
+            result = await self.run_handoff()
+        self.assertEqual(result["reasons"], ["handoff_native_child_identity_unverified"])
+        self.assertEqual(self.exchange.posts, [])
+
+    async def test_native_issued_quantity_is_not_treated_as_filled_quantity(self):
+        algo_id, _ = await self.native_remainder()
+        self.exchange.algos[algo_id]["actualSz"] = "3"
+        result = await self.run_handoff()
+        self.assertEqual(result["reasons"], ["handoff_native_issued_quantity_unverified"])
+        self.assertEqual(self.exchange.posts, [])
+
+    async def test_changed_native_fill_after_settlement_requires_review(self):
+        _, child_id = await self.native_remainder()
+        first = await self.run_handoff()
+        self.assertTrue(first["accepted"], first)
+        self.exchange.orders[child_id]["accFillSz"] = "2"
+        result = await self.run_handoff()
+        self.assertEqual(result["reasons"], ["handoff_native_settlement_changed"])
+        self.assertEqual(len(self.exchange.order_submissions), 1)
+        self.assertEqual(self.store.protection_handoffs(self.account.account_scope)[0]["status"], "review")
+
+    async def test_native_settlement_is_rechecked_before_atomic_local_close_claim(self):
+        _, child_id = await self.native_remainder()
+        prepare = self.engine.preflight.prepare
+        async def change(*args, **kwargs):
+            if kwargs.get("expected_protection", {}).get("kind") == "handoff":
+                self.exchange.orders[child_id]["accFillSz"] = "2"
+            return await prepare(*args, **kwargs)
+        with patch.object(self.engine.preflight, "prepare", side_effect=change):
+            result = await self.run_handoff()
+        self.assertEqual(result["reasons"], ["close_handoff_settlement_changed"])
+        self.assertEqual(self.exchange.order_submissions, [])
+
+    async def test_equivalent_native_quantity_formatting_does_not_invalidate_settlement(self):
+        _, child_id = await self.native_remainder()
+        first = await self.run_handoff()
+        self.assertTrue(first["accepted"], first)
+        self.exchange.orders[child_id].update(sz="4.000", accFillSz="1.00")
+        result = await self.run_handoff()
+        self.assertEqual(result["reasons"], ["handoff_close_unconfirmed"])
+        self.assertEqual(len(self.exchange.order_submissions), 1)
+
+    async def test_native_then_local_partial_close_continues_only_remaining_lot(self):
+        await self.native_remainder()
+        first = await self.run_handoff()
+        self.assertTrue(first["accepted"], first)
+        self.exchange.fill(first["order"]["exchange_order_id"], quantity=1)
+        self.exchange.orders[first["order"]["exchange_order_id"]]["state"] = "canceled"
+        self.reopen()
+        result = await self.run_handoff()
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(result["order"]["size"], 2)
+        self.assertNotEqual(result["order"]["client_order_id"], first["order"]["client_order_id"])
+        self.assertEqual(len(self.exchange.order_submissions), 2)
+
+    async def test_native_remainder_for_net_short_uses_buy_and_positive_quantity(self):
+        await self.native_remainder(side="sell")
+        result = await self.run_handoff()
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(result["order"]["side"], "buy")
+        self.assertEqual(result["order"]["size"], 3)
+
+    async def test_zero_filled_terminal_native_child_allows_full_lot_remainder(self):
+        await self.native_remainder(filled=0)
+        result = await self.run_handoff()
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(result["order"]["size"], 4)
+        self.assertEqual(json.loads(result["order"]["protection_context_json"])["native_settlement"]["filled_size"], "0")
+
+    async def test_native_remainder_cannot_consume_a_different_opening_lot(self):
+        await self.entry(name="untouched", size=2, stop=80, target=140)
+        await self.native_remainder()
+        result = await self.run_handoff()
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(result["order"]["size"], 3)
+        self.exchange.fill(result["order"]["exchange_order_id"])
+        await self.run_handoff()
+        lot = positions_with_lots(self.store)[0]["lot_allocation"]["lots"][0]
+        self.assertEqual(lot["opening_order_id"], "untouched")
+        self.assertEqual(float(lot["remaining_size"]), 2)
+        self.assertEqual(lot["protection"]["state"], "native_matched")
+        self.assertEqual(len(self.exchange.order_submissions), 1)
+
+    async def test_disappearing_native_children_after_settlement_requires_review(self):
+        algo_id, _ = await self.native_remainder()
+        first = await self.run_handoff()
+        self.assertTrue(first["accepted"], first)
+        self.exchange.algos[algo_id].update(state="canceled", actualSz="0", ordIdList=[])
+        result = await self.run_handoff()
+        self.assertEqual(result["reasons"], ["handoff_native_settlement_changed"])
+        self.assertEqual(self.store.protection_handoffs(self.account.account_scope)[0]["status"], "review")
+        self.assertEqual(len(self.exchange.order_submissions), 1)
+
+    async def test_pending_child_after_terminal_settlement_requires_review(self):
+        _, child_id = await self.native_remainder()
+        first = await self.run_handoff()
+        self.assertTrue(first["accepted"], first)
+        self.exchange.orders[child_id]["state"] = "partially_filled"
+        result = await self.run_handoff()
+        self.assertEqual(result["reasons"], ["handoff_native_child_pending"])
+        self.assertEqual(self.store.protection_handoffs(self.account.account_scope)[0]["status"], "review")
         self.assertEqual(len(self.exchange.order_submissions), 1)
 
 

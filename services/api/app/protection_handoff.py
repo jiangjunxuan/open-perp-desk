@@ -2,12 +2,12 @@ import hashlib
 import json
 import math
 import time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .okx_account import OkxAccountError
 from .position_lots import positions_with_lots
-from .position_protection import attached_parent_evidence, protection_evidence
+from .position_protection import attached_parent_evidence, protection_evidence, triggered_protection_evidence
 from .state_store import ACTIVE_ORDER_STATUSES, ExposureSnapshotChanged
 from .trading_signal import TradeSignal
 
@@ -18,6 +18,7 @@ class HandoffError(ValueError):
 
 HANDOFF_LABELS = {
     "opening_cancel_pending": "开仓余单撤销待确认", "native_pending": "原生保护生成待核对",
+    "native_cancel_pending": "原生余单撤销待确认",
     "cancel_pending": "原生撤单待确认", "ready": "本地接管待执行", "closing": "分单平仓中",
     "native_executing": "原生平仓核对中", "review": "接管需人工核对", "complete": "接管完成",
 }
@@ -41,6 +42,8 @@ def close_context(handoff: dict[str, Any]) -> dict[str, Any]:
         **effective_evidence(handoff), "kind": "handoff",
         "handoff_id": handoff["handoff_id"], "lot_id": handoff["lot_id"],
         "close_sequence": handoff["close_sequence"] + 1,
+        **({"native_settlement": json.loads(handoff["native_settlement_json"])}
+           if handoff.get("native_settlement_json") else {}),
     }
 
 
@@ -55,6 +58,59 @@ def native_evidence(opening: dict[str, Any], raw: dict[str, Any], expected: dict
     return normalized if normalized == expected else None
 
 
+async def native_execution_evidence(account, opening, raw, expected, *, require_terminal=True):
+    normalized = triggered_protection_evidence(opening, raw, position_size=expected["size"])
+    if normalized != expected:
+        raise HandoffError("handoff_native_execution_changed")
+    if require_terminal and raw["state"] not in {"effective", "canceled"}:
+        raise HandoffError("handoff_native_execution_not_terminal")
+    children, records = [], []
+    issued = filled = Decimal(0)
+    for order_id in sorted(raw["ordIdList"]):
+        try:
+            child = await account.order_details(opening["inst_id"], ord_id=order_id)
+        except Exception:
+            raise HandoffError("handoff_native_children_unavailable") from None
+        if opening["account_scope"] != account.account_scope:
+            raise HandoffError("handoff_account_changed")
+        if child.get("state") not in {"filled", "canceled", "mmp_canceled"}:
+            raise HandoffError("handoff_native_child_pending")
+        if (
+            child.get("ordId") != order_id or child.get("ordType") != "market"
+            or child.get("side") != ("sell" if opening["side"] == "buy" else "buy")
+            or any(child.get(remote) != opening[local] for remote, local in (
+                ("instId", "inst_id"), ("posSide", "pos_side"), ("tdMode", "td_mode"),
+            )) or opening["pos_side"] == "net" and str(child.get("reduceOnly")).lower() != "true"
+        ):
+            raise HandoffError("handoff_native_child_identity_unverified")
+        try:
+            size, done = Decimal(str(child.get("sz"))), Decimal(str(child.get("accFillSz")))
+            if not size.is_finite() or not done.is_finite() or not 0 <= done <= size or size <= 0:
+                raise ValueError()
+            if child["state"] == "filled" and done != size:
+                raise ValueError()
+        except (InvalidOperation, ValueError):
+            raise HandoffError("handoff_native_child_quantity_unverified") from None
+        issued += size
+        filled += done
+        children.append({
+            "order_id": order_id, "state": child["state"],
+            "size": str(size.normalize()), "filled_size": str(done.normalize()),
+        })
+        records.append(child)
+    try:
+        actual = Decimal(str(raw.get("actualSz")))
+        if not actual.is_finite() or actual != issued or issued > Decimal(str(expected["size"])):
+            raise ValueError()
+    except (InvalidOperation, ValueError):
+        raise HandoffError("handoff_native_issued_quantity_unverified") from None
+    return {
+        "algo_id": expected["algo_id"], "state": raw["state"],
+        "actual_side": raw.get("actualSide") or "", "issued_size": str(issued.normalize()),
+        "filled_size": str(filled.normalize()), "children": children,
+    }, records
+
+
 def verified_lot(store, position, lot_id):
     allocation = store.position_lots(position)
     if not allocation or allocation["status"] != "verified":
@@ -63,7 +119,7 @@ def verified_lot(store, position, lot_id):
 
 
 class ProtectionHandoff:
-    """Cancel one linked native exit before submitting its virtual lot close."""
+    """Reconcile an entry and its native exit before closing the virtual lot."""
 
     def __init__(self, store, account_sync, execution, *, account=None) -> None:
         self.store, self.sync, self.execution = store, account_sync, execution
@@ -74,7 +130,10 @@ class ProtectionHandoff:
             return True
         return any(
             row["inst_id"] == inst_id and row["lot_allocation"]["status"] == "verified"
-            and any(lot["managed"] and lot["protection"]["state"] in {"native_matched", "native_size_mismatch", "attached_pending"}
+            and any(lot["managed"] and (
+                lot["protection"]["state"] in {"native_matched", "native_size_mismatch", "attached_pending"}
+                or lot["protection"].get("triggered")
+            )
                     for lot in row["lot_allocation"]["lots"])
             for row in positions_with_lots(self.store, account_scope=self.account.account_scope)
         )
@@ -115,6 +174,7 @@ class ProtectionHandoff:
                     continue
                 opening = self.store.get_order(lot["opening_order_id"])
                 native = self.store.get_order(lot["native_client_id"])
+                triggered = False
                 if not opening or opening["account_scope"] != position["account_scope"]:
                     continue
                 if not native or opening["status"] == "partially_filled":
@@ -129,15 +189,21 @@ class ProtectionHandoff:
                     proof = protection_evidence(opening, raw, native=True, position_size=float(lot["remaining_size"]))
                     if proof and not native_evidence(opening, raw, proof):
                         proof = None
+                    if not proof:
+                        proof = triggered_protection_evidence(opening, raw, position_size=float(lot["remaining_size"]))
+                        triggered = proof is not None
                 else:
                     proof = None
                 if not proof:
                     continue
+                if triggered:
+                    reason = {"sl": "stop_loss", "tp": "take_profit"}.get(raw.get("actualSide"), "native_trigger")
+                    return position, lot, proof, reason, True
                 stop, target = proof["stop_loss"], proof["take_profit"]
                 hit_stop = stop and (mark_price <= stop if long else mark_price >= stop)
                 hit_target = target and (mark_price >= target if long else mark_price <= target)
                 if hit_stop or hit_target:
-                    return position, lot, proof, "stop_loss" if hit_stop else "take_profit"
+                    return position, lot, proof, "stop_loss" if hit_stop else "take_profit", False
         return None
 
     @staticmethod
@@ -164,12 +230,14 @@ class ProtectionHandoff:
             candidate = self._candidate(inst_id, mark_price)
             if candidate is None:
                 return None
-            position, lot, proof, reason = candidate
+            position, lot, proof, reason, triggered = candidate
             identity = "\n".join((position["account_scope"], lot["lot_id"], proof["algo_id"] or proof["algo_client_id"]))
             handoff_id = hashlib.sha256(identity.encode()).hexdigest()[:32]
             signal = self._signal({"inst_id": inst_id, "reason": reason})
             quantity = float(lot["remaining_size"])
             context = {**proof, "lot_id": lot["lot_id"]}
+            if triggered:
+                context["native_triggered"] = True
             if dry_run:
                 result = await self.execution.submit_signal(
                     signal, account_equity=0, daily_pnl_pct=0, size=quantity,
@@ -349,27 +417,72 @@ class ProtectionHandoff:
                 handoff = await self._transition(handoff, last_error=error)
                 return await self._advance(handoff, market_data_fresh=market_data_fresh, allow_cancel=False)
             return {"inst_id": handoff["inst_id"], "action": "protection_cancel_pending", "accepted": False}
-        if raw.get("state") in {"effective", "partially_effective"}:
-            if handoff["status"] != "native_executing":
-                handoff = await self._transition(handoff, status="native_executing")
-            children = raw.get("ordIdList")
-            if not isinstance(children, list) or not children:
-                raise HandoffError("handoff_native_children_unverified")
-            for child_id in children:
-                child = await self.account.order_details(handoff["inst_id"], ord_id=child_id)
-                self.sync._save_regular_order(child, source="okx-handoff-history")
-                if child.get("state") not in {"filled", "canceled", "mmp_canceled"}:
-                    raise HandoffError("handoff_native_child_pending")
-            await self._refresh()
-            _, lot = self._remaining(handoff)
-            if lot is None:
-                await self._transition(handoff, status="complete", last_error=None)
-                return {"inst_id": handoff["inst_id"], "action": "protection_native_completed", "accepted": True}
-            raise HandoffError("handoff_native_remaining_requires_review")
+        if raw.get("state") in {"effective", "partially_effective"} or (
+            raw.get("state") == "canceled" and raw.get("ordIdList")
+        ):
+            return await self._settle_native(handoff, opening, raw, proof, market_data_fresh, allow_cancel)
+        if handoff.get("native_settlement_json"):
+            await self._transition(handoff, status="review", last_error="handoff_native_settlement_changed")
+            raise HandoffError("handoff_native_settlement_changed")
         if not native_evidence(opening, raw, proof, canceled=True):
             await self._transition(handoff, status="review", last_error="handoff_cancellation_unverified")
             raise HandoffError("handoff_cancellation_unverified")
         return await self._close(handoff, market_data_fresh=market_data_fresh)
+
+    async def _settle_native(self, handoff, opening, raw, proof, market_data_fresh, allow_cancel):
+        try:
+            evidence, records = await native_execution_evidence(
+                self.account, opening, raw, proof, require_terminal=False,
+            )
+        except HandoffError as exc:
+            if handoff.get("native_settlement_json") and str(exc) not in {
+                "handoff_native_children_unavailable", "handoff_account_changed",
+            }:
+                await self._transition(handoff, status="review", last_error=str(exc))
+            raise
+        self._enabled(handoff["account_scope"])
+        for child in records:
+            self.sync._save_regular_order(child, source="okx-handoff-history")
+        if raw["state"] == "partially_effective":
+            if handoff["close_sequence"] or handoff.get("native_settlement_json"):
+                await self._transition(handoff, status="review", last_error="handoff_native_reactivated")
+                raise HandoffError("handoff_native_reactivated")
+            if handoff["status"] != "native_cancel_pending":
+                handoff = await self._transition(handoff, status="native_cancel_pending")
+            now = int(time.time() * 1000)
+            if allow_cancel and now >= handoff["cancel_after_ms"]:
+                if not market_data_fresh:
+                    raise HandoffError("handoff_market_data_stale")
+                handoff = await self._transition(
+                    handoff, cancel_attempts=handoff["cancel_attempts"] + 1, cancel_after_ms=now + 30000,
+                )
+                self._enabled(handoff["account_scope"])
+                error = None
+                try:
+                    response = await self.execution.trade_client.cancel_algo_order(handoff["inst_id"], proof["algo_id"])
+                    rows = response.get("data", [])
+                    if len(rows) != 1 or rows[0].get("algoId") != proof["algo_id"] or str(rows[0].get("sCode")) != "0":
+                        error = "handoff_cancel_ack_unverified"
+                except Exception:
+                    error = "handoff_cancel_outcome_unknown"
+                handoff = await self._transition(handoff, last_error=error)
+                return await self._advance(handoff, market_data_fresh=market_data_fresh, allow_cancel=False)
+            return {"inst_id": handoff["inst_id"], "action": "protection_native_cancel_pending", "accepted": False}
+        if handoff.get("native_settlement_json"):
+            if json.loads(handoff["native_settlement_json"]) != evidence:
+                await self._transition(handoff, status="review", last_error="handoff_native_settlement_changed")
+                raise HandoffError("handoff_native_settlement_changed")
+        else:
+            if handoff["status"] != "native_executing":
+                handoff = await self._transition(handoff, status="native_executing")
+            saved = self.store.settle_handoff_native(handoff, evidence)
+            if not saved:
+                raise HandoffError("handoff_changed")
+            handoff = saved
+        result = await self._close(handoff, market_data_fresh=market_data_fresh)
+        if result["action"] == "protection_handoff_complete" and not handoff["close_order_id"]:
+            result["action"] = "protection_native_completed"
+        return result
 
     async def _close(self, handoff, *, market_data_fresh):
         await self._refresh()
@@ -397,7 +510,7 @@ class ProtectionHandoff:
         except Exception:
             raise HandoffError("handoff_close_outcome_requires_reconciliation") from None
         if result.get("accepted") and not result.get("idempotent"):
-            reason_label = "止损" if handoff["reason"] == "stop_loss" else "止盈"
+            reason_label = {"stop_loss": "止损", "take_profit": "止盈"}.get(handoff["reason"], "原生保护")
             await self.execution.notify_event(
                 "protective_exit_triggered", "OpenPerpDesk 保护性平仓触发",
                 f"{handoff['inst_id']} {reason_label}已触发，标记价格 {handoff['trigger_price']}。"

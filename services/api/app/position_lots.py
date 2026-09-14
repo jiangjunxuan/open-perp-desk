@@ -190,7 +190,7 @@ class PositionLotReconciler:
         if len(native) > 1:
             raise PositionLotError("lot_native_owner_ambiguous")
         for parent in native:
-            if parent["status"] not in {"effective", "partially_effective"}:
+            if parent["status"] not in {"effective", "partially_effective", "canceled"}:
                 raise PositionLotError("lot_native_execution_unconfirmed")
             matching = [lot for lot in lots if lot["native_client_id"] == parent["client_order_id"]]
             if len(matching) != 1:
@@ -287,6 +287,7 @@ def positions_with_lots(store: StateStore, *, account_scope: str | None = None) 
                 key: handoff[key] for key in ("handoff_id", "status", "last_error", "close_sequence")
             } if handoff else None
             protection = None
+            triggered = False
             state = "external_entry" if not lot["managed"] else "native_unverified"
             opening = store.get_order(lot["opening_order_id"])
             native = store.get_order(lot["native_client_id"]) if lot["native_client_id"] else None
@@ -299,13 +300,14 @@ def positions_with_lots(store: StateStore, *, account_scope: str | None = None) 
             if opening and native and native["account_scope"] == position["account_scope"] and native["order_kind"] == "algo":
                 try:
                     raw = json.loads(native["raw_json"])
+                    triggered = native["status"] in {"effective", "partially_effective", "canceled"} and bool(raw.get("ordIdList"))
                     if raw.get("state") == native["status"] and raw.get("algoId") == native["exchange_order_id"]:
                         if native["status"] == "live":
                             covered_size = min(_decimal(raw.get("sz"), positive=True), _decimal(lot["remaining_size"], positive=True))
                             protection = protection_evidence(
                                 opening, raw, native=True, position_size=float(covered_size),
                             )
-                        elif native["status"] in {"canceled", "effective", "order_failed", "pause"}:
+                        elif native["status"] in {"canceled", "effective", "partially_effective", "order_failed", "pause"}:
                             state = native["status"]
                     if protection:
                         state = "native_matched" if _decimal(protection["size"]) == _decimal(lot["remaining_size"]) else "native_size_mismatch"
@@ -313,6 +315,7 @@ def positions_with_lots(store: StateStore, *, account_scope: str | None = None) 
                     protection = None
             lot["protection"] = {
                 "state": state, "size": protection["size"] if protection and state != "attached_pending" else None,
+                "triggered": triggered,
                 "stop_loss": protection["stop_loss"] if protection else None,
                 "take_profit": protection["take_profit"] if protection else None,
             }
