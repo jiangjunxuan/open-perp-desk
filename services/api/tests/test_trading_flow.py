@@ -363,6 +363,46 @@ class TradingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((await self.api.request("GET", "/execution/status"))["live_execution_allowed"])
         self.assertEqual(self.exchange.errors, [])
 
+    async def test_worker_amends_native_protection_after_manual_partial_close(self):
+        payload = {**await self.signal_payload(), "size": 4}
+        submitted = await self.api.request("POST", "/execution/signals", payload)
+        self.assertTrue(submitted["accepted"], submitted)
+        self.exchange.fill(submitted["order"]["exchange_order_id"])
+        await self.synchronize()
+        attached = self.exchange.order_submissions[0]["attachAlgoOrds"][0]
+        self.exchange.mark_price = str((
+            float(attached["slTriggerPx"]) + float(attached["tpTriggerPx"])
+        ) / 2)
+        with self.exchange.lock:
+            manual = self.exchange._create_order({
+                "instId": SYMBOL, "side": "sell", "posSide": "net",
+                "tdMode": "isolated", "ordType": "market", "sz": "1", "reduceOnly": True,
+            })
+            self.exchange._fill(manual["ordId"])
+        await self.synchronize()
+        await self.api.request("PUT", "/strategies/structured-technical", {
+            "name": "Native quantity maintenance", "enabled": True, "config": {},
+        })
+
+        previous = (await self.api.request("GET", "/worker/status"))["run_count"]
+        await self.api.request("POST", "/worker/control", {"enabled": True, "dry_run": False})
+        async def completed():
+            return (await self.api.request("GET", "/worker/status"))["run_count"] > previous
+        await eventually(completed)
+        await self.api.request("POST", "/worker/control", {"enabled": False})
+        amendments = [row for row in self.exchange.posts if row["path"] == "/api/v5/trade/amend-algos"]
+        self.assertEqual(len(amendments), 1)
+        self.assertEqual(amendments[0]["body"]["newSz"], "3")
+        self.assertFalse(amendments[0]["body"]["cxlOnFail"])
+        self.assertEqual(len(self.exchange.order_submissions), 1)
+        await self.synchronize()
+        position = (await self.api.request("GET", "/positions"))["data"][0]
+        lot = position["lot_allocation"]["lots"][0]
+        self.assertEqual(lot["protection"]["state"], "native_matched")
+        self.assertEqual(lot["protection"]["size"], 3)
+        self.assertEqual((await self.api.request("GET", "/protection/adjustments"))["data"], [])
+        self.assertEqual(self.exchange.errors, [])
+
     async def test_worker_native_partial_trigger_remainder_and_restart(self):
         payload = {**await self.signal_payload(), "size": 4}
         submitted = await self.api.request("POST", "/execution/signals", payload)

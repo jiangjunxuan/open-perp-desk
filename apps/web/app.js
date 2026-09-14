@@ -34,6 +34,7 @@ const state = {
   ticket: "signal",
   records: { positions: null, orders: null, fills: null },
   handoffs: [],
+  adjustments: [],
   chartMode: "candles",
   chartRange: 80,
   chartCursorTime: null,
@@ -1258,13 +1259,28 @@ const handoffStates = {
   native_executing: "原生平仓核对中", review: "接管需人工核对",
 };
 
+function adjustmentLabel(row) {
+  if (row.status === "review") return "保护数量需人工核对";
+  if (row.target_size === "0") return row.status === "prepared" ? "遗留保护撤销待执行" : "遗留保护撤销待确认";
+  return row.status === "prepared" ? "保护数量调整待执行" : "保护数量调整待确认";
+}
+
+function renderProtectionAdjustments(rows) {
+  state.adjustments = rows || [];
+  renderProtectionHandoffs(state.handoffs);
+}
+
 function renderProtectionHandoffs(rows) {
   state.handoffs = rows || [];
-  $("#protection-handoffs").hidden = !state.handoffs.length;
-  setText("#protection-handoff-title", `保护接管 · ${state.handoffs.length} 笔待完成`);
-  $("#protection-handoff-list").innerHTML = state.handoffs.map(row => `<li>
+  const entries = [
+    ...state.handoffs.map(row => ({ ...row, label: handoffStates[row.status] || "接管待核对" })),
+    ...state.adjustments.map(row => ({ ...row, label: adjustmentLabel(row) })),
+  ];
+  $("#protection-handoffs").hidden = !entries.length;
+  setText("#protection-handoff-title", `保护维护 · ${entries.length} 笔待完成`);
+  $("#protection-handoff-list").innerHTML = entries.map(row => `<li>
     <strong>${escapeHtml(row.inst_id)}</strong><span class="mono-cell">${escapeHtml(row.opening_order_id)}</span>
-    <span class="lot-protection-state">${escapeHtml(handoffStates[row.status] || "接管待核对")}</span>
+    <span class="lot-protection-state">${escapeHtml(row.label)}</span>
   </li>`).join("");
 }
 
@@ -1299,7 +1315,8 @@ function renderPositionLots(row) {
         <div><dt>原生保护</dt><dd>${formatNumber(lot.protection?.size, 8)} 张</dd></div>
         <div><dt>止盈 / 止损</dt><dd>${formatNumber(lot.protection?.take_profit, 2)} / ${formatNumber(lot.protection?.stop_loss, 2)}</dd></div></dl>
         <div><span class="lot-protection-state" data-tone="${lot.protection?.state === "native_matched" ? "good" : "warning"}">${escapeHtml(states[lot.protection?.state] || "保护待核对")}</span>
-        ${lot.handoff ? `<span class="lot-protection-state">${escapeHtml(handoffStates[lot.handoff.status] || "接管待核对")}</span>` : ""}</div>
+        ${lot.handoff ? `<span class="lot-protection-state">${escapeHtml(handoffStates[lot.handoff.status] || "接管待核对")}</span>` : ""}
+        ${lot.adjustment ? `<span class="lot-protection-state">${escapeHtml(adjustmentLabel(lot.adjustment))}</span>` : ""}</div>
       </li>`).join("")}</ul>
       <p class="subtle" data-lot-execution>分单本地执行：${executionLabel}</p>`
       : `<p class="lot-allocation-reason">${escapeHtml(positionLotReasons[allocation.reason] || "成交归属尚未核实")}</p>`}
@@ -2003,6 +2020,7 @@ function lockPrivateAccess() {
   state.privateFeedState = "locked";
   state.token = "";
   state.privateUpdates += 1;
+  state.adjustments = [];
   renderProtectionHandoffs([]);
   renderPositions([]);
   renderOrders([]);
@@ -2043,6 +2061,7 @@ function applyPrivateEvent(event, payload) {
     renderPnl(payload.data);
   } else if (event === "orders") renderOrders(payload.data);
   else if (event === "protection_handoffs") renderProtectionHandoffs(payload.data);
+  else if (event === "protection_adjustments") renderProtectionAdjustments(payload.data);
   else if (event === "fills") {
     renderFills(payload.data);
     clearTimeout(state.performanceTimer);
@@ -2131,7 +2150,7 @@ async function loadPrivate() {
     if (token !== state.token) return false;
     const activityRequest = ++state.activityRequest;
     const privateUpdates = state.privateUpdates;
-    const [account, positions, orders, fills, pnl, report, activity, bills, handoffs] = await Promise.all([
+    const [account, positions, orders, fills, pnl, report, activity, bills, handoffs, adjustments] = await Promise.all([
       api("/api/v1/account/overview"),
       api("/api/v1/positions"),
       api("/api/v1/orders"),
@@ -2141,6 +2160,7 @@ async function loadPrivate() {
       api("/api/v1/activity"),
       api("/api/v1/account/bills").catch(error => ({ error: error.message })),
       api("/api/v1/protection/handoffs"),
+      api("/api/v1/protection/adjustments"),
     ]);
     if (token !== state.token) return false;
     if (privateUpdates !== state.privateUpdates && state.privateFeedState === "open") return true;
@@ -2150,6 +2170,7 @@ async function loadPrivate() {
     setText("#metric-equity-note", account.configured ? "OKX 账户快照" : "OKX 私有凭据未配置");
     renderPositions(positions.data);
     renderProtectionHandoffs(handoffs.data);
+    renderProtectionAdjustments(adjustments.data);
     renderPnl(positions.data);
     renderOrders(orders.data);
     renderFills(fills.data);

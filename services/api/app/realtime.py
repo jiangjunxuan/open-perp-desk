@@ -6,6 +6,7 @@ from typing import Any
 
 from .position_lots import positions_with_lots
 from .protection_handoff import handoff_summaries
+from .protection_adjustment import adjustment_summaries
 
 
 def event_frame(event: str, payload: Any) -> str:
@@ -60,6 +61,7 @@ async def private_events(store, account, account_client, authorized, rate_scope=
                 return {
                     "positions": {"data": positions_with_lots(store, account_scope=scope)},
                     "protection_handoffs": {"data": handoff_summaries(store, scope)},
+                    "protection_adjustments": {"data": adjustment_summaries(store, scope)},
                     "orders": {"data": store.list_orders()},
                     "fills": {"data": store.list_fills()},
                     "activity": {"data": store.list_audit()},

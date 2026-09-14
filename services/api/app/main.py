@@ -559,6 +559,12 @@ def stored_protection_handoffs(_: None = Depends(require_admin_token)) -> dict[s
     return {"data": handoff_summaries(state_store, account_client.account_scope)}
 
 
+@app.get("/api/v1/protection/adjustments")
+def stored_protection_adjustments(_: None = Depends(require_admin_token)) -> dict[str, object]:
+    from .protection_adjustment import adjustment_summaries
+    return {"data": adjustment_summaries(state_store, account_client.account_scope)}
+
+
 @app.get("/api/v1/fills")
 def stored_fills(
     limit: int = Query(default=100, ge=1, le=500),

@@ -389,7 +389,9 @@ class OrderPreflight:
                         == expected_protection.get("algo_client_id" if native else "opening_order_id")
                     ]
                     current = protection_evidence(
-                        opening, matches[0], native=native, position_size=float(protected_size),
+                        opening, matches[0], native=native,
+                        position_size=min(float(protected_size), float(expected_protection["size"]))
+                        if native and expected_protection.get("lot_id") else float(protected_size),
                     ) if len(matches) == 1 else None
                     if current is not None and expected_protection.get("lot_id"):
                         current["lot_id"] = expected_protection["lot_id"]

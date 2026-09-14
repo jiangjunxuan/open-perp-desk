@@ -281,11 +281,20 @@ def positions_with_lots(store: StateStore, *, account_scope: str | None = None) 
             row["lot_id"]: row for row in store.protection_handoffs(position.get("account_scope"), position["inst_id"])
             if row["position_key"] == position["position_key"]
         }
+        adjustments = {
+            row["opening_order_id"]: row
+            for row in store.protection_adjustments(position.get("account_scope"), position["inst_id"])
+            if row["position_key"] == position["position_key"]
+        }
         for lot in allocation["lots"]:
             handoff = handoffs.get(lot["lot_id"])
             lot["handoff"] = {
                 key: handoff[key] for key in ("handoff_id", "status", "last_error", "close_sequence")
             } if handoff else None
+            adjustment = adjustments.get(lot["opening_order_id"])
+            lot["adjustment"] = {
+                key: adjustment[key] for key in ("adjustment_id", "status", "target_size", "last_error")
+            } if adjustment else None
             protection = None
             triggered = False
             state = "external_entry" if not lot["managed"] else "native_unverified"

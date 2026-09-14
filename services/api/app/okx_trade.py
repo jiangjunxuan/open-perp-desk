@@ -214,6 +214,21 @@ class OkxTradeClient:
             "/api/v5/trade/cancel-algos", [{"instId": inst_id, "algoId": algo_id}],
         )
 
+    async def amend_algo_size(self, inst_id: str, algo_id: str, size: str, request_id: str) -> dict[str, Any]:
+        try:
+            quantity = Decimal(size)
+        except Exception as exc:
+            raise OkxOrderRejected("Algo amendment size is invalid.") from exc
+        if not quantity.is_finite() or quantity <= 0:
+            raise OkxOrderRejected("Algo amendment requires a positive finite size.")
+        if not request_id.isascii() or not request_id.isalnum() or len(request_id) > 32:
+            raise OkxOrderRejected("Algo amendment request ID is invalid.")
+        normalized = format(quantity.normalize(), "f")
+        return await self._post("/api/v5/trade/amend-algos", {
+            "instId": inst_id, "algoId": algo_id, "newSz": normalized,
+            "reqId": request_id, "cxlOnFail": False,
+        })
+
     async def set_leverage(
         self, inst_id: str, leverage: float, mgn_mode: str, pos_side: str,
     ) -> dict[str, Any]:

@@ -324,6 +324,26 @@ class StateStore:
                     updated_at TEXT NOT NULL,
                     UNIQUE(account_scope, lot_id)
                 );
+                CREATE TABLE IF NOT EXISTS protection_adjustments (
+                    adjustment_id TEXT PRIMARY KEY,
+                    account_scope TEXT NOT NULL,
+                    inst_id TEXT NOT NULL,
+                    position_key TEXT NOT NULL,
+                    opening_order_id TEXT NOT NULL,
+                    lot_id TEXT,
+                    evidence_json TEXT NOT NULL,
+                    target_size TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'prepared',
+                    version INTEGER NOT NULL DEFAULT 0,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    retry_after_ms INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS one_active_protection_adjustment
+                    ON protection_adjustments(account_scope, inst_id)
+                    WHERE status NOT IN ('complete', 'rejected', 'superseded');
                 CREATE TABLE IF NOT EXISTS analyses (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     inst_id TEXT NOT NULL,
@@ -578,6 +598,13 @@ class StateStore:
             context = order.get("protection_context") or {}
             if order["status"] != "preview":
                 if not order.get("reduce_only"):
+                    adjustment = connection.execute(
+                        """SELECT 1 FROM protection_adjustments WHERE account_scope = ? AND inst_id = ?
+                           AND status NOT IN ('complete', 'rejected', 'superseded') LIMIT 1""",
+                        (order.get("account_scope"), order["inst_id"]),
+                    ).fetchone()
+                    if adjustment:
+                        raise ExposureSnapshotChanged("protection_adjustment_pending")
                     pending = connection.execute(
                         """SELECT 1 FROM protection_handoffs WHERE account_scope = ? AND inst_id = ?
                            AND status != 'complete' LIMIT 1""",
@@ -669,6 +696,12 @@ class StateStore:
     ) -> dict[str, Any]:
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                """SELECT 1 FROM protection_adjustments WHERE account_scope = ? AND inst_id = ?
+                   AND status NOT IN ('complete', 'rejected', 'superseded') LIMIT 1""",
+                (position["account_scope"], position["inst_id"]),
+            ).fetchone():
+                raise ExposureSnapshotChanged("protection_adjustment_pending")
             generation = connection.execute(
                 "SELECT generation FROM execution_generation WHERE singleton = 1",
             ).fetchone()[0]
@@ -696,6 +729,159 @@ class StateStore:
                 (position["account_scope"], record["lot_id"]),
             ).fetchone()
         return dict(saved)
+
+    def managed_opening_orders(self, account_scope: str, inst_id: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM orders WHERE account_scope = ? AND inst_id = ? AND order_kind = 'standard'
+                   AND reduce_only = 0 AND source NOT LIKE 'okx-%' AND source NOT LIKE 'protective-%'
+                   AND status IN ('filled', 'canceled', 'mmp_canceled') ORDER BY created_at, client_order_id""",
+                (account_scope, inst_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def protection_adjustments(self, account_scope: str, inst_id: str | None = None) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM protection_adjustments WHERE account_scope = ?
+                   AND status NOT IN ('complete', 'rejected', 'superseded')
+                   AND (? IS NULL OR inst_id = ?) ORDER BY created_at, adjustment_id""",
+                (account_scope, inst_id, inst_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def protection_adjustment(self, adjustment_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            return self._row(connection.execute(
+                "SELECT * FROM protection_adjustments WHERE adjustment_id = ?", (adjustment_id,),
+            ).fetchone())
+
+    def claim_protection_adjustment(
+        self, record: dict[str, Any], position: dict[str, Any], *, expected_generation: int,
+    ) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            generation = connection.execute(
+                "SELECT generation FROM execution_generation WHERE singleton = 1",
+            ).fetchone()[0]
+            current = connection.execute(
+                "SELECT * FROM positions WHERE position_key = ?", (position["position_key"],),
+            ).fetchone()
+            if generation != expected_generation or not current or any(
+                current[field] != position[field] for field in (
+                    "account_scope", "exchange_trade_id", "size", "lifecycle_generation", "status",
+                )
+            ):
+                raise ExposureSnapshotChanged("adjustment_position_changed")
+            if connection.execute(
+                """SELECT 1 FROM protection_handoffs WHERE account_scope = ? AND inst_id = ?
+                   AND status != 'complete' LIMIT 1""",
+                (position["account_scope"], position["inst_id"]),
+            ).fetchone():
+                raise ExposureSnapshotChanged("protection_handoff_pending")
+            active = connection.execute(
+                """SELECT 1 FROM protection_adjustments WHERE account_scope = ? AND inst_id = ?
+                   AND (status NOT IN ('complete', 'rejected', 'superseded')
+                        OR status = 'rejected' AND retry_after_ms > ?) LIMIT 1""",
+                (position["account_scope"], position["inst_id"], record["now_ms"]),
+            ).fetchone()
+            if active:
+                raise ExposureSnapshotChanged("protection_adjustment_pending")
+            self._verify_adjustment_lot(connection, record, current, expected_generation)
+            now = _utc_now()
+            try:
+                connection.execute(
+                    """INSERT INTO protection_adjustments
+                       (adjustment_id, account_scope, inst_id, position_key, opening_order_id, lot_id,
+                        evidence_json, target_size, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (record["adjustment_id"], position["account_scope"], position["inst_id"], position["position_key"],
+                     record["opening_order_id"], record.get("lot_id"), json.dumps(record["evidence"], sort_keys=True),
+                     record["target_size"], now, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ExposureSnapshotChanged("protection_adjustment_pending") from exc
+            row = connection.execute(
+                "SELECT * FROM protection_adjustments WHERE adjustment_id = ?", (record["adjustment_id"],),
+            ).fetchone()
+        return dict(row)
+
+    @staticmethod
+    def _verify_adjustment_lot(connection, record, position, generation):
+        from decimal import Decimal
+        if position["status"] == "closed" and position["size"] == 0:
+            if Decimal(record["target_size"]) != 0:
+                raise ExposureSnapshotChanged("adjustment_lot_changed")
+            return
+        snapshot = connection.execute(
+            """SELECT * FROM position_lot_snapshots WHERE account_scope = ? AND position_key = ?""",
+            (position["account_scope"], position["position_key"]),
+        ).fetchone()
+        if not snapshot or any(snapshot[left] != position[right] for left, right in (
+            ("position_trade_id", "exchange_trade_id"), ("position_size", "size"),
+            ("lifecycle_generation", "lifecycle_generation"),
+        )):
+            raise ExposureSnapshotChanged("adjustment_lot_changed")
+        allocation = json.loads(snapshot["snapshot_json"])
+        lots = [lot for lot in allocation.get("lots", []) if lot["opening_order_id"] == record["opening_order_id"]]
+        if (
+            allocation.get("status") != "verified" or allocation.get("policy_version") != LOT_RECONSTRUCTION_VERSION
+            or allocation.get("execution_generation") != generation or len(lots) > 1
+            or Decimal(lots[0]["remaining_size"] if lots else "0") != Decimal(record["target_size"])
+            or lots and lots[0]["lot_id"] != record["lot_id"]
+        ):
+            raise ExposureSnapshotChanged("adjustment_lot_changed")
+
+    def update_protection_adjustment(self, record: dict[str, Any], **changes: Any) -> dict[str, Any] | None:
+        if not changes or changes.keys() - {"status", "last_error", "attempts", "retry_after_ms"}:
+            raise ValueError("invalid_adjustment_update")
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE protection_adjustments SET " + ", ".join(f"{key} = ?" for key in changes)
+                + ", version = version + 1, updated_at = ? WHERE adjustment_id = ? AND version = ?"
+                + " AND status NOT IN ('complete', 'rejected', 'superseded')",
+                (*changes.values(), _utc_now(), record["adjustment_id"], record["version"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                "SELECT * FROM protection_adjustments WHERE adjustment_id = ?", (record["adjustment_id"],),
+            ).fetchone()
+        return dict(row)
+
+    def start_protection_adjustment(self, record, position, *, expected_generation, now_ms):
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT * FROM positions WHERE position_key = ?", (position["position_key"],),
+            ).fetchone()
+            generation = connection.execute(
+                "SELECT generation FROM execution_generation WHERE singleton = 1",
+            ).fetchone()[0]
+            if generation != expected_generation or not current or any(
+                current[key] != position[key] for key in (
+                    "account_scope", "size", "exchange_trade_id", "lifecycle_generation", "status",
+                )
+            ):
+                raise ExposureSnapshotChanged("adjustment_position_changed")
+            if connection.execute(
+                """SELECT 1 FROM protection_handoffs WHERE account_scope = ? AND inst_id = ?
+                   AND status != 'complete' LIMIT 1""", (record["account_scope"], record["inst_id"]),
+            ).fetchone():
+                raise ExposureSnapshotChanged("protection_handoff_pending")
+            self._verify_adjustment_lot(connection, record, current, expected_generation)
+            cursor = connection.execute(
+                """UPDATE protection_adjustments SET status = 'submitted', attempts = attempts + 1,
+                   retry_after_ms = ?, version = version + 1, updated_at = ?
+                   WHERE adjustment_id = ? AND version = ?
+                   AND (status = 'prepared' OR status IN ('submitted', 'accepted')
+                        AND retry_after_ms <= ?)""",
+                (now_ms + 30000, _utc_now(), record["adjustment_id"], record["version"], now_ms),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return dict(connection.execute(
+                "SELECT * FROM protection_adjustments WHERE adjustment_id = ?", (record["adjustment_id"],),
+            ).fetchone())
 
     def bind_handoff_native(self, handoff: dict[str, Any], proof: dict[str, Any]) -> dict[str, Any] | None:
         original = json.loads(handoff["evidence_json"])

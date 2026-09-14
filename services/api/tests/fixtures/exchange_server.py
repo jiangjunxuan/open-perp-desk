@@ -232,6 +232,15 @@ class ExchangeServer:
             algo.update(state="canceled", uTime=milliseconds())
             self.revision += 1
             return [{"algoId": algo["algoId"], "sCode": "0"}]
+        if path == "/api/v5/trade/amend-algos":
+            algo = self.algos[body["algoId"]]
+            if body.get("cxlOnFail") is not False or set(body) != {"instId", "algoId", "newSz", "reqId", "cxlOnFail"}:
+                raise AssertionError("Quantity amendment must not change protection prices or cancel on failure")
+            if algo["state"] != "live":
+                return [{"algoId": algo["algoId"], "reqId": body["reqId"], "sCode": "51400"}]
+            algo.update(sz=body["newSz"], uTime=milliseconds())
+            self.revision += 1
+            return [{"algoId": algo["algoId"], "reqId": body["reqId"], "sCode": "0"}]
         raise AssertionError(f"Unexpected fixture POST {path}")
 
     def _create_order(self, body):

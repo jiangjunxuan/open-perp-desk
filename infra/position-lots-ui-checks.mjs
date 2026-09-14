@@ -1,9 +1,13 @@
 function exercisePositionLots() {
-  const original = { token: state.token, rows: state.records.positions, handoffs: state.handoffs, view: document.body.dataset.view };
+  const original = {
+    token: state.token, rows: state.records.positions, handoffs: state.handoffs,
+    adjustments: state.adjustments, view: document.body.dataset.view,
+  };
   const restore = () => {
     state.token = original.token;
     renderPositions(original.rows || []);
     state.records.positions = original.rows;
+    state.adjustments = original.adjustments || [];
     renderProtectionHandoffs(original.handoffs);
     updatePrivateActionAvailability();
     showView(original.view || "overview");
@@ -52,6 +56,11 @@ function exercisePositionLots() {
     row.lot_allocation.lots[0].handoff.status = "native_cancel_pending";
     renderPositions([row]);
     checks.nativeCancellationPendingVisible = $("#positions-body").textContent.includes("原生余单撤销待确认");
+    row.lot_allocation.lots[0].adjustment = {
+      adjustment_id: "adjustment1", status: "accepted", target_size: "1", last_error: null,
+    };
+    renderPositions([row]);
+    checks.adjustmentPendingVisible = $("#positions-body").textContent.includes("保护数量调整待确认");
     checks.protectedQuantityVisible = [...$("#positions-body").querySelectorAll("dl > div")].some(
       item => item.querySelector("dt").textContent === "原生保护" && item.querySelector("dd").textContent === "2 张",
     );
@@ -80,6 +89,14 @@ function exercisePositionLots() {
     checks.pendingVisibleWithoutPosition = !$("#protection-handoffs").hidden
       && $("#protection-handoff-list").textContent.includes("分单平仓中");
     applyPrivateEvent("protection_handoffs", { data: [] });
+    state.adjustments = [{
+      inst_id: "BTC-USDT-SWAP", opening_order_id: "opd12345678901234567890",
+      status: "accepted", target_size: "1",
+    }];
+    applyPrivateEvent("protection_adjustments", { data: state.adjustments });
+    checks.adjustmentSummaryVisible = !$("#protection-handoffs").hidden
+      && $("#protection-handoff-list").textContent.includes("保护数量调整待确认");
+    applyPrivateEvent("protection_adjustments", { data: [] });
     checks.completedClearsSummary = $("#protection-handoffs").hidden;
     const unknown = { ...row, lot_allocation: { status: "unverified", reason: "lot_flat_boundary_missing", lots: [] } };
     renderPositions([unknown]);

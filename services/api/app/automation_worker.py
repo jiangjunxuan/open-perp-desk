@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable
 from .account_sync import AccountSynchronizer
 from .execution_engine import ExecutionEngine
 from .protection_handoff import ProtectionHandoff
+from .protection_adjustment import ProtectionAdjustment
 from .okx_account import OkxAccountClient, OkxAccountError
 from .okx_market import OkxMarketClient
 from .risk_engine import RiskEngine
@@ -75,6 +76,7 @@ class AutomationWorker:
         self._task: asyncio.Task[None] | None = None
         self._cycle_lock = asyncio.Lock()
         self.protection_handoff = ProtectionHandoff(store, account_sync, execution, account=account_client)
+        self.protection_adjustment = ProtectionAdjustment(self.protection_handoff, market_client)
 
     async def start(self) -> None:
         if self.enabled and self._task is None:
@@ -185,6 +187,7 @@ class AutomationWorker:
             )
             if self.account_client.configured:
                 protected = protected or self.protection_handoff.has_work(symbol)
+                protected = protected or self.protection_adjustment.has_work(symbol)
             if protected:
                 try:
                     mark_price = await self.market_client.mark_price(symbol)
@@ -207,11 +210,22 @@ class AutomationWorker:
                     })
                     continue
                 if self.account_client.configured:
+                    if self.store.protection_adjustments(self.account_client.account_scope, symbol):
+                        results.append(await self.protection_adjustment.run(
+                            symbol, mark_price, dry_run=self.dry_run, market_data_fresh=self.market_data_fresh(),
+                        ))
+                        continue
                     handoff_result = await self.protection_handoff.run(
                         symbol, mark_price, dry_run=self.dry_run, market_data_fresh=self.market_data_fresh(),
                     )
                     if handoff_result is not None:
                         results.append(handoff_result)
+                        continue
+                    adjustment_result = await self.protection_adjustment.run(
+                        symbol, mark_price, dry_run=self.dry_run, market_data_fresh=self.market_data_fresh(),
+                    )
+                    if adjustment_result is not None:
+                        results.append(adjustment_result)
                         continue
                 exit_event = self.execution.protective_exit(
                     inst_id=symbol,

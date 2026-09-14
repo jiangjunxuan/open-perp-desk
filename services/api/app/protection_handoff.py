@@ -186,11 +186,15 @@ class ProtectionHandoff:
                     and native["account_scope"] == position["account_scope"] and native["order_kind"] == "algo"
                 ):
                     raw = json.loads(native["raw_json"])
-                    proof = protection_evidence(opening, raw, native=True, position_size=float(lot["remaining_size"]))
+                    try:
+                        covered_size = min(float(lot["remaining_size"]), float(raw.get("sz") or 0))
+                    except (ValueError, TypeError):
+                        continue
+                    proof = protection_evidence(opening, raw, native=True, position_size=covered_size)
                     if proof and not native_evidence(opening, raw, proof):
                         proof = None
                     if not proof:
-                        proof = triggered_protection_evidence(opening, raw, position_size=float(lot["remaining_size"]))
+                        proof = triggered_protection_evidence(opening, raw, position_size=covered_size)
                         triggered = proof is not None
                 else:
                     proof = None
