@@ -5,12 +5,12 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from typing import Any
 
-from .okx_account import OkxAccountClient
+from .okx_account import OkxAccountClient, OkxAccountError
 from .account_ledger import AccountLedgerError, parse_daily_bills, value_daily_risk
 from .okx_market import OkxMarketClient
 from .state_store import StateStore
-from .position_protection import protection_evidence
-from .protection_handoff import HandoffError, close_context, native_evidence, verified_lot
+from .position_protection import attached_parent_evidence, protection_evidence
+from .protection_handoff import HandoffError, close_context, effective_evidence, native_evidence, verified_lot
 from .trading_signal import TradeSignal
 
 
@@ -305,19 +305,63 @@ class OrderPreflight:
                         or handoff["inst_id"] != signal.inst_id
                         or close_context(handoff) != expected_protection
                         or not expected_protection.get("lot_id")
-                        or any(row.get("algoId") == expected_protection["algo_id"] for row in algos)
+                        or any(
+                            row.get("algoClOrdId") == expected_protection["algo_client_id"]
+                            or expected_protection["algo_id"] is not None and row.get("algoId") == expected_protection["algo_id"]
+                            for row in algos
+                        )
                     ):
                         raise PreflightError("close_handoff_unverified")
+                    original, proof = json.loads(handoff["evidence_json"]), effective_evidence(handoff)
+                    parent = None
+                    if original["kind"] == "attached":
+                        try:
+                            parent = await self.account.order_details(
+                                signal.inst_id, ord_id=original["opening_exchange_id"],
+                                client_order_id=original["opening_order_id"],
+                            )
+                        except Exception as exc:
+                            raise PreflightError("close_handoff_parent_unavailable") from exc
+                        if (
+                            parent.get("state") not in {"filled", "canceled", "mmp_canceled"}
+                            or any(row.get("ordId") == original["opening_exchange_id"] for row in pending)
+                            or not attached_parent_evidence(opening, parent, position_size=float(quantity), expected=original)
+                        ):
+                            raise PreflightError("close_handoff_parent_unverified")
                     try:
                         native_row = await self.account.algo_order_details(
                             signal.inst_id, algo_id=expected_protection["algo_id"],
                             client_order_id=expected_protection["algo_client_id"],
                         )
+                    except OkxAccountError as exc:
+                        if proof["kind"] != "attached" or exc.code != "51603":
+                            raise PreflightError("close_handoff_native_unavailable") from exc
+                        native_row = None
                     except Exception as exc:
                         raise PreflightError("close_handoff_native_unavailable") from exc
-                    if not native_evidence(opening, native_row, json.loads(handoff["evidence_json"]), canceled=True):
+                    if opening["account_scope"] != self.account.account_scope:
+                        raise PreflightError("close_handoff_account_changed")
+                    if proof["kind"] == "attached":
+                        if (
+                            native_row is not None or parent["state"] not in {"canceled", "mmp_canceled"}
+                            or number(parent["accFillSz"], "parent_filled_size") >= number(parent["sz"], "parent_size")
+                            or self.store.get_order(proof["algo_client_id"])
+                        ):
+                            raise PreflightError("close_handoff_absence_unverified")
+                    elif not native_evidence(opening, native_row, proof, canceled=True):
                         raise PreflightError("close_handoff_cancellation_unverified")
                     current = expected_protection
+                elif expected_protection.get("kind") == "attached" and expected_protection.get("lot_id"):
+                    try:
+                        parent = await self.account.order_details(
+                            signal.inst_id, ord_id=opening["exchange_order_id"],
+                            client_order_id=opening["client_order_id"],
+                        )
+                    except Exception as exc:
+                        raise PreflightError("close_parent_unavailable") from exc
+                    current = attached_parent_evidence(opening, parent, position_size=float(protected_size))
+                    if current is not None:
+                        current["lot_id"] = expected_protection["lot_id"]
                 else:
                     native = expected_protection.get("kind") == "native"
                     matches = [

@@ -43,6 +43,12 @@ function exercisePositionLots() {
     checks.pushKeepsFocus = document.activeElement === $("#positions-body .position-lot-toggle");
     checks.quantityMismatchVisible = $("#positions-body").textContent.includes("原生数量待调整");
     checks.handoffVisible = $("#positions-body").textContent.includes("原生撤单待确认");
+    row.lot_allocation.lots[0].handoff.status = "opening_cancel_pending";
+    renderPositions([row]);
+    checks.openingCancellationVisible = $("#positions-body").textContent.includes("开仓余单撤销待确认");
+    row.lot_allocation.lots[0].handoff.status = "native_pending";
+    renderPositions([row]);
+    checks.nativeGenerationPendingVisible = $("#positions-body").textContent.includes("原生保护生成待核对");
     checks.protectedQuantityVisible = [...$("#positions-body").querySelectorAll("dl > div")].some(
       item => item.querySelector("dt").textContent === "原生保护" && item.querySelector("dd").textContent === "2 张",
     );

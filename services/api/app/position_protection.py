@@ -154,3 +154,31 @@ def linked_protection(
         return protection_evidence(order, raw, native=False, position_size=size)
     except (ValueError, TypeError):
         return None
+
+
+def attached_parent_evidence(
+    opening: dict[str, Any], current: dict[str, Any], *, position_size: float,
+    expected: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Verify attached terms independently of a parent's active/terminal state."""
+    try:
+        state = current.get("state")
+        filled, size = _positive(current.get("accFillSz")), _positive(current.get("sz"))
+        if (
+            state not in {"partially_filled", "filled", "canceled", "mmp_canceled"}
+            or filled > size or state == "filled" and filled != size
+            or state == "partially_filled" and filled == size
+        ):
+            return None
+        proof = protection_evidence(
+            {**opening, "raw_json": json.dumps(current)},
+            {**current, "state": "partially_filled"}, native=False, position_size=position_size,
+        )
+        if not proof or expected is not None and (
+            proof["size"] < expected["size"]
+            or any(proof.get(key) != value for key, value in expected.items() if key != "size")
+        ):
+            return None
+        return proof
+    except (ValueError, TypeError, InvalidOperation):
+        return None

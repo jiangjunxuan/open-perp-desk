@@ -220,6 +220,8 @@ class ExchangeServer:
             return [{"ordId": order["ordId"], "clOrdId": order["clOrdId"], "sCode": "0"}]
         if path == "/api/v5/trade/cancel-order":
             order = self.orders[body["ordId"]]
+            if order["state"] in {"filled", "canceled", "mmp_canceled"}:
+                return [{"ordId": order["ordId"], "sCode": "51400"}]
             order.update(state="canceled", uTime=milliseconds())
             self.revision += 1
             return [{"ordId": order["ordId"], "sCode": "0"}]

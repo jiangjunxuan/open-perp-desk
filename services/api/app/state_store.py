@@ -309,6 +309,7 @@ class StateStore:
                     position_key TEXT NOT NULL,
                     lot_id TEXT NOT NULL,
                     evidence_json TEXT NOT NULL,
+                    native_evidence_json TEXT,
                     reason TEXT NOT NULL,
                     trigger_price REAL,
                     status TEXT NOT NULL DEFAULT 'cancel_pending',
@@ -377,6 +378,8 @@ class StateStore:
             handoff_columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(protection_handoffs)")}
             if "trigger_price" not in handoff_columns:
                 connection.execute("ALTER TABLE protection_handoffs ADD COLUMN trigger_price REAL")
+            if "native_evidence_json" not in handoff_columns:
+                connection.execute("ALTER TABLE protection_handoffs ADD COLUMN native_evidence_json TEXT")
             if "risk_notional" not in order_columns:
                 connection.execute("ALTER TABLE orders ADD COLUMN risk_notional REAL")
             if "account_scope" not in order_columns:
@@ -608,12 +611,18 @@ class StateStore:
                     allocation = json.loads(snapshot["snapshot_json"])
                     lot = next((row for row in allocation.get("lots", []) if row["lot_id"] == handoff["lot_id"]), None)
                     evidence = json.loads(handoff["evidence_json"])
+                    close_evidence = json.loads(handoff["native_evidence_json"] or handoff["evidence_json"])
+                    expected_context = {
+                        **close_evidence, "kind": "handoff", "handoff_id": handoff["handoff_id"],
+                        "lot_id": handoff["lot_id"], "close_sequence": handoff["close_sequence"] + 1,
+                    }
                     if (
                         allocation.get("status") != "verified" or allocation.get("policy_version") != LOT_RECONSTRUCTION_VERSION
                         or allocation.get("execution_generation") != expected_generation
                         or not lot or float(lot["remaining_size"]) != order["size"]
                         or context.get("opening_order_id") != evidence["opening_order_id"]
                         or context.get("opening_exchange_id") != evidence["opening_exchange_id"]
+                        or context != expected_context
                         or position["exchange_trade_id"] != order.get("raw", {}).get("expected_position_trade_id")
                         or (position["pos_side"], position["td_mode"]) != (order["pos_side"], order["td_mode"])
                     ):
@@ -671,16 +680,40 @@ class StateStore:
             connection.execute(
                 """INSERT OR IGNORE INTO protection_handoffs
                    (handoff_id, account_scope, inst_id, position_key, lot_id, evidence_json,
-                    reason, trigger_price, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    reason, trigger_price, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (record["handoff_id"], position["account_scope"], position["inst_id"], position["position_key"],
                  record["lot_id"], json.dumps(record["evidence"], sort_keys=True, allow_nan=False),
-                 record["reason"], record["trigger_price"], now, now),
+                 record["reason"], record["trigger_price"],
+                 "opening_cancel_pending" if record["evidence"]["kind"] == "attached" else "cancel_pending", now, now),
             )
             saved = connection.execute(
                 "SELECT * FROM protection_handoffs WHERE account_scope = ? AND lot_id = ?",
                 (position["account_scope"], record["lot_id"]),
             ).fetchone()
         return dict(saved)
+
+    def bind_handoff_native(self, handoff: dict[str, Any], proof: dict[str, Any]) -> dict[str, Any] | None:
+        original = json.loads(handoff["evidence_json"])
+        if original["kind"] != "attached" or proof.get("kind") != "native" or any(
+            original[key] != proof.get(key) for key in (
+                "opening_order_id", "opening_exchange_id", "algo_client_id", "stop_loss", "take_profit",
+            )
+        ):
+            raise ValueError("handoff_native_binding_invalid")
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """UPDATE protection_handoffs SET native_evidence_json = ?, status = 'cancel_pending',
+                   cancel_after_ms = 0, version = version + 1, updated_at = ?
+                   WHERE handoff_id = ? AND version = ? AND native_evidence_json IS NULL
+                   AND close_sequence = 0 AND status IN ('opening_cancel_pending', 'native_pending', 'ready')""",
+                (json.dumps(proof, sort_keys=True, allow_nan=False), _utc_now(), handoff["handoff_id"], handoff["version"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                "SELECT * FROM protection_handoffs WHERE handoff_id = ?", (handoff["handoff_id"],),
+            ).fetchone()
+        return dict(row)
 
     def update_protection_handoff(self, handoff: dict[str, Any], **changes: Any) -> dict[str, Any] | None:
         allowed = {"status", "last_error", "cancel_attempts", "cancel_after_ms"}

@@ -4,7 +4,7 @@ import math
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
-from .position_protection import attached_algo_client_id, protection_evidence
+from .position_protection import attached_algo_client_id, attached_parent_evidence, protection_evidence
 from .state_store import LOT_RECONSTRUCTION_VERSION, StateStore
 
 
@@ -290,6 +290,12 @@ def positions_with_lots(store: StateStore, *, account_scope: str | None = None) 
             state = "external_entry" if not lot["managed"] else "native_unverified"
             opening = store.get_order(lot["opening_order_id"])
             native = store.get_order(lot["native_client_id"]) if lot["native_client_id"] else None
+            if opening and lot["managed"] and not native:
+                protection = attached_parent_evidence(
+                    opening, json.loads(opening["raw_json"]), position_size=float(lot["remaining_size"]),
+                )
+                if protection:
+                    state = "attached_pending"
             if opening and native and native["account_scope"] == position["account_scope"] and native["order_kind"] == "algo":
                 try:
                     raw = json.loads(native["raw_json"])
@@ -306,7 +312,7 @@ def positions_with_lots(store: StateStore, *, account_scope: str | None = None) 
                 except (ValueError, TypeError, AttributeError):
                     protection = None
             lot["protection"] = {
-                "state": state, "size": protection["size"] if protection else None,
+                "state": state, "size": protection["size"] if protection and state != "attached_pending" else None,
                 "stop_loss": protection["stop_loss"] if protection else None,
                 "take_profit": protection["take_profit"] if protection else None,
             }

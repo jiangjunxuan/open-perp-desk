@@ -329,3 +329,36 @@ class TradingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.api.request("GET", "/positions"))["data"], [])
         self.assertFalse((await self.api.request("GET", "/worker/status"))["running"])
         self.assertEqual(self.exchange.errors, [])
+
+    async def test_worker_partial_parent_cancellation_lot_exit_and_restart(self):
+        payload = {**await self.signal_payload(), "size": 3}
+        submitted = await self.api.request("POST", "/execution/signals", payload)
+        self.assertTrue(submitted["accepted"], submitted)
+        self.exchange.fill(submitted["order"]["exchange_order_id"], quantity=1)
+        await self.synchronize()
+        position = (await self.api.request("GET", "/positions"))["data"][0]
+        self.assertEqual(position["lot_allocation"]["lots"][0]["protection"]["state"], "attached_pending")
+        self.assertFalse(self.exchange.algos)
+        await self.api.request("PUT", "/strategies/structured-technical", {
+            "name": "Partial parent acceptance", "enabled": True, "config": {},
+        })
+        self.exchange.mark_price = str(float(payload["signal"]["stop_loss"]) - .1)
+        await self.api.request("POST", "/worker/control", {"enabled": True, "dry_run": False})
+        async def completed():
+            return (await self.api.request("GET", "/worker/status"))["run_count"] >= 1
+        await eventually(completed)
+        await self.api.request("POST", "/worker/control", {"enabled": False})
+        self.assertEqual(len(self.exchange.order_submissions), 2)
+        close = self.exchange.order_submissions[-1]
+        self.assertTrue(close["reduceOnly"])
+        self.assertEqual(float(close["sz"]), 1)
+        self.assertEqual(self.exchange.orders[submitted["order"]["exchange_order_id"]]["state"], "canceled")
+        handoffs = (await self.api.request("GET", "/protection/handoffs"))["data"]
+        self.assertEqual(handoffs[0]["status"], "closing")
+        await self.api.stop()
+        await self.api.start()
+        self.assertEqual((await self.api.request("GET", "/protection/handoffs"))["data"][0]["status"], "closing")
+        self.assertEqual(len(self.exchange.order_submissions), 2)
+        self.assertTrue(any("保护性平仓触发" in row["title"] for row in self.exchange.notifications))
+        self.assertFalse((await self.api.request("GET", "/execution/status"))["live_execution_allowed"])
+        self.assertEqual(self.exchange.errors, [])

@@ -1,19 +1,21 @@
 import asyncio
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.account_sync import AccountSynchronizer
 from app.execution_engine import ExecutionEngine
-from app.okx_account import OkxAccountClient
+from app.okx_account import OkxAccountClient, OkxAccountError
 from app.okx_market import OkxMarketClient
 from app.okx_trade import OkxTradeClient, OkxTradeError, OrderRequest
 from app.order_preflight import OrderPreflight
-from app.protection_handoff import ProtectionHandoff
+from app.protection_handoff import ProtectionHandoff, close_context
 from app.risk_engine import RiskEngine
 from app.state_store import StateStore
 from app.trading_signal import TradeSignal
@@ -46,13 +48,13 @@ class ProtectionHandoffTests(unittest.IsolatedAsyncioTestCase):
         )
         self.manager = ProtectionHandoff(self.store, self.sync, self.engine)
 
-    async def entry(self, name="entry1", size=2, stop=90):
+    async def entry(self, name="entry1", size=2, stop=90, filled=None):
         order = OrderRequest(
             inst_id=SYMBOL, side="buy", sz=size, stop_loss=stop, take_profit=120, cl_ord_id=name,
         )
         with self.exchange.lock:
             raw = self.exchange._create_order(order.okx_payload())
-            self.exchange._fill(raw["ordId"])
+            self.exchange._fill(raw["ordId"], quantity=filled)
         self.sync._save_regular_order(dict(raw), source="structured-technical")
         result = await self.sync.sync_rest()
         self.assertNotIn("errors", result, result)
@@ -305,6 +307,246 @@ class ProtectionHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["reasons"], ["handoff_cancellation_unverified"])
         self.assertEqual(self.exchange.order_submissions, [])
         self.assertEqual(self.store.protection_handoffs(self.account.account_scope)[0]["status"], "review")
+
+    async def test_partial_parent_cancel_precedes_close_of_confirmed_fill(self):
+        await self.entry(size=3, filled=1)
+        result = await self.run_handoff()
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(result["order"]["size"], 1)
+        self.assertEqual([row["path"] for row in self.exchange.posts], [
+            "/api/v5/trade/cancel-order", "/api/v5/trade/order",
+        ])
+        handoff = self.store.protection_handoffs(self.account.account_scope)[0]
+        self.assertEqual(json.loads(handoff["evidence_json"])["kind"], "attached")
+        self.assertIsNone(handoff["native_evidence_json"])
+        self.reopen()
+        result = await self.run_handoff()
+        self.assertEqual(result["reasons"], ["handoff_close_unconfirmed"])
+        self.exchange.fill(self.store.get_order(handoff["close_order_id"])["exchange_order_id"])
+        await self.run_handoff()
+        self.assertEqual(self.store.protection_handoffs(self.account.account_scope), [])
+        self.assertEqual(len(self.exchange.order_submissions), 1)
+
+    async def test_partial_parent_cancel_ack_cannot_authorize_close_or_forged_ready_state(self):
+        await self.entry(size=3, filled=1)
+        async def accepted_only(inst_id, order_id):
+            return {"data": [{"ordId": order_id, "sCode": "0"}]}
+        with patch.object(self.trade, "cancel_order", side_effect=accepted_only):
+            result = await self.run_handoff()
+        self.assertEqual(result["action"], "protection_opening_cancel_pending")
+        self.assertEqual(self.exchange.order_submissions, [])
+        handoff = self.store.protection_handoffs(self.account.account_scope)[0]
+        handoff = self.store.update_protection_handoff(handoff, status="ready")
+        position = self.store.list_positions()[0]
+        result = await self.engine.submit_signal(
+            self.manager._signal(handoff), account_equity=0, daily_pnl_pct=0, size=1,
+            expected_position_trade_id=position["exchange_trade_id"], expected_protection=close_context(handoff),
+        )
+        self.assertEqual(result["reasons"], ["close_handoff_parent_unverified"])
+        self.assertEqual(self.exchange.order_submissions, [])
+
+    async def test_partial_parent_lost_cancel_response_recovers_by_exact_query(self):
+        await self.entry(size=3, filled=1)
+        cancel = self.trade.cancel_order
+        async def lose(inst_id, order_id):
+            await cancel(inst_id, order_id)
+            raise OkxTradeError("fixture lost parent cancellation response")
+        with patch.object(self.trade, "cancel_order", side_effect=lose):
+            result = await self.run_handoff()
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(len(self.exchange.posts), 2)
+
+    async def test_more_parent_fills_during_cancel_are_included_in_the_lot_close(self):
+        await self.entry(size=3, filled=1)
+        cancel = self.trade.cancel_order
+        async def fill_then_cancel(inst_id, order_id):
+            self.exchange.fill(order_id, quantity=1)
+            return await cancel(inst_id, order_id)
+        with patch.object(self.trade, "cancel_order", side_effect=fill_then_cancel):
+            result = await self.run_handoff()
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(result["order"]["size"], 2)
+        self.assertEqual(len(self.cancellations()), 0)
+
+    async def test_parent_full_fill_race_binds_then_cancels_generated_native_before_close(self):
+        await self.entry(size=3, filled=1)
+        cancel = self.trade.cancel_order
+        async def fill_then_cancel(inst_id, order_id):
+            self.exchange.fill(order_id)
+            return await cancel(inst_id, order_id)
+        with patch.object(self.trade, "cancel_order", side_effect=fill_then_cancel):
+            result = await self.run_handoff()
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(result["order"]["size"], 3)
+        self.assertEqual([row["path"] for row in self.exchange.posts], [
+            "/api/v5/trade/cancel-order", "/api/v5/trade/cancel-algos", "/api/v5/trade/order",
+        ])
+        handoff = self.store.protection_handoffs(self.account.account_scope)[0]
+        self.assertEqual(json.loads(handoff["evidence_json"])["size"], 1)
+        self.assertEqual(json.loads(handoff["native_evidence_json"])["size"], 3)
+        self.assertIsNone(self.store.bind_handoff_native(handoff, json.loads(handoff["native_evidence_json"])))
+
+    async def test_full_parent_waits_for_delayed_native_generation_across_restart(self):
+        await self.entry(size=3, filled=1)
+        saved = {}
+        cancel = self.trade.cancel_order
+        async def delay_native(inst_id, order_id):
+            self.exchange.fill(order_id)
+            with self.exchange.lock:
+                saved.update(self.exchange.algos)
+                self.exchange.algos.clear()
+            return await cancel(inst_id, order_id)
+        with patch.object(self.trade, "cancel_order", side_effect=delay_native):
+            result = await self.run_handoff()
+        self.assertEqual(result["reasons"], ["handoff_native_creation_pending"])
+        self.assertEqual(self.exchange.order_submissions, [])
+        self.reopen()
+        result = await self.run_handoff()
+        self.assertEqual(result["reasons"], ["handoff_native_creation_pending"])
+        with self.exchange.lock:
+            self.exchange.algos.update(saved)
+        result = await self.run_handoff()
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(result["order"]["size"], 3)
+        self.assertEqual(len(self.exchange.order_submissions), 1)
+
+    async def test_generated_native_trigger_wins_parent_cancellation_race_without_second_close(self):
+        await self.entry(size=3, filled=1)
+        cancel = self.trade.cancel_order
+        async def native_wins(inst_id, order_id):
+            self.exchange.fill(order_id)
+            self.exchange.trigger_protection(next(iter(self.exchange.algos)))
+            return await cancel(inst_id, order_id)
+        with patch.object(self.trade, "cancel_order", side_effect=native_wins):
+            result = await self.run_handoff()
+        self.assertEqual(result["action"], "protection_native_completed", result)
+        self.assertEqual(self.exchange.order_submissions, [])
+        self.assertEqual(len(self.cancellations()), 0)
+
+    async def test_native_query_outage_after_parent_cancel_never_means_absence(self):
+        await self.entry(size=3, filled=1)
+        with patch.object(self.account, "algo_order_details", side_effect=OkxAccountError("fixture outage", code="50011")):
+            result = await self.run_handoff()
+        self.assertEqual(result["reasons"], ["handoff_native_query_unavailable"])
+        self.assertEqual(self.exchange.order_submissions, [])
+        result = await self.run_handoff()
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(sum(row["path"] == "/api/v5/trade/cancel-order" for row in self.exchange.posts), 1)
+
+    async def test_malformed_empty_native_lookup_does_not_authorize_partial_parent_close(self):
+        await self.entry(size=3, filled=1)
+        with patch.object(self.account, "algo_order_details", side_effect=OkxAccountError("Exact algo lookup did not return one order")):
+            result = await self.run_handoff()
+        self.assertEqual(result["reasons"], ["handoff_native_query_unavailable"])
+        self.assertEqual(self.exchange.order_submissions, [])
+
+    async def test_parent_amendment_during_cancel_requires_review(self):
+        await self.entry(size=3, filled=1)
+        cancel = self.trade.cancel_order
+        async def amend(inst_id, order_id):
+            self.exchange.orders[order_id]["attachAlgoOrds"][0]["slTriggerPx"] = "70"
+            return await cancel(inst_id, order_id)
+        with patch.object(self.trade, "cancel_order", side_effect=amend):
+            result = await self.run_handoff()
+        self.assertEqual(result["reasons"], ["handoff_opening_changed"])
+        self.assertEqual(self.exchange.order_submissions, [])
+
+    async def test_partial_parent_concurrent_managers_cancel_and_close_once(self):
+        await self.entry(size=3, filled=1)
+        results = await asyncio.gather(self.run_handoff(), self.run_handoff())
+        self.assertEqual(sum(bool(row.get("accepted")) and not row.get("idempotent") for row in results), 1, results)
+        self.assertEqual(sum(row["path"] == "/api/v5/trade/cancel-order" for row in self.exchange.posts), 1)
+        self.assertEqual(len(self.exchange.order_submissions), 1)
+
+    async def test_parent_cancel_503_retries_require_backoff_and_fresh_market(self):
+        await self.entry(size=3, filled=1)
+        with patch.object(self.trade, "cancel_order", side_effect=OkxTradeError("fixture 503")) as cancel:
+            await self.run_handoff()
+            await self.run_handoff()
+            self.assertEqual(cancel.call_count, 1)
+        handoff = self.store.protection_handoffs(self.account.account_scope)[0]
+        self.store.update_protection_handoff(handoff, cancel_after_ms=0)
+        result = await self.manager.run(SYMBOL, 85, dry_run=False, market_data_fresh=False)
+        self.assertEqual(result["reasons"], ["handoff_market_data_stale"])
+        self.assertEqual(self.exchange.posts, [])
+        result = await self.run_handoff()
+        self.assertTrue(result["accepted"], result)
+
+    async def test_already_canceled_partial_parent_is_recovered_without_second_cancel(self):
+        raw = await self.entry(size=3, filled=1)
+        await self.trade.cancel_order(SYMBOL, raw["ordId"])
+        await self.sync.sync_rest()
+        result = await self.run_handoff()
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(result["order"]["size"], 1)
+        self.assertEqual(sum(row["path"] == "/api/v5/trade/cancel-order" for row in self.exchange.posts), 1)
+
+    async def test_partial_parent_preview_does_not_cancel_or_create_handoff(self):
+        await self.entry(size=3, filled=1)
+        result = await self.manager.run(SYMBOL, 85, dry_run=True, market_data_fresh=True)
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(self.exchange.posts, [])
+        self.assertEqual(self.store.protection_handoffs(self.account.account_scope), [])
+
+    async def test_parent_query_account_change_prevents_cancellation(self):
+        await self.entry(size=3, filled=1)
+        query = self.account.order_details
+        calls = 0
+        async def change(*args, **kwargs):
+            nonlocal calls
+            result = await query(*args, **kwargs)
+            calls += 1
+            if calls == 2:
+                self.account.api_key = self.trade.api_key = "another-fixture-account"
+            return result
+        with patch.object(self.account, "order_details", side_effect=change):
+            result = await self.run_handoff()
+        self.assertEqual(result["reasons"], ["handoff_account_changed"])
+        self.assertEqual(self.exchange.posts, [])
+
+    async def test_native_appearing_during_close_preflight_blocks_unprotected_close(self):
+        raw = await self.entry(size=3, filled=1)
+        prepare = self.engine.preflight.prepare
+        async def appear(*args, **kwargs):
+            if kwargs.get("expected_protection", {}).get("kind") == "handoff":
+                with self.exchange.lock:
+                    self.exchange.algos["latealgo"] = {
+                        **raw["attachAlgoOrds"][0], "algoId": "latealgo",
+                        "algoClOrdId": raw["attachAlgoOrds"][0]["attachAlgoClOrdId"],
+                        "instId": SYMBOL, "posSide": "net", "tdMode": "isolated", "side": "sell",
+                        "sz": "1", "reduceOnly": True, "ordType": "oco", "state": "live",
+                        "cTime": raw["cTime"], "uTime": raw["uTime"],
+                    }
+            return await prepare(*args, **kwargs)
+        with patch.object(self.engine.preflight, "prepare", side_effect=appear):
+            result = await self.run_handoff()
+        self.assertEqual(result["reasons"], ["close_handoff_unverified"])
+        self.assertEqual(self.exchange.order_submissions, [])
+        result = await self.run_handoff()
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(len(self.cancellations()), 1)
+
+    async def test_legacy_handoff_schema_preserves_pending_intent_during_upgrade(self):
+        await self.entry()
+        async def accepted_only(inst_id, algo_id):
+            return {"data": [{"algoId": algo_id, "sCode": "0"}]}
+        with patch.object(self.trade, "cancel_algo_order", side_effect=accepted_only):
+            await self.run_handoff()
+        original = self.store.protection_handoffs(self.account.account_scope)[0]
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("ALTER TABLE protection_handoffs DROP COLUMN native_evidence_json")
+            connection.commit()
+        self.reopen()
+        restored = self.store.protection_handoffs(self.account.account_scope)[0]
+        self.assertEqual(restored, original)
+        result = await self.run_handoff()
+        self.assertEqual(result["action"], "protection_cancel_pending")
+        self.assertEqual(self.exchange.posts, [])
+        self.store.update_protection_handoff(restored, cancel_after_ms=0)
+        result = await self.run_handoff()
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(len(self.cancellations()), 1)
+        self.assertEqual(len(self.exchange.order_submissions), 1)
 
 
 if __name__ == "__main__":
