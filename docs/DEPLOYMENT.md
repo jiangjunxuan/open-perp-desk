@@ -25,6 +25,9 @@ chmod +x infra/openperpdesk.sh
 
 编辑 `.env`，至少设置一个随机的 `ADMIN_API_TOKEN`。首次运行保持：
 
+本机 `APP_ENV=development` 或 `test` 可以暂时使用 `admin` 进行页面联调；
+生产和预发布环境仍强制要求至少 16 位令牌，不能沿用这个开发密码。
+
 ```dotenv
 APP_ENV=production
 TRADING_MODE=demo
