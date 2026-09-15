@@ -1,0 +1,10 @@
+# Core versions used by the real-framework/local-provider smoke test.
+# This is not a complete transitive dependency lock or a container acceptance result.
+langchain-core==1.6.3
+langchain-openai==1.6.2
+langgraph==1.2.11
+langgraph-checkpoint==4.2.0
+langgraph-checkpoint-sqlite==3.1.1
+openai==3.13.0
+pandas==3.0.5
+yfinance==1.7.0

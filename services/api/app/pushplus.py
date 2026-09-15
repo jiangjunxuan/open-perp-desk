@@ -1,11 +1,20 @@
+import json
 import os
+import re
 from typing import Any
 
 import httpx
 
 
 class PushPlusError(RuntimeError):
-    """Raised when a PushPlus notification cannot be delivered."""
+    """Safe failure metadata; upstream messages and URLs never leave this client."""
+
+    CODES = {"pushplus_unconfigured", "pushplus_rejected", "pushplus_acceptance_unknown"}
+
+    def __init__(self, code: str = "pushplus_acceptance_unknown") -> None:
+        self.code = code if code in self.CODES else "pushplus_acceptance_unknown"
+        self.acceptance_unknown = self.code == "pushplus_acceptance_unknown"
+        super().__init__(self.code)
 
 
 class PushPlusClient:
@@ -30,7 +39,7 @@ class PushPlusClient:
         topic: str | None = None,
     ) -> dict[str, Any]:
         if not self.configured:
-            raise PushPlusError("PushPlus token is not configured")
+            raise PushPlusError("pushplus_unconfigured")
 
         payload: dict[str, str] = {
             "token": self.token,
@@ -46,12 +55,31 @@ class PushPlusClient:
                 transport=self.transport,
                 timeout=httpx.Timeout(10.0, connect=5.0),
             ) as client:
-                response = await client.post(self.base_url, json=payload)
-                response.raise_for_status()
-                result = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            raise PushPlusError(f"PushPlus request failed: {exc}") from exc
+                async with client.stream("POST", self.base_url, json=payload) as response:
+                    response.raise_for_status()
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes(8192):
+                        body.extend(chunk)
+                        if len(body) > 65_536:
+                            raise PushPlusError("pushplus_acceptance_unknown")
+                    result = json.loads(body)
+        except (httpx.HTTPError, ValueError):
+            # A failed POST response is not proof that the provider rejected it.
+            raise PushPlusError("pushplus_acceptance_unknown") from None
 
-        if str(result.get("code")) != "200":
-            raise PushPlusError(result.get("msg") or "PushPlus returned an unknown error")
-        return {"code": result.get("code"), "msg": result.get("msg", "")}
+        if not isinstance(result, dict) or type(result.get("code")) not in {int, str}:
+            raise PushPlusError("pushplus_acceptance_unknown")
+        if not re.fullmatch(r"[0-9]{3}", str(result["code"])):
+            raise PushPlusError("pushplus_acceptance_unknown")
+        if str(result["code"]) != "200":
+            raise PushPlusError("pushplus_rejected")
+        message_id = result.get("data")
+        if message_id not in (None, "") and (
+            not isinstance(message_id, str) or not re.fullmatch(r"[a-fA-F0-9]{32}", message_id)
+            or message_id.casefold() == self.token.casefold()
+        ):
+            raise PushPlusError("pushplus_acceptance_unknown")
+        return {
+            "code": result["code"], "msg": "request_accepted", "accepted": True,
+            "delivery_confirmed": False, "message_id": message_id or None,
+        }

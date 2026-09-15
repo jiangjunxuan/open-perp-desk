@@ -4,18 +4,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 ARG TRADINGAGENTS_REPOSITORY=https://github.com/TauricResearch/TradingAgents.git
-ARG TRADINGAGENTS_REF=main
+ARG TRADINGAGENTS_REF=be952b8eccb49720509af544c6675233bc1f10d0
 
 WORKDIR /app
 
 COPY services/api/requirements.txt /tmp/openperpdesk-requirements.txt
+COPY services/api/tradingagents-constraints.txt /tmp/tradingagents-constraints.txt
 RUN pip install --no-cache-dir -r /tmp/openperpdesk-requirements.txt \
     && apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
     && git clone --depth 1 "${TRADINGAGENTS_REPOSITORY}" /opt/tradingagents \
     && git -C /opt/tradingagents fetch --depth 1 origin "${TRADINGAGENTS_REF}" \
     && git -C /opt/tradingagents checkout --detach "${TRADINGAGENTS_REF}" \
-    && pip install --no-cache-dir /opt/tradingagents \
+    && pip install --no-cache-dir -c /tmp/tradingagents-constraints.txt /opt/tradingagents \
     && apt-get purge -y --auto-remove git \
     && rm -rf /var/lib/apt/lists/* /root/.cache
 
@@ -26,4 +27,4 @@ RUN mkdir -p /data/tradingagents/cache /data/tradingagents/results /data/trading
 USER nobody
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-graceful-shutdown", "20"]

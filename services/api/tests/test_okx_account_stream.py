@@ -87,6 +87,77 @@ class OkxAccountStreamTests(unittest.TestCase):
         self.assertEqual(snapshot["positions"][0]["instId"], "BTC-USDT-SWAP")
         self.assertEqual(snapshot["orders"][0]["ordId"], "123")
 
+    def test_consume_captures_latest_fill_from_order_event(self) -> None:
+        stream = OkxAccountStream()
+        stream.consume(
+            json.dumps(
+                {
+                    "arg": {"channel": "orders"},
+                    "data": [
+                        {
+                            "ordId": "123",
+                            "tradeId": "trade-1",
+                            "instId": "BTC-USDT-SWAP",
+                            "side": "buy",
+                            "posSide": "net",
+                            "fillPx": "50000",
+                            "fillSz": "1",
+                            "fillFee": "-0.1",
+                            "fillPnl": "2.5",
+                            "fillTime": "1760000000000",
+                            "state": "filled",
+                        }
+                    ],
+                }
+            )
+        )
+
+        snapshot = stream.snapshot()
+        self.assertEqual(snapshot["fills"][0]["tradeId"], "trade-1")
+        self.assertEqual(snapshot["fills"][0]["fillPx"], "50000")
+
+    def test_reauthentication_requires_new_account_data(self) -> None:
+        stream = OkxAccountStream()
+        stream.connected = True
+        stream.consume(json.dumps({"event": "login", "code": "0"}))
+        self.assertFalse(stream.account_ready)
+        stream.consume(json.dumps({
+            "arg": {"channel": "account"}, "data": [{"totalEq": "1000"}],
+        }))
+        self.assertTrue(stream.account_ready)
+        stream.consume(json.dumps({"event": "login", "code": "0"}))
+        self.assertEqual(stream.snapshot()["balance"], [])
+        self.assertFalse(stream.account_ready)
+        for message in [
+            {"event": "subscribe", "arg": {"channel": "account"}},
+            {"arg": {"channel": "account"}, "data": []},
+            {"arg": {"channel": "positions"}, "data": [{"pos": "0"}]},
+        ]:
+            stream.consume(json.dumps(message))
+            self.assertFalse(stream.account_ready)
+        stream.consume(json.dumps({
+            "arg": {"channel": "account"}, "data": [{"totalEq": "0"}],
+        }))
+        self.assertTrue(stream.snapshot()["account_ready"])
+        self.assertEqual(stream.balance, [{"totalEq": "0"}])
+        stream.consume(json.dumps({"event": "login", "code": "60009"}))
+        self.assertFalse(stream.account_ready)
+        self.assertEqual(stream.balance, [])
+
+    def test_order_events_without_finite_positive_fills_are_ignored(self) -> None:
+        stream = OkxAccountStream()
+        for value in ("0", "-1", "NaN", "Infinity", "invalid"):
+            stream.consume(json.dumps({
+                "arg": {"channel": "orders"},
+                "data": [{
+                    "ordId": "123",
+                    "tradeId": f"invalid-{value}",
+                    "fillPx": value,
+                    "fillSz": "1",
+                }],
+            }))
+        self.assertEqual(stream.snapshot()["fills"], [])
+
     def test_incremental_events_preserve_other_balances_and_positions(self) -> None:
         stream = OkxAccountStream()
         stream.consume(

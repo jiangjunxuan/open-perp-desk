@@ -4,21 +4,27 @@ import hmac
 import json
 import os
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Literal
 
 import httpx
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .live_safety import LiveSafetyGate
+from .position_protection import attached_algo_client_id
 
 
 class OkxTradeError(RuntimeError):
     """Raised when a guarded OKX demo order cannot be completed."""
 
+class OkxOrderRejected(OkxTradeError):
+    """A local guard or explicit exchange response proves no order was accepted."""
+
 
 class OrderRequest(BaseModel):
     """A deliberately narrow SWAP order shape for the first executor."""
 
+    model_config = ConfigDict(allow_inf_nan=False)
     inst_id: str = Field(min_length=9, max_length=40, pattern=r"^[A-Z0-9-]+$")
     side: Literal["buy", "sell"]
     td_mode: Literal["isolated", "cross"] = "isolated"
@@ -33,7 +39,7 @@ class OrderRequest(BaseModel):
         default=None,
         min_length=1,
         max_length=32,
-        pattern=r"^[A-Za-z0-9_-]+$",
+        pattern=r"^[A-Za-z0-9]+$",
     )
 
     @model_validator(mode="after")
@@ -59,13 +65,14 @@ class OrderRequest(BaseModel):
         }
         if self.px is not None:
             payload["px"] = self._number(self.px)
-        if self.reduce_only:
+        if self.reduce_only and self.pos_side == "net":
             payload["reduceOnly"] = True
         if self.stop_loss is not None or self.take_profit is not None:
             attached: dict[str, Any] = {
-                "attachAlgoClOrdId": f"{self.cl_ord_id or 'opd'}-protect",
                 "tpOrdKind": "condition",
             }
+            if self.cl_ord_id:
+                attached["attachAlgoClOrdId"] = attached_algo_client_id(self.cl_ord_id)
             if self.take_profit is not None:
                 attached.update(
                     {
@@ -89,7 +96,8 @@ class OrderRequest(BaseModel):
 
     @staticmethod
     def _number(value: float) -> str:
-        return format(value, "f").rstrip("0").rstrip(".")
+        text = format(Decimal(str(value)), "f")
+        return text.rstrip("0").rstrip(".") if "." in text else text
 
 
 class OkxTradeClient:
@@ -171,35 +179,13 @@ class OkxTradeClient:
         return headers
 
     async def place_order(self, order: OrderRequest) -> dict[str, Any]:
-        self._assert_enabled()
-        path = "/api/v5/trade/order"
-        body = json.dumps(order.okx_payload(), separators=(",", ":"))
-        timestamp = self.timestamp()
-        try:
-            async with httpx.AsyncClient(
-                proxy=self.proxy_url,
-                transport=self.transport,
-                timeout=httpx.Timeout(10.0, connect=5.0),
-                headers=self._headers(timestamp, path, body),
-            ) as client:
-                response = await client.post(f"{self.base_url}{path}", content=body)
-                response.raise_for_status()
-                payload = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            raise OkxTradeError(f"OKX order request failed: {exc}") from exc
-
-        if payload.get("code") != "0":
-            raise OkxTradeError(payload.get("msg") or "OKX returned an unknown error")
+        payload = await self._post("/api/v5/trade/order", order.okx_payload())
         self._raise_for_order_row_error(payload)
         return payload
 
-    async def cancel_order(self, inst_id: str, ord_id: str) -> dict[str, Any]:
+    async def _post(self, path: str, parameters: dict[str, Any] | list[dict[str, Any]]) -> dict[str, Any]:
         self._assert_enabled()
-        path = "/api/v5/trade/cancel-order"
-        body = json.dumps(
-            {"instId": inst_id, "ordId": ord_id},
-            separators=(",", ":"),
-        )
+        body = json.dumps(parameters, separators=(",", ":"))
         timestamp = self.timestamp()
         try:
             async with httpx.AsyncClient(
@@ -212,10 +198,61 @@ class OkxTradeClient:
                 response.raise_for_status()
                 payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
-            raise OkxTradeError(f"OKX cancel request failed: {exc}") from exc
+            raise OkxTradeError(f"OKX request failed: {type(exc).__name__}") from exc
 
         if payload.get("code") != "0":
-            raise OkxTradeError(payload.get("msg") or "OKX returned an unknown error")
+            raise OkxOrderRejected(payload.get("msg") or "OKX returned an unknown error")
+        return payload
+
+    async def cancel_order(self, inst_id: str, ord_id: str) -> dict[str, Any]:
+        return await self._post(
+            "/api/v5/trade/cancel-order", {"instId": inst_id, "ordId": ord_id},
+        )
+
+    async def cancel_algo_order(self, inst_id: str, algo_id: str) -> dict[str, Any]:
+        return await self._post(
+            "/api/v5/trade/cancel-algos", [{"instId": inst_id, "algoId": algo_id}],
+        )
+
+    async def amend_algo_size(self, inst_id: str, algo_id: str, size: str, request_id: str) -> dict[str, Any]:
+        try:
+            quantity = Decimal(size)
+        except Exception as exc:
+            raise OkxOrderRejected("Algo amendment size is invalid.") from exc
+        if not quantity.is_finite() or quantity <= 0:
+            raise OkxOrderRejected("Algo amendment requires a positive finite size.")
+        if not request_id.isascii() or not request_id.isalnum() or len(request_id) > 32:
+            raise OkxOrderRejected("Algo amendment request ID is invalid.")
+        normalized = format(quantity.normalize(), "f")
+        return await self._post("/api/v5/trade/amend-algos", {
+            "instId": inst_id, "algoId": algo_id, "newSz": normalized,
+            "reqId": request_id, "cxlOnFail": False,
+        })
+
+    async def set_leverage(
+        self, inst_id: str, leverage: float, mgn_mode: str, pos_side: str,
+    ) -> dict[str, Any]:
+        parameters = {
+            "instId": inst_id,
+            "lever": OrderRequest._number(leverage),
+            "mgnMode": mgn_mode,
+        }
+        if mgn_mode == "isolated" and pos_side in {"long", "short"}:
+            parameters["posSide"] = pos_side
+        payload = await self._post("/api/v5/account/set-leverage", parameters)
+        rows = payload.get("data") or []
+        try:
+            matched = any(
+                row.get("instId") == inst_id
+                and row.get("mgnMode") == mgn_mode
+                and Decimal(str(row.get("lever"))) == Decimal(str(leverage))
+                and ("posSide" not in parameters or row.get("posSide") == pos_side)
+                for row in rows
+            )
+        except Exception as exc:
+            raise OkxTradeError("Leverage acknowledgement is invalid") from exc
+        if not matched:
+            raise OkxTradeError("Leverage acknowledgement does not match the approved order")
         return payload
 
     @staticmethod
@@ -226,7 +263,7 @@ class OkxTradeClient:
             raise OkxTradeError("OKX order response did not contain an order result")
         row = rows[0] or {}
         if str(row.get("sCode", "0")) != "0":
-            raise OkxTradeError(
+            raise OkxOrderRejected(
                 row.get("sMsg")
                 or row.get("msg")
                 or f"OKX order rejected with sCode={row.get('sCode')}"
@@ -237,13 +274,13 @@ class OkxTradeClient:
     def _assert_enabled(self) -> None:
         if self.demo and self.trading_mode == "demo":
             if not self.execution_enabled:
-                raise OkxTradeError("Execution is disabled by EXECUTION_ENABLED.")
+                raise OkxOrderRejected("Execution is disabled by EXECUTION_ENABLED.")
             if not self.configured:
-                raise OkxTradeError("OKX credentials are not configured.")
+                raise OkxOrderRejected("OKX credentials are not configured.")
             return
         if not self.live_gate.allowed:
-            raise OkxTradeError(
+            raise OkxOrderRejected(
                 "Live order execution is blocked by the independent safety gate."
             )
         if not self.configured:
-            raise OkxTradeError("OKX credentials are not configured.")
+            raise OkxOrderRejected("OKX credentials are not configured.")

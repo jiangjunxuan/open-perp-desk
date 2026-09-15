@@ -1,9 +1,12 @@
+import asyncio
 import base64
 import hashlib
 import hmac
+import json
 import os
+from collections.abc import AsyncIterator
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import urlencode
 
 import httpx
@@ -12,19 +15,39 @@ import httpx
 class OkxAccountError(RuntimeError):
     """Raised when a signed OKX account request cannot be completed."""
 
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
 
 class OkxAccountClient:
-    def __init__(self) -> None:
+    def __init__(self, transport: httpx.AsyncBaseTransport | None = None) -> None:
         self.base_url = os.getenv("OKX_REST_BASE_URL", "https://www.okx.com").rstrip("/")
         self.api_key = os.getenv("OKX_API_KEY", "").strip()
         self.secret_key = os.getenv("OKX_SECRET_KEY", "").strip()
         self.passphrase = os.getenv("OKX_PASSPHRASE", "").strip()
         self.proxy_url = os.getenv("OKX_PROXY_URL", "").strip() or None
         self.demo = os.getenv("OKX_DEMO", "true").lower() == "true"
+        self.transport = transport
+        self._bill_request_lock = asyncio.Lock()
+        self._last_bill_request = 0.0
+        self._archive_request_lock = asyncio.Lock()
+        self._last_archive_request = 0.0
+        self._order_request_lock = asyncio.Lock()
+        self._last_order_request = 0.0
+        self._fill_request_lock = asyncio.Lock()
+        self._last_fill_request = 0.0
+        self._quarter_request_lock = asyncio.Lock()
+        self._last_quarter_request = 0.0
 
     @property
     def configured(self) -> bool:
         return all((self.api_key, self.secret_key, self.passphrase))
+
+    @property
+    def account_scope(self) -> str:
+        identity = f"{self.base_url}\n{self.demo}\n{self.api_key}"
+        return hashlib.sha256(identity.encode()).hexdigest()
 
     @staticmethod
     def timestamp() -> str:
@@ -45,14 +68,17 @@ class OkxAccountClient:
         digest = hmac.new(secret_key.encode(), message, hashlib.sha256).digest()
         return base64.b64encode(digest).decode()
 
-    def _headers(self, timestamp: str, request_path: str) -> dict[str, str]:
+    def _headers(
+        self, timestamp: str, request_path: str, *, method: str = "GET", body: str = "",
+    ) -> dict[str, str]:
         headers = {
             "Accept": "application/json",
             "OK-ACCESS-KEY": self.api_key,
             "OK-ACCESS-SIGN": self.signature(
                 timestamp,
-                "GET",
+                method,
                 request_path,
+                body=body,
                 secret_key=self.secret_key,
             ),
             "OK-ACCESS-TIMESTAMP": timestamp,
@@ -60,6 +86,8 @@ class OkxAccountClient:
         }
         if self.demo:
             headers["x-simulated-trading"] = "1"
+        if method == "POST":
+            headers["Content-Type"] = "application/json"
         return headers
 
     async def _get(
@@ -67,27 +95,117 @@ class OkxAccountClient:
         path: str,
         params: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]:
+        return await self._request(path, params)
+
+    async def _request(
+        self, path: str, params: dict[str, str] | None = None, *,
+        method: str = "GET", body: str = "",
+    ) -> list[dict[str, Any]]:
         if not self.configured:
             raise OkxAccountError("OKX read-only credentials are not configured")
 
         query = f"?{urlencode(params)}" if params else ""
         request_path = f"{path}{query}"
+        if path == "/api/v5/account/bills-history-archive" and method == "POST":
+            async with self._quarter_request_lock:
+                loop = asyncio.get_running_loop()
+                delay = 10.1 - (loop.time() - self._last_quarter_request)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                self._last_quarter_request = loop.time()
+        elif path == "/api/v5/account/bills":
+            async with self._bill_request_lock:
+                loop = asyncio.get_running_loop()
+                delay = 0.21 - (loop.time() - self._last_bill_request)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                self._last_bill_request = loop.time()
+        elif path == "/api/v5/account/bills-archive":
+            async with self._archive_request_lock:
+                loop = asyncio.get_running_loop()
+                delay = 0.41 - (loop.time() - self._last_archive_request)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                self._last_archive_request = loop.time()
+        elif path == "/api/v5/trade/fills-history":
+            async with self._fill_request_lock:
+                loop = asyncio.get_running_loop()
+                delay = 0.21 - (loop.time() - self._last_fill_request)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                self._last_fill_request = loop.time()
+        elif path.startswith("/api/v5/trade/"):
+            async with self._order_request_lock:
+                loop = asyncio.get_running_loop()
+                delay = 0.11 - (loop.time() - self._last_order_request)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                self._last_order_request = loop.time()
         timestamp = self.timestamp()
         try:
             async with httpx.AsyncClient(
                 proxy=self.proxy_url,
+                transport=self.transport,
                 timeout=httpx.Timeout(10.0, connect=5.0),
-                headers=self._headers(timestamp, request_path),
+                headers=self._headers(timestamp, request_path, method=method, body=body),
             ) as client:
-                response = await client.get(f"{self.base_url}{path}", params=params)
+                response = await client.request(
+                    method, f"{self.base_url}{path}", params=params, content=body or None,
+                )
                 response.raise_for_status()
                 payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
-            raise OkxAccountError(f"OKX account request failed: {exc}") from exc
+            raise OkxAccountError(f"OKX account request failed: {type(exc).__name__}") from exc
 
+        if not isinstance(payload, dict):
+            raise OkxAccountError("Invalid OKX account response")
         if payload.get("code") != "0":
-            raise OkxAccountError(payload.get("msg") or "OKX returned an unknown error")
-        return payload.get("data", [])
+            raise OkxAccountError(
+                payload.get("msg") or "OKX returned an unknown error",
+                code=str(payload.get("code") or ""),
+            )
+        data = payload.get("data")
+        if not isinstance(data, list) or any(not isinstance(row, dict) for row in data):
+            raise OkxAccountError("Invalid OKX account data")
+        return data
+
+    async def apply_bill_archive(self, year: int, quarter: str) -> dict[str, Any]:
+        from .bill_archive import quarter_days
+        quarter_days(year, quarter)
+        rows = await self._request(
+            "/api/v5/account/bills-history-archive", method="POST",
+            body=json.dumps({"year": str(year), "quarter": quarter}, separators=(",", ":")),
+        )
+        if len(rows) != 1 or rows[0].get("result") not in {"true", "false"}:
+            raise OkxAccountError("archive_application_invalid")
+        return rows[0]
+
+    async def bill_archive_status(self, year: int, quarter: str) -> dict[str, Any]:
+        from .bill_archive import quarter_days
+        quarter_days(year, quarter)
+        rows = await self._get(
+            "/api/v5/account/bills-history-archive", {"year": str(year), "quarter": quarter},
+        )
+        if len(rows) != 1 or rows[0].get("state") not in {"ongoing", "finished", "failed"}:
+            raise OkxAccountError("archive_status_invalid")
+        return rows[0]
+
+    async def bill_subtypes(self) -> dict[str, str]:
+        rows = await self._get("/api/v5/account/subtypes")
+        mapping: dict[str, str] = {}
+        for row in rows:
+            kind = row.get("type")
+            details = row.get("subTypeDetails")
+            if not isinstance(kind, str) or not kind.isdigit() or not isinstance(details, list):
+                raise OkxAccountError("archive_subtypes_invalid")
+            for detail in details:
+                subtype = detail.get("subType") if isinstance(detail, dict) else None
+                if not isinstance(subtype, str) or not subtype.isdigit():
+                    raise OkxAccountError("archive_subtypes_invalid")
+                if subtype in mapping and mapping[subtype] != kind:
+                    raise OkxAccountError("archive_subtypes_conflict")
+                mapping[subtype] = kind
+        return mapping
 
     async def balance(self) -> list[dict[str, Any]]:
         return await self._get("/api/v5/account/balance")
@@ -99,10 +217,96 @@ class OkxAccountClient:
         return await self._get("/api/v5/account/config")
 
     async def pending_orders(self) -> list[dict[str, Any]]:
-        return await self._get(
+        return await self._all_pages(
             "/api/v5/trade/orders-pending",
             {"instType": "SWAP"},
+            cursor_field="ordId",
         )
+
+    async def _all_pages(
+        self,
+        path: str,
+        params: dict[str, str],
+        *,
+        cursor_field: str,
+        page_size: int = 100,
+        on_page: Callable[[], Awaitable[None]] | None = None,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        page_size = max(1, min(page_size, 100))
+        query = {**params, "limit": str(page_size)}
+        for _ in range(100):
+            page = await self._get(path, query)
+            if on_page is not None:
+                await on_page()
+            if len(page) > page_size:
+                raise OkxAccountError("Invalid account pagination page size")
+            for row in page:
+                cursor = str(row.get(cursor_field) or "")
+                if not cursor or cursor in seen:
+                    raise OkxAccountError("Incomplete or repeated account pagination")
+                seen.add(cursor)
+                rows.append(row)
+            if len(page) < page_size:
+                return rows
+            query["after"] = str(page[-1][cursor_field])
+        raise OkxAccountError("Account pagination safety limit reached")
+
+    async def fills_today(self) -> list[dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+        begin = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return await self._all_pages(
+            "/api/v5/trade/fills-history",
+            {
+                "instType": "SWAP",
+                "begin": str(int(begin.timestamp() * 1000)),
+                "end": str(int(now.timestamp() * 1000)),
+            },
+            cursor_field="billId",
+        )
+
+    async def bills_today(self, *, as_of: datetime | None = None) -> list[dict[str, Any]]:
+        now = as_of or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            raise OkxAccountError("Bill snapshot timezone is required")
+        now = now.astimezone(timezone.utc)
+        begin = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return await self._all_pages(
+            "/api/v5/account/bills",
+            {
+                "instType": "SWAP",
+                "begin": str(int(begin.timestamp() * 1000)),
+                "end": str(int(now.timestamp() * 1000)),
+            },
+            cursor_field="billId",
+        )
+
+    async def bills_archive(
+        self, begin_ms: int, end_ms: int, *,
+        on_page: Callable[[], Awaitable[None]] | None = None,
+    ) -> list[dict[str, Any]]:
+        if begin_ms <= 0 or end_ms <= begin_ms:
+            raise OkxAccountError("Invalid archive window")
+        # Do not filter by instType: funding-account transfers have no instrument.
+        rows = await self._all_pages(
+            "/api/v5/account/bills-archive",
+            {"begin": str(begin_ms - 1), "end": str(end_ms)},
+            cursor_field="billId", on_page=on_page,
+        )
+        selected = []
+        for row in rows:
+            try:
+                timestamp = int(str(row.get("ts")))
+            except (ValueError, TypeError) as exc:
+                raise OkxAccountError("Invalid archive timestamp") from exc
+            if not begin_ms - 1 <= timestamp <= end_ms:
+                raise OkxAccountError("Archive response outside requested window")
+            # Pad remote filters by one millisecond, then enforce [begin, end)
+            # locally so endpoint inclusivity cannot drop a boundary record.
+            if begin_ms <= timestamp < end_ms:
+                selected.append(row)
+        return selected
 
     async def orders_history(
         self,
@@ -133,21 +337,58 @@ class OkxAccountClient:
             params["instId"] = inst_id
         return await self._get("/api/v5/trade/fills-history", params)
 
+    async def position_fill_pages(
+        self, inst_id: str, *, page_size: int = 100,
+    ) -> AsyncIterator[list[dict[str, Any]]]:
+        if not inst_id.endswith("-SWAP"):
+            raise OkxAccountError("Position fill history requires a SWAP instrument")
+        page_size = max(1, min(page_size, 100))
+        params = {"instType": "SWAP", "instId": inst_id, "limit": str(page_size)}
+        previous: int | None = None
+        for _ in range(100):
+            page = await self._get("/api/v5/trade/fills-history", params)
+            if len(page) > page_size:
+                raise OkxAccountError("Position fill page exceeded requested size")
+            for row in page:
+                bill_id = row.get("billId")
+                if (
+                    not isinstance(bill_id, str) or not bill_id.isascii() or not bill_id.isdigit()
+                    or int(bill_id) <= 0 or (previous is not None and int(bill_id) >= previous)
+                    or row.get("instId") != inst_id or row.get("instType") != "SWAP"
+                ):
+                    raise OkxAccountError("Position fill pagination identity or ordering is invalid")
+                previous = int(bill_id)
+            yield page
+            if len(page) < page_size:
+                return
+            params["after"] = str(previous)
+        raise OkxAccountError("Position fill history exceeded pagination limit")
+
     async def pending_algo_orders(
         self,
         inst_id: str | None = None,
         limit: int = 100,
+        *,
+        ord_type: str = "conditional,oco",
     ) -> list[dict[str, Any]]:
         params = {
             "instType": "SWAP",
-            "limit": str(max(1, min(limit, 100))),
+            "ordType": ord_type,
         }
         if inst_id:
             params["instId"] = inst_id
-        return await self._get(
+        return await self._all_pages(
             "/api/v5/trade/orders-algo-pending",
             params,
+            cursor_field="algoId",
+            page_size=limit,
         )
+
+    async def active_algo_orders(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for ord_type in ("conditional,oco", "trigger", "move_order_stop", "iceberg", "twap", "chase", "smart_iceberg"):
+            rows.extend(await self.pending_algo_orders(ord_type=ord_type))
+        return rows
 
     async def algo_orders_history(
         self,
@@ -156,11 +397,64 @@ class OkxAccountClient:
     ) -> list[dict[str, Any]]:
         params = {
             "instType": "SWAP",
-            "limit": str(max(1, min(limit, 100))),
+            "ordType": "conditional,oco",
         }
         if inst_id:
             params["instId"] = inst_id
-        return await self._get(
-            "/api/v5/trade/orders-algo-history",
-            params,
-        )
+        rows: list[dict[str, Any]] = []
+        for state in ("effective", "canceled", "order_failed"):
+            rows.extend(await self._all_pages(
+                "/api/v5/trade/orders-algo-history",
+                {**params, "state": state},
+                cursor_field="algoId",
+                page_size=limit,
+            ))
+        return rows
+
+    async def algo_order_details(
+        self,
+        inst_id: str,
+        *,
+        algo_id: str | None = None,
+        client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not inst_id or not (algo_id or client_order_id):
+            raise OkxAccountError("Algo instrument and identity are required")
+        params = {"algoId": algo_id} if algo_id else {"algoClOrdId": str(client_order_id)}
+        rows = await self._get("/api/v5/trade/order-algo", params)
+        if len(rows) != 1 or not isinstance(rows[0], dict):
+            raise OkxAccountError("Exact algo lookup did not return one order")
+        row = rows[0]
+        if row.get("instId") != inst_id or not row.get("algoId"):
+            raise OkxAccountError("Algo lookup identity mismatch")
+        if algo_id and row["algoId"] != algo_id:
+            raise OkxAccountError("Algo lookup exchange identity mismatch")
+        if client_order_id and row.get("algoClOrdId") != client_order_id:
+            raise OkxAccountError("Algo lookup client identity mismatch")
+        return row
+
+    async def order_details(
+        self,
+        inst_id: str,
+        *,
+        ord_id: str | None = None,
+        client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not inst_id or not (ord_id or client_order_id):
+            raise OkxAccountError("Order instrument and identity are required")
+        params = {"instId": inst_id}
+        if ord_id:
+            params["ordId"] = ord_id
+        else:
+            params["clOrdId"] = str(client_order_id)
+        rows = await self._get("/api/v5/trade/order", params)
+        if len(rows) != 1:
+            raise OkxAccountError("Exact order lookup did not return one order")
+        row = rows[0]
+        if row.get("instId") != inst_id or not row.get("ordId"):
+            raise OkxAccountError("Order lookup identity mismatch")
+        if ord_id and str(row["ordId"]) != ord_id:
+            raise OkxAccountError("Order lookup exchange identity mismatch")
+        if client_order_id and row.get("clOrdId") != client_order_id:
+            raise OkxAccountError("Order lookup client identity mismatch")
+        return row
