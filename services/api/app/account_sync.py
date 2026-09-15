@@ -10,7 +10,8 @@ from .okx_account import OkxAccountClient, OkxAccountError
 from .okx_algo_stream import OkxAlgoOrderStream
 from .okx_account_stream import OkxAccountStream
 from .account_ledger import AccountLedgerError, parse_daily_bills
-from .position_protection import linked_protection
+from .position_protection import attached_algo_client_id, linked_protection
+from .protection_incident import expected_protection
 from .position_lots import PositionLotReconciler
 from .state_store import OrderSnapshotConflict, StateStore
 
@@ -147,7 +148,64 @@ class AccountSynchronizer:
             "updated_at": _timestamp(item.get("uTime")),
             "exchange_updated_ms": _exchange_ms(item.get("uTime")),
         })
+        self._record_attached_protection_failure(previous, item)
         return True
+
+    def _record_attached_protection_failure(
+        self, previous: dict[str, Any] | None, item: dict[str, Any],
+    ) -> None:
+        """Persist explicit OKX attached-protection failures before they disappear."""
+        if (
+            not previous
+            or previous["source"].startswith("okx-")
+            or not (previous.get("stop_loss") or previous.get("take_profit"))
+            or item.get("state") not in {"partially_filled", "filled", "canceled", "mmp_canceled"}
+            or "attachAlgoOrds" not in item
+        ):
+            return
+        attached = item.get("attachAlgoOrds")
+        code, detail = "", ""
+        if not isinstance(attached, list) or len(attached) != 1 or not isinstance(attached[0], dict):
+            code, detail = "attached_protection_missing", "OKX order snapshot did not contain one attached protection record."
+        else:
+            terms = attached[0]
+            raw_code = terms.get("failCode")
+            if raw_code not in (None, "", "0", 0):
+                code = f"attached_protection_{raw_code}"
+                detail = _text(terms.get("failReason") or terms.get("failMsg"), "OKX rejected attached protection.")
+            elif terms.get("attachAlgoClOrdId") != attached_algo_client_id(previous["client_order_id"]):
+                code, detail = "attached_protection_identity_mismatch", "Attached protection client ID does not match the opening order."
+        if not code:
+            return
+        account_scope = previous.get("account_scope") or getattr(self.account_client, "account_scope", None)
+        if not account_scope:
+            return
+        record = self.store.record_protection_incident({
+            "account_scope": account_scope,
+            "inst_id": previous["inst_id"],
+            "position_key": f"{previous['inst_id']}:{previous['pos_side']}:{previous['td_mode']}",
+            "opening_order_id": previous["client_order_id"],
+            "exchange_order_id": previous.get("exchange_order_id") or _text(item.get("ordId")) or None,
+            "expected_protection": expected_protection(previous),
+            "failure_code": code,
+            "failure_detail": detail,
+        })
+        self.store.add_audit(
+            "attached_protection_failed",
+            "OKX attached protection creation failed",
+            severity="error",
+            payload={
+                "incident_id": record["incident_id"], "inst_id": previous["inst_id"],
+                "opening_order_id": previous["client_order_id"], "failure_code": code,
+            },
+        )
+        self._schedule_notification(
+            "attached_protection_failed",
+            "OpenPerpDesk 附带保护创建失败",
+            f"{previous['inst_id']} 开仓 {previous['client_order_id']} 的止盈止损未能确认，已暂停新的开仓并要求人工复核。",
+            severity="error",
+            payload={"incident_id": record["incident_id"], "failure_code": code},
+        )
 
     def _local_protection(
         self,
@@ -257,6 +315,16 @@ class AccountSynchronizer:
                 },
                 severity="warning" if status.lower() in {"failed", "order_failed"} else "info",
             )
+        account_scope = getattr(self.account_client, "account_scope", None)
+        owner = next((
+            row for row in self.store.managed_opening_orders(account_scope, str(item.get("instId") or ""))
+            if attached_algo_client_id(row["client_order_id"]) == client_order_id
+        ), None) if account_scope else None
+        if owner:
+            self.store.supersede_protection_incident(
+                account_scope, owner["client_order_id"],
+                reason="A matching native protection order was observed.",
+            )
         return True
 
     def _save_fill(
@@ -365,6 +433,11 @@ class AccountSynchronizer:
             str(item.get("instId", "")), pos_side, size,
             td_mode=td_mode, account_scope=scope, trade_id=trade_id,
         )
+        if owner and scope:
+            self.store.supersede_protection_incident(
+                scope, owner,
+                reason="A matching native protection order was observed.",
+            )
         previous = self.store.get_position(key)
         self.store.upsert_position({
             "position_key": key,

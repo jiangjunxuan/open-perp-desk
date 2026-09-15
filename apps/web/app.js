@@ -35,6 +35,7 @@ const state = {
   records: { positions: null, orders: null, fills: null },
   handoffs: [],
   adjustments: [],
+  incidents: [],
   chartMode: "candles",
   chartRange: 80,
   chartCursorTime: null,
@@ -1270,6 +1271,48 @@ function renderProtectionAdjustments(rows) {
   renderProtectionHandoffs(state.handoffs);
 }
 
+function renderProtectionIncidents(rows) {
+  state.incidents = rows || [];
+  const active = state.incidents.filter(row => ["open", "review"].includes(row.status));
+  const section = $("#protection-incidents");
+  if (!section) return;
+  section.hidden = !active.length;
+  setText("#protection-incident-summary", active.length
+    ? `${active.length} 笔附带保护未确认，新的开仓已暂停。`
+    : "");
+  const list = $("#protection-incident-list");
+  list.innerHTML = active.map(row => {
+    const expected = row.expected_protection || {};
+    return `<article class="protection-incident" data-incident-id="${escapeHtml(row.incident_id)}">
+      <div class="protection-incident-meta">
+        <strong>${escapeHtml(row.inst_id)}</strong>
+        <span class="mono">${escapeHtml(row.failure_code || "unknown")}</span>
+        <span>${escapeHtml(formatTime(row.created_at))}</span>
+      </div>
+      <div class="protection-incident-meta">
+        <span>开仓单</span>
+        <strong class="mono">${escapeHtml(row.opening_order_id)}</strong>
+        <span>交易所单号 ${escapeHtml(row.exchange_order_id || "--")}</span>
+      </div>
+      <div class="protection-incident-evidence">
+        <span>失败详情</span>
+        <p>${escapeHtml(row.failure_detail || "交易所未返回可确认的附带保护记录。")}</p>
+        <p>预期止盈 / 止损：${formatNumber(expected.take_profit, 2)} / ${formatNumber(expected.stop_loss, 2)}</p>
+      </div>
+      <div class="protection-incident-actions">
+        <label class="sr-only" for="incident-resolution-${escapeHtml(row.incident_id)}">解除方式</label>
+        <select id="incident-resolution-${escapeHtml(row.incident_id)}" data-incident-resolution>
+          <option value="external_protection_verified">已核实交易所保护</option>
+          <option value="position_closed">仓位已归零</option>
+        </select>
+        <label class="sr-only" for="incident-note-${escapeHtml(row.incident_id)}">复核备注</label>
+        <input id="incident-note-${escapeHtml(row.incident_id)}" data-incident-note maxlength="500" placeholder="填写复核依据">
+        <button class="button danger" type="button" data-resolve-incident="${escapeHtml(row.incident_id)}">解除事故</button>
+      </div>
+    </article>`;
+  }).join("");
+}
+
 function renderProtectionHandoffs(rows) {
   state.handoffs = rows || [];
   const entries = [
@@ -2021,7 +2064,9 @@ function lockPrivateAccess() {
   state.token = "";
   state.privateUpdates += 1;
   state.adjustments = [];
+  state.incidents = [];
   renderProtectionHandoffs([]);
+  renderProtectionIncidents([]);
   renderPositions([]);
   renderOrders([]);
   renderFills([]);
@@ -2062,6 +2107,7 @@ function applyPrivateEvent(event, payload) {
   } else if (event === "orders") renderOrders(payload.data);
   else if (event === "protection_handoffs") renderProtectionHandoffs(payload.data);
   else if (event === "protection_adjustments") renderProtectionAdjustments(payload.data);
+  else if (event === "protection_incidents") renderProtectionIncidents(payload.data);
   else if (event === "fills") {
     renderFills(payload.data);
     clearTimeout(state.performanceTimer);
@@ -2150,7 +2196,7 @@ async function loadPrivate() {
     if (token !== state.token) return false;
     const activityRequest = ++state.activityRequest;
     const privateUpdates = state.privateUpdates;
-    const [account, positions, orders, fills, pnl, report, activity, bills, handoffs, adjustments] = await Promise.all([
+    const [account, positions, orders, fills, pnl, report, activity, bills, handoffs, adjustments, incidents] = await Promise.all([
       api("/api/v1/account/overview"),
       api("/api/v1/positions"),
       api("/api/v1/orders"),
@@ -2161,6 +2207,7 @@ async function loadPrivate() {
       api("/api/v1/account/bills").catch(error => ({ error: error.message })),
       api("/api/v1/protection/handoffs"),
       api("/api/v1/protection/adjustments"),
+      api("/api/v1/protection/incidents"),
     ]);
     if (token !== state.token) return false;
     if (privateUpdates !== state.privateUpdates && state.privateFeedState === "open") return true;
@@ -2171,6 +2218,7 @@ async function loadPrivate() {
     renderPositions(positions.data);
     renderProtectionHandoffs(handoffs.data);
     renderProtectionAdjustments(adjustments.data);
+    renderProtectionIncidents(incidents.data);
     renderPnl(positions.data);
     renderOrders(orders.data);
     renderFills(fills.data);
@@ -2830,6 +2878,32 @@ $("#preview-signal").addEventListener("click", () => submitSignal(true));
 $("#execute-signal").addEventListener("click", () => submitSignal(false));
 $("#refresh-private").addEventListener("click", loadPrivate);
 $("#sync-ledger").addEventListener("click", loadPrivate);
+$("#protection-incident-list").addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-resolve-incident]");
+  if (!button || !state.token) return;
+  const incident = button.closest("[data-incident-id]");
+  const incidentId = button.dataset.resolveIncident;
+  const resolution = incident?.querySelector("[data-incident-resolution]")?.value;
+  const note = incident?.querySelector("[data-incident-note]")?.value.trim();
+  if (!note) {
+    setMessage("解除保护事故前必须填写复核依据。", "error");
+    incident?.querySelector("[data-incident-note]")?.focus();
+    return;
+  }
+  setBusy(button, true, "解除中...");
+  try {
+    const result = await api(`/api/v1/protection/incidents/${encodeURIComponent(incidentId)}/resolve`, {
+      method: "POST",
+      body: JSON.stringify({ resolution, note }),
+    });
+    renderProtectionIncidents(result.data || []);
+    setMessage("保护事故已解除，开仓闸门状态已实时更新。", "good");
+  } catch (error) {
+    setMessage(`保护事故解除失败：${error.message}`, "error");
+  } finally {
+    setBusy(button, false);
+  }
+});
 $("#watchlist").addEventListener("click", (event) => {
   const button = event.target.closest(".watch-item");
   if (!button) return;

@@ -23,6 +23,7 @@ from .execution_engine import ExecutionEngine
 from .order_preflight import OrderPreflight
 from .position_lots import positions_with_lots
 from .protection_handoff import handoff_summaries
+from .protection_incident import incident_summaries
 from .ai_analysis import AIAnalysisError, TradingAgentsAdapter
 from .account_sync import AccountSynchronizer
 from .account_history import AccountHistoryImporter
@@ -563,6 +564,56 @@ def stored_protection_handoffs(_: None = Depends(require_admin_token)) -> dict[s
 def stored_protection_adjustments(_: None = Depends(require_admin_token)) -> dict[str, object]:
     from .protection_adjustment import adjustment_summaries
     return {"data": adjustment_summaries(state_store, account_client.account_scope)}
+
+
+@app.get("/api/v1/protection/incidents")
+def stored_protection_incidents(_: None = Depends(require_admin_token)) -> dict[str, object]:
+    return {"data": incident_summaries(state_store, account_client.account_scope)}
+
+
+class ProtectionIncidentResolutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    resolution: Literal["external_protection_verified", "position_closed"]
+    note: str = Field(min_length=3, max_length=500)
+
+
+@app.post("/api/v1/protection/incidents/{incident_id}/resolve")
+async def resolve_protection_incident(
+    request: ProtectionIncidentResolutionRequest,
+    incident_id: str = RoutePath(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"),
+    _: None = Depends(require_admin_token),
+) -> dict[str, object]:
+    incident = state_store.protection_incident(incident_id)
+    if not incident or incident["account_scope"] != account_client.account_scope:
+        raise HTTPException(status_code=404, detail="Protection incident not found.")
+    if request.resolution == "position_closed":
+        position = state_store.get_position(incident["position_key"]) if incident.get("position_key") else None
+        if position and (position["status"] != "closed" or float(position["size"]) != 0):
+            raise HTTPException(status_code=409, detail="Position is still open; cannot resolve as closed.")
+    try:
+        resolved = state_store.resolve_protection_incident(
+            incident, resolution=request.resolution, note=request.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if resolved is None:
+        raise HTTPException(status_code=409, detail="Protection incident changed; refresh before resolving.")
+    state_store.add_audit(
+        "protection_incident_resolved",
+        "Protection incident was manually resolved",
+        payload={
+            "incident_id": incident_id, "inst_id": resolved["inst_id"],
+            "resolution": request.resolution,
+        },
+    )
+    await execution_engine.notify_event(
+        "protection_incident_resolved",
+        "OpenPerpDesk 保护事故已解除",
+        f"{resolved['inst_id']} 的附带保护事故已由管理员复核解除：{request.resolution}。",
+        payload={"incident_id": incident_id, "resolution": request.resolution},
+        severity="warning",
+    )
+    return {"accepted": True, "data": incident_summaries(state_store, account_client.account_scope)}
 
 
 @app.get("/api/v1/fills")

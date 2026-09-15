@@ -344,6 +344,27 @@ class StateStore:
                 CREATE UNIQUE INDEX IF NOT EXISTS one_active_protection_adjustment
                     ON protection_adjustments(account_scope, inst_id)
                     WHERE status NOT IN ('complete', 'rejected', 'superseded');
+                CREATE TABLE IF NOT EXISTS protection_incidents (
+                    incident_id TEXT PRIMARY KEY,
+                    account_scope TEXT NOT NULL,
+                    inst_id TEXT NOT NULL,
+                    position_key TEXT,
+                    opening_order_id TEXT NOT NULL,
+                    exchange_order_id TEXT,
+                    expected_protection_json TEXT NOT NULL DEFAULT '{}',
+                    failure_code TEXT NOT NULL,
+                    failure_detail TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'open',
+                    resolution TEXT,
+                    resolution_note TEXT,
+                    version INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    resolved_at TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS one_active_protection_incident
+                    ON protection_incidents(account_scope, opening_order_id)
+                    WHERE status IN ('open', 'review');
                 CREATE TABLE IF NOT EXISTS analyses (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     inst_id TEXT NOT NULL,
@@ -605,6 +626,14 @@ class StateStore:
                     ).fetchone()
                     if adjustment:
                         raise ExposureSnapshotChanged("protection_adjustment_pending")
+                    incident = connection.execute(
+                        """SELECT 1 FROM protection_incidents
+                           WHERE account_scope = ? AND inst_id = ?
+                             AND status IN ('open', 'review') LIMIT 1""",
+                        (order.get("account_scope"), order["inst_id"]),
+                    ).fetchone()
+                    if incident:
+                        raise ExposureSnapshotChanged("protection_incident_review_required")
                     pending = connection.execute(
                         """SELECT 1 FROM protection_handoffs WHERE account_scope = ? AND inst_id = ?
                            AND status != 'complete' LIMIT 1""",
@@ -1171,6 +1200,117 @@ class StateStore:
                 (trade_id,),
             ).fetchone()
         return self._row(row)
+
+    def protection_incidents(
+        self, account_scope: str, inst_id: str | None = None, *, include_resolved: bool = False,
+    ) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM protection_incidents
+                   WHERE account_scope = ?
+                     AND (? IS NULL OR inst_id = ?)
+                     AND (? OR status IN ('open', 'review'))
+                   ORDER BY created_at, incident_id""",
+                (account_scope, inst_id, inst_id, include_resolved),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def protection_incident(self, incident_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            return self._row(connection.execute(
+                "SELECT * FROM protection_incidents WHERE incident_id = ?", (incident_id,),
+            ).fetchone())
+
+    def has_active_protection_incident(self, account_scope: str, inst_id: str) -> bool:
+        with self._connection() as connection:
+            return connection.execute(
+                """SELECT 1 FROM protection_incidents
+                   WHERE account_scope = ? AND inst_id = ? AND status IN ('open', 'review') LIMIT 1""",
+                (account_scope, inst_id),
+            ).fetchone() is not None
+
+    def record_protection_incident(self, record: dict[str, Any]) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """SELECT * FROM protection_incidents
+                   WHERE account_scope = ? AND opening_order_id = ?
+                     AND status IN ('open', 'review')
+                   LIMIT 1""",
+                (record["account_scope"], record["opening_order_id"]),
+            ).fetchone()
+            now = _utc_now()
+            if existing:
+                connection.execute(
+                    """UPDATE protection_incidents
+                       SET failure_code = ?, failure_detail = ?, expected_protection_json = ?,
+                           status = 'review', updated_at = ?, version = version + 1
+                       WHERE incident_id = ?""",
+                    (
+                        record["failure_code"], record.get("failure_detail", ""),
+                        json.dumps(record.get("expected_protection") or {}, sort_keys=True, allow_nan=False),
+                        now, existing["incident_id"],
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM protection_incidents WHERE incident_id = ?",
+                    (existing["incident_id"],),
+                ).fetchone()
+                return dict(row)
+            incident_id = record.get("incident_id") or uuid4().hex
+            connection.execute(
+                """INSERT INTO protection_incidents
+                   (incident_id, account_scope, inst_id, position_key, opening_order_id,
+                    exchange_order_id, expected_protection_json, failure_code, failure_detail,
+                    status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
+                (
+                    incident_id, record["account_scope"], record["inst_id"], record.get("position_key"),
+                    record["opening_order_id"], record.get("exchange_order_id"),
+                    json.dumps(record.get("expected_protection") or {}, sort_keys=True, allow_nan=False),
+                    record["failure_code"], record.get("failure_detail", ""), now, now,
+                ),
+            )
+            return dict(connection.execute(
+                "SELECT * FROM protection_incidents WHERE incident_id = ?", (incident_id,),
+            ).fetchone())
+
+    def resolve_protection_incident(
+        self, incident: dict[str, Any], *, resolution: str, note: str,
+    ) -> dict[str, Any] | None:
+        if resolution not in {"external_protection_verified", "position_closed"}:
+            raise ValueError("invalid_protection_incident_resolution")
+        if not note.strip():
+            raise ValueError("protection_incident_note_required")
+        now = _utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """UPDATE protection_incidents
+                   SET status = 'resolved', resolution = ?, resolution_note = ?,
+                       resolved_at = ?, updated_at = ?, version = version + 1
+                   WHERE incident_id = ? AND version = ? AND status IN ('open', 'review')""",
+                (resolution, note.strip(), now, now, incident["incident_id"], incident["version"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return dict(connection.execute(
+                "SELECT * FROM protection_incidents WHERE incident_id = ?",
+                (incident["incident_id"],),
+            ).fetchone())
+
+    def supersede_protection_incident(
+        self, account_scope: str, opening_order_id: str, *, reason: str,
+    ) -> int:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """UPDATE protection_incidents
+                   SET status = 'superseded', resolution = 'native_protection_found',
+                       resolution_note = ?, updated_at = ?, resolved_at = ?, version = version + 1
+                   WHERE account_scope = ? AND opening_order_id = ?
+                     AND status IN ('open', 'review')""",
+                (reason, _utc_now(), _utc_now(), account_scope, opening_order_id),
+            )
+        return cursor.rowcount
 
     def list_fills(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._connection() as connection:

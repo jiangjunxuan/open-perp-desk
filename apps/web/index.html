@@ -384,6 +384,16 @@
                 <h3 id="protection-handoff-title" role="status" aria-atomic="true"></h3>
                 <ul id="protection-handoff-list"></ul>
               </section>
+              <section class="protection-incidents" id="protection-incidents" aria-labelledby="protection-incident-title" hidden>
+                <div class="protection-incident-heading">
+                  <div>
+                    <h3 id="protection-incident-title">保护事故</h3>
+                    <p id="protection-incident-summary" class="subtle" role="status" aria-live="polite"></p>
+                  </div>
+                  <span class="record-state" data-tone="danger">需复核</span>
+                </div>
+                <div id="protection-incident-list" class="protection-incident-list"></div>
+              </section>
               <div class="table-wrap" tabindex="0" role="region" aria-label="持仓表">
                 <table>
                   <caption class="sr-only">当前活动持仓</caption>

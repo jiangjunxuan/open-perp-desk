@@ -376,6 +376,27 @@ tbody tr:hover { background: var(--surface); }
 .protection-handoffs ul { list-style: none; margin: 0; padding: 0; }
 .protection-handoffs li { display: flex; flex-wrap: wrap; gap: 8px 20px; padding: 8px 0; font-size: 12px; }
 .protection-handoffs li > * { min-width: 0; overflow-wrap: anywhere; }
+.protection-incidents { padding: 14px 0; border-top: 1px solid var(--danger-border); background: var(--danger-soft); }
+.protection-incident-heading { display: flex; align-items: start; justify-content: space-between; gap: 16px; padding: 0 12px 10px; }
+.protection-incident-heading h3 { margin: 0; font-size: 12px; color: var(--danger); }
+.protection-incident-heading p { margin: 5px 0 0; font-size: 11px; }
+.protection-incident-list { display: grid; gap: 1px; }
+.protection-incident { display: grid; grid-template-columns: minmax(150px, .8fr) minmax(180px, 1fr) minmax(260px, 1.6fr) auto; align-items: center; gap: 12px; padding: 12px; background: var(--surface); }
+.protection-incident > * { min-width: 0; }
+.protection-incident-meta, .protection-incident-evidence { display: grid; gap: 5px; }
+.protection-incident-meta strong { overflow-wrap: anywhere; }
+.protection-incident-meta span, .protection-incident-evidence span { color: var(--muted); font-size: 11px; }
+.protection-incident-evidence p { margin: 0; color: var(--muted-strong); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.protection-incident-actions { display: grid; grid-template-columns: minmax(170px, 1fr) minmax(180px, 1.2fr) auto; align-items: center; gap: 6px; }
+.protection-incident-actions select, .protection-incident-actions input { width: 100%; font-size: 11px; }
+.protection-incident-actions .button { min-height: 36px; }
+@media (max-width: 1023px) {
+  .protection-incident { grid-template-columns: 1fr; }
+  .protection-incident-actions { grid-template-columns: 1fr 1fr auto; }
+}
+@media (max-width: 620px) {
+  .protection-incident-actions { grid-template-columns: 1fr; }
+}
 @media (max-width: 1023px) {
   .position-lot-details li { grid-template-columns: minmax(0, 1fr); gap: 8px; }
 }
