@@ -154,6 +154,17 @@ PUSHPLUS_PROXY_URL=http://user:password@proxy.example.com:8080
 WebSocket 非本机端点必须使用 `wss://` 并校验证书；`ws://` 仅允许
 回环目标与本机测试代理。
 
+配置 OKX Demo 私有凭据后，可用下面的只读验收脚本验证账户、持仓、订单、成交
+和原生保护订单流。脚本不会导入执行客户端，也不会发送交易请求；输出只包含
+连接状态和记录数量：
+
+```bash
+python infra/okx-private-smoke.py --timeout 45
+```
+
+脚本默认拒绝 `OKX_DEMO=false`。对真实账户的只读连接也必须显式加
+`--allow-live`，并在人工审批记录中保留命令输出和时间。
+
 PushPlus 配置后，服务会对关键运行事件发送通知，包括风控拒绝、订单失败、
 Worker 启停/异常、急停/恢复、成交回报、原生止盈止损状态变化和账户同步异常。
 成交回报按交易所 `tradeId` 去重；没有配置 `PUSHPLUS_TOKEN` 时不会阻塞行情、

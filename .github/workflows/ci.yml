@@ -146,6 +146,7 @@ jobs:
       - run: node --check apps/web/live.js
       - run: node --test infra/appearance.test.mjs infra/live.test.mjs
       - run: bash -n infra/openperpdesk.sh
+      - run: python -m py_compile infra/deploy.py infra/okx-private-smoke.py
       - run: ./infra/openperpdesk.sh --help
       - name: preflight safety smoke
         run: |

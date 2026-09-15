@@ -85,6 +85,9 @@ protection updates.
 stable focus, stale/incorrect-interval rejection and private UI fixtures.
 `infra/chart-annotation-ui-checks.mjs` checks drawing, editing, deletion/undo,
 time/price anchors, persistence, corrupt-storage recovery and mobile layouts.
+`infra/okx-private-smoke.py` is the deployment-time read-only probe for private
+REST, account WebSocket and native algo-order WebSocket authentication. It
+reports counts only and refuses live mode unless explicitly allowed.
 
 Private fixtures are not real OKX Demo acceptance. Actual private credentials,
 model-provider connectivity, PushPlus WeChat receipt, prolonged operation and
