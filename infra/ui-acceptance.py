@@ -63,6 +63,9 @@ async def main():
             summary = {
                 "scope": "loopback protocol fixtures, not real OKX acceptance",
                 "routes": sum(len(row["routeChecks"]) for row in report["results"]),
+                "chinese_glyphs_rendered": bool(report["results"]) and all(
+                    row["chineseGlyphsRendered"] for row in report["results"]
+                ),
                 "realtime_viewports": len(report["realtime"]),
                 "annotation_groups": len(report["annotations"]),
                 "protection_incident_groups": len(report["protectionIncidents"]),

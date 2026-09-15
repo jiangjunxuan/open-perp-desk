@@ -159,6 +159,15 @@ try {
       const pixels = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
       let painted = 0;
       for (let i = 3; i < pixels.length; i += 4) if (pixels[i] > 0) painted++;
+      const glyphCanvas = document.createElement("canvas");
+      glyphCanvas.width = glyphCanvas.height = 64;
+      const glyphContext = glyphCanvas.getContext("2d");
+      glyphContext.font = "32px " + getComputedStyle(document.body).fontFamily;
+      const glyphImages = [0x4e2d, 0x6587, 0x4ea4, 0x10ffff].map(codepoint => {
+        glyphContext.clearRect(0, 0, 64, 64);
+        glyphContext.fillText(String.fromCodePoint(codepoint), 4, 44);
+        return glyphCanvas.toDataURL();
+      });
       return {
         width: innerWidth,
         clientWidth: document.documentElement.clientWidth,
@@ -179,6 +188,7 @@ try {
         watchItems: document.querySelectorAll(".watch-item").length,
         price: document.querySelector("#market-price").textContent,
         canvasPaintedPixels: painted,
+        chineseGlyphsRendered: new Set(glyphImages).size === glyphImages.length,
         execution: document.querySelector("#top-execution").textContent
       };
     })()`);
@@ -203,6 +213,9 @@ try {
     }
     if (layout.canvasPaintedPixels < 100) {
       throw new Error(`${viewport.name} candlestick canvas is blank`);
+    }
+    if (!layout.chineseGlyphsRendered) {
+      throw new Error(`${viewport.name} Chinese glyphs are missing; install a CJK browser font before UI acceptance`);
     }
 
     const routeChecks = [];
