@@ -65,6 +65,7 @@ async def main():
                 "routes": sum(len(row["routeChecks"]) for row in report["results"]),
                 "realtime_viewports": len(report["realtime"]),
                 "annotation_groups": len(report["annotations"]),
+                "protection_incident_groups": len(report["protectionIncidents"]),
                 "browser_errors": report["browserErrors"],
                 "exchange_mutations": len(exchange.posts),
                 "execution_enabled": False,

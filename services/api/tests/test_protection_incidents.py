@@ -72,6 +72,8 @@ class ProtectionIncidentTests(unittest.TestCase):
         incidents = self.store.protection_incidents("incident-fixture")
         self.assertEqual(len(incidents), 1)
         self.assertEqual(incidents[0]["failure_code"], "attached_protection_51000")
+        self.assertEqual(incidents[0]["version"], 0)
+        self.assertEqual(len(self.store.list_audit()), 1)
         self.assertTrue(self.store.has_active_protection_incident(
             "incident-fixture", "BTC-USDT-SWAP",
         ))
@@ -150,6 +152,108 @@ class ProtectionIncidentTests(unittest.TestCase):
             resolution="external_protection_verified",
             note="重复提交",
         ))
+        self.assertEqual(len(self.store.list_audit()), 1)
+
+    def test_historical_failure_replay_does_not_reopen_resolved_incident(self):
+        self.store.save_order(self.opening_order())
+        self.sync._save_regular_order(self.failed_exchange_order(), source="okx-order-history")
+        incident = self.store.protection_incidents("incident-fixture")[0]
+        self.store.resolve_protection_incident(
+            incident, resolution="external_protection_verified", note="Reviewed external protection",
+        )
+        self.sync._save_regular_order(self.failed_exchange_order(), source="okx-order-history")
+        self.assertEqual(self.store.protection_incidents("incident-fixture"), [])
+        self.assertEqual(len(self.store.protection_incidents("incident-fixture", include_resolved=True)), 1)
+        self.assertEqual(len(self.store.list_audit()), 2)
+        changed = self.failed_exchange_order()
+        changed["attachAlgoOrds"][0]["failCode"] = "51001"
+        self.sync._save_regular_order(changed, source="okx-order-history")
+        active = self.store.protection_incidents("incident-fixture")
+        self.assertEqual(len(active), 1)
+        self.assertNotEqual(active[0]["incident_id"], incident["incident_id"])
+        self.assertEqual(active[0]["failure_code"], "attached_protection_51001")
+
+    def test_changed_failure_invalidates_existing_review_version(self):
+        self.store.save_order(self.opening_order())
+        self.sync._save_regular_order(self.failed_exchange_order(), source="okx-order-history")
+        old = self.store.protection_incidents("incident-fixture")[0]
+        changed = self.failed_exchange_order()
+        changed["attachAlgoOrds"][0]["failReason"] = "Additional exchange evidence"
+        self.sync._save_regular_order(changed, source="okx-order-history")
+        current = self.store.protection_incidents("incident-fixture")[0]
+        self.assertEqual(current["version"], old["version"] + 1)
+        self.assertEqual(current["status"], "review")
+        self.assertIsNone(self.store.resolve_protection_incident(
+            old, resolution="external_protection_verified", note="Obsolete review",
+        ))
+
+    def test_late_order_snapshot_cannot_replace_incident_evidence(self):
+        self.store.save_order(self.opening_order())
+        fresh = self.failed_exchange_order()
+        fresh["uTime"] = "1767225601000"
+        fresh["attachAlgoOrds"][0]["failReason"] = "Current evidence"
+        self.sync._save_regular_order(fresh, source="okx-order-history")
+        incident = self.store.protection_incidents("incident-fixture")[0]
+        self.sync._save_regular_order(self.failed_exchange_order(), source="okx-order-history")
+        current = self.store.protection_incidents("incident-fixture")[0]
+        self.assertEqual(current["failure_detail"], "Current evidence")
+        self.assertEqual(current["version"], incident["version"])
+        self.assertEqual(len(self.store.list_audit()), 1)
+
+    def test_closed_resolution_checks_current_scope_and_position_in_store(self):
+        incident = self.store.record_protection_incident({
+            "account_scope": "incident-fixture", "inst_id": "BTC-USDT-SWAP",
+            "position_key": "BTC-USDT-SWAP:net:cross", "opening_order_id": "entry-incident-1",
+            "failure_code": "attached_protection_missing",
+        })
+        for scope, status, size in (
+            ("different-account", "closed", 0),
+            ("incident-fixture", "open", 1),
+            ("incident-fixture", "open", 0),
+            ("incident-fixture", "closed", 1),
+        ):
+            with self.subTest(scope=scope, status=status, size=size):
+                self.store.upsert_position({
+                    "position_key": incident["position_key"], "inst_id": incident["inst_id"],
+                    "pos_side": "net", "td_mode": "cross", "account_scope": scope,
+                    "size": size, "entry_price": 50000, "status": status,
+                })
+                with self.assertRaisesRegex(ExposureSnapshotChanged, "position_not_closed"):
+                    self.store.resolve_protection_incident(incident, resolution="position_closed", note="Close review")
+                self.assertEqual(self.store.protection_incident(incident["incident_id"])["status"], "open")
+        self.assertEqual(self.store.list_audit(), [])
+
+    def test_closed_position_with_uncertain_order_cannot_resolve(self):
+        self.store.save_order({**self.opening_order(), "status": "submission_unknown"})
+        incident = self.store.record_protection_incident({
+            "account_scope": "incident-fixture", "inst_id": "BTC-USDT-SWAP",
+            "position_key": "BTC-USDT-SWAP:net:cross", "opening_order_id": "entry-incident-1",
+            "failure_code": "attached_protection_missing",
+        })
+        self.store.upsert_position({
+            "position_key": incident["position_key"], "inst_id": incident["inst_id"],
+            "pos_side": "net", "td_mode": "cross", "account_scope": "incident-fixture",
+            "size": 0, "entry_price": 50000, "status": "closed",
+        })
+        with self.assertRaisesRegex(ExposureSnapshotChanged, "orders_pending"):
+            self.store.resolve_protection_incident(incident, resolution="position_closed", note="Close review")
+
+    def test_resolution_audit_failure_rolls_back_release(self):
+        incident = self.store.record_protection_incident({
+            "account_scope": "incident-fixture", "inst_id": "BTC-USDT-SWAP",
+            "opening_order_id": "entry-incident-1", "failure_code": "attached_protection_missing",
+        })
+        with self.store._connection() as connection:
+            connection.execute("""
+                CREATE TRIGGER reject_resolution_audit BEFORE INSERT ON audit_events
+                BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END
+            """)
+        import sqlite3
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.resolve_protection_incident(
+                incident, resolution="external_protection_verified", note="External review",
+            )
+        self.assertEqual(self.store.protection_incident(incident["incident_id"])["status"], "open")
 
     def test_position_closed_resolution_requires_durable_closed_position(self):
         incident = self.store.record_protection_incident({
@@ -162,10 +266,12 @@ class ProtectionIncidentTests(unittest.TestCase):
         request = api_main.ProtectionIncidentResolutionRequest(
             resolution="position_closed",
             note="仓位已归零，依据本地对账记录。",
+            expected_version=incident["version"],
         )
         notifier = AsyncMock()
         with patch.object(api_main, "state_store", self.store), \
-                patch.object(api_main, "account_client", SimpleNamespace(account_scope="incident-fixture")), \
+                patch.object(api_main, "account_client", SimpleNamespace(account_scope="incident-fixture", configured=True)), \
+                patch.object(api_main, "account_sync", SimpleNamespace(sync_rest=AsyncMock(return_value={}))), \
                 patch.object(api_main, "execution_engine", SimpleNamespace(notify_event=notifier)):
             with self.assertRaises(HTTPException) as context:
                 import asyncio
@@ -184,7 +290,8 @@ class ProtectionIncidentTests(unittest.TestCase):
             "status": "closed",
         })
         with patch.object(api_main, "state_store", self.store), \
-                patch.object(api_main, "account_client", SimpleNamespace(account_scope="incident-fixture")), \
+                patch.object(api_main, "account_client", SimpleNamespace(account_scope="incident-fixture", configured=True)), \
+                patch.object(api_main, "account_sync", SimpleNamespace(sync_rest=AsyncMock(return_value={}))), \
                 patch.object(api_main, "execution_engine", SimpleNamespace(notify_event=notifier)):
             result = __import__("asyncio").run(api_main.resolve_protection_incident(
                 request, incident["incident_id"], None,

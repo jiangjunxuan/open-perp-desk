@@ -28,6 +28,7 @@ def incident_summaries(store, account_scope: str) -> list[dict[str, Any]]:
             "failure_code": row["failure_code"],
             "failure_detail": row["failure_detail"],
             "status": row["status"],
+            "version": row["version"],
             "resolution": row["resolution"],
             "resolution_note": row["resolution_note"],
             "created_at": row["created_at"],

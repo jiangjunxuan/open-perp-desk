@@ -36,6 +36,8 @@ const state = {
   handoffs: [],
   adjustments: [],
   incidents: [],
+  incidentUpdates: 0,
+  incidentRequests: new Map(),
   chartMode: "candles",
   chartRange: 80,
   chartCursorTime: null,
@@ -1275,6 +1277,7 @@ function renderProtectionAdjustments(rows) {
 }
 
 function renderProtectionIncidents(rows) {
+  state.incidentUpdates += 1;
   state.incidents = rows || [];
   const active = state.incidents.filter(row => ["open", "review"].includes(row.status));
   const section = $("#protection-incidents");
@@ -1284,9 +1287,12 @@ function renderProtectionIncidents(rows) {
     ? `${active.length} 笔附带保护未确认，新的开仓已暂停。`
     : "");
   const list = $("#protection-incident-list");
-  list.innerHTML = active.map(row => {
+  const existing = new Map([...list.children].map(item => [item.dataset.incidentId, item]));
+  const focused = list.contains(document.activeElement) ? document.activeElement : null;
+  active.forEach((row, index) => {
     const expected = row.expected_protection || {};
-    return `<article class="protection-incident" data-incident-id="${escapeHtml(row.incident_id)}">
+    const template = document.createElement("template");
+    template.innerHTML = `<article class="protection-incident" data-incident-id="${escapeHtml(row.incident_id)}" data-version="${escapeHtml(row.version)}">
       <div class="protection-incident-meta">
         <strong>${escapeHtml(row.inst_id)}</strong>
         <span class="mono">${escapeHtml(row.failure_code || "unknown")}</span>
@@ -1303,17 +1309,105 @@ function renderProtectionIncidents(rows) {
         <p>预期止盈 / 止损：${formatNumber(expected.take_profit, 2)} / ${formatNumber(expected.stop_loss, 2)}</p>
       </div>
       <div class="protection-incident-actions">
-        <label class="sr-only" for="incident-resolution-${escapeHtml(row.incident_id)}">解除方式</label>
+        <label for="incident-resolution-${escapeHtml(row.incident_id)}">解除方式
         <select id="incident-resolution-${escapeHtml(row.incident_id)}" data-incident-resolution>
           <option value="external_protection_verified">已核实交易所保护</option>
           <option value="position_closed">仓位已归零</option>
-        </select>
-        <label class="sr-only" for="incident-note-${escapeHtml(row.incident_id)}">复核备注</label>
-        <input id="incident-note-${escapeHtml(row.incident_id)}" data-incident-note maxlength="500" placeholder="填写复核依据">
+        </select></label>
+        <label for="incident-note-${escapeHtml(row.incident_id)}">复核备注
+        <input id="incident-note-${escapeHtml(row.incident_id)}" data-incident-note aria-describedby="incident-message-${escapeHtml(row.incident_id)}" minlength="3" maxlength="500" required></label>
         <button class="button danger" type="button" data-resolve-incident="${escapeHtml(row.incident_id)}">解除事故</button>
+        <p class="incident-message" id="incident-message-${escapeHtml(row.incident_id)}" data-incident-message role="status" aria-live="polite"></p>
       </div>
     </article>`;
-  }).join("");
+    const replacement = template.content.firstElementChild;
+    const entry = existing.get(row.incident_id) || replacement;
+    existing.delete(row.incident_id);
+    if (entry !== replacement) {
+      const changed = entry.dataset.version !== replacement.dataset.version;
+      entry.dataset.version = replacement.dataset.version;
+      const oldEvidence = entry.querySelectorAll(".protection-incident-meta, .protection-incident-evidence");
+      replacement.querySelectorAll(".protection-incident-meta, .protection-incident-evidence").forEach((node, i) => {
+        oldEvidence[i].replaceWith(node);
+      });
+      if (changed) entry.querySelector("[data-incident-message]").textContent = "事故记录已更新，请重新核对。";
+    }
+    if (list.children[index] !== entry) list.insertBefore(entry, list.children[index] || null);
+    const busy = state.incidentRequests.has(row.incident_id);
+    const button = entry.querySelector("[data-resolve-incident]");
+    setBusy(button, busy, "复核中...");
+    button.disabled = busy || !state.token || !Number.isInteger(row.version) || row.version < 0;
+    entry.querySelectorAll("input, select").forEach(input => { input.disabled = busy || !state.token; });
+  });
+  existing.forEach(entry => entry.remove());
+  if (focused?.isConnected && document.activeElement !== focused && !focused.disabled) {
+    focused.focus({ preventScroll: true });
+  }
+}
+
+async function resolveProtectionIncident(button) {
+  if (!button || !state.token || button.disabled) return;
+  const entry = button.closest("[data-incident-id]");
+  const incidentId = button.dataset.resolveIncident;
+  if (state.incidentRequests.has(incidentId)) return;
+  const row = state.incidents.find(item => item.incident_id === incidentId);
+  if (!row || !Number.isInteger(row.version) || String(row.version) !== entry.dataset.version) return;
+  const input = entry.querySelector("[data-incident-note]");
+  const note = input.value.trim();
+  const message = entry.querySelector("[data-incident-message]");
+  if (note.length < 3 || note.length > 500) {
+    message.textContent = "请填写 3 至 500 字的复核依据。";
+    input.setAttribute("aria-invalid", "true");
+    input.focus();
+    return;
+  }
+  input.removeAttribute("aria-invalid");
+  const resolution = entry.querySelector("[data-incident-resolution]").value;
+  const request = { token: state.token, updates: state.incidentUpdates };
+  state.incidentRequests.set(incidentId, request);
+  setBusy(button, true, "复核中...");
+  entry.querySelectorAll("input, select").forEach(control => { control.disabled = true; });
+  message.textContent = "";
+  const current = () => state.token === request.token && state.incidentRequests.get(incidentId) === request;
+  try {
+    const result = await api(`/api/v1/protection/incidents/${encodeURIComponent(incidentId)}/resolve`, {
+      method: "POST", body: JSON.stringify({ resolution, note, expected_version: row.version }),
+    });
+    if (!current()) return;
+    if (result.accepted !== true || !Array.isArray(result.data)) throw new Error("Unverified incident response");
+    if (request.updates === state.incidentUpdates) renderProtectionIncidents(result.data || []);
+    const stillActive = state.incidents.some(item => item.incident_id === incidentId);
+    setMessage(stillActive ? "复核请求已完成，请以当前事故列表为准。" : "保护事故已解除。", stillActive ? "normal" : "good");
+  } catch (error) {
+    if (!current()) return;
+    if (error.status === 401) {
+      lockPrivateAccess();
+      setMessage("管理员授权已失效，请重新解锁。", "error");
+      return;
+    }
+    try {
+      const revision = state.incidentUpdates;
+      const latest = await api("/api/v1/protection/incidents");
+      if (current() && revision === state.incidentUpdates && Array.isArray(latest.data)) renderProtectionIncidents(latest.data);
+    } catch {}
+    if (!current()) return;
+    if (!state.incidents.some(item => item.incident_id === incidentId)) {
+      setMessage("事故列表已同步，该事故已不在待复核列表中。");
+      return;
+    }
+    const messages = {
+      protection_incident_position_not_closed: "当前账户的仓位尚未确认归零。",
+      protection_incident_orders_pending: "仍有活动或结果未确认的委托。",
+    };
+    message.textContent = messages[error.message] || (error.status === 409
+      ? "事故或账户状态已变化，请核对最新记录后重试。"
+      : "复核结果未确认，请检查连接并同步事故列表后重新核对。");
+  } finally {
+    if (state.incidentRequests.get(incidentId) === request) {
+      state.incidentRequests.delete(incidentId);
+      renderProtectionIncidents(state.incidents);
+    }
+  }
 }
 
 function renderProtectionHandoffs(rows) {
@@ -2076,6 +2170,7 @@ function lockPrivateAccess() {
   state.privateUpdates += 1;
   state.adjustments = [];
   state.incidents = [];
+  state.incidentRequests.clear();
   renderProtectionHandoffs([]);
   renderProtectionIncidents([]);
   renderPositions([]);
@@ -2889,31 +2984,8 @@ $("#preview-signal").addEventListener("click", () => submitSignal(true));
 $("#execute-signal").addEventListener("click", () => submitSignal(false));
 $("#refresh-private").addEventListener("click", loadPrivate);
 $("#sync-ledger").addEventListener("click", loadPrivate);
-$("#protection-incident-list").addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-resolve-incident]");
-  if (!button || !state.token) return;
-  const incident = button.closest("[data-incident-id]");
-  const incidentId = button.dataset.resolveIncident;
-  const resolution = incident?.querySelector("[data-incident-resolution]")?.value;
-  const note = incident?.querySelector("[data-incident-note]")?.value.trim();
-  if (!note) {
-    setMessage("解除保护事故前必须填写复核依据。", "error");
-    incident?.querySelector("[data-incident-note]")?.focus();
-    return;
-  }
-  setBusy(button, true, "解除中...");
-  try {
-    const result = await api(`/api/v1/protection/incidents/${encodeURIComponent(incidentId)}/resolve`, {
-      method: "POST",
-      body: JSON.stringify({ resolution, note }),
-    });
-    renderProtectionIncidents(result.data || []);
-    setMessage("保护事故已解除，开仓闸门状态已实时更新。", "good");
-  } catch (error) {
-    setMessage(`保护事故解除失败：${error.message}`, "error");
-  } finally {
-    setBusy(button, false);
-  }
+$("#protection-incident-list").addEventListener("click", event => {
+  resolveProtectionIncident(event.target.closest("[data-resolve-incident]"));
 });
 $("#watchlist").addEventListener("click", (event) => {
   const button = event.target.closest(".watch-item");

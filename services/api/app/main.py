@@ -35,7 +35,7 @@ from .account_reconciler import AccountReconciler
 from .equity_baseline import EquityBaselineSampler
 from .automation_worker import AutomationWorker
 from .backtest import BacktestEngine
-from .state_store import BillImportBusy, StateStore
+from .state_store import BillImportBusy, ExposureSnapshotChanged, StateStore
 from .safety_control import SafetyController
 from .strategy_engine import StrategyEngine
 from .trading_signal import TradeSignal
@@ -572,9 +572,10 @@ def stored_protection_incidents(_: None = Depends(require_admin_token)) -> dict[
 
 
 class ProtectionIncidentResolutionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     resolution: Literal["external_protection_verified", "position_closed"]
     note: str = Field(min_length=3, max_length=500)
+    expected_version: int = Field(ge=0, strict=True)
 
 
 @app.post("/api/v1/protection/incidents/{incident_id}/resolve")
@@ -586,26 +587,30 @@ async def resolve_protection_incident(
     incident = state_store.protection_incident(incident_id)
     if not incident or incident["account_scope"] != account_client.account_scope:
         raise HTTPException(status_code=404, detail="Protection incident not found.")
+    if incident["version"] != request.expected_version or incident["status"] not in {"open", "review"}:
+        raise HTTPException(status_code=409, detail="Protection incident changed; refresh before resolving.")
     if request.resolution == "position_closed":
-        position = state_store.get_position(incident["position_key"]) if incident.get("position_key") else None
-        if not position or position["status"] != "closed" or float(position["size"]) != 0:
-            raise HTTPException(status_code=409, detail="Position is still open; cannot resolve as closed.")
+        if not account_client.configured:
+            raise HTTPException(status_code=503, detail="OKX private credentials are not configured.")
+        try:
+            async with asyncio.timeout(30):
+                snapshot = await account_sync.sync_rest()
+        except Exception:
+            raise HTTPException(status_code=502, detail="Account reconciliation failed; incident remains locked.") from None
+        if snapshot.get("errors"):
+            raise HTTPException(status_code=409, detail="Account snapshot is incomplete; incident remains locked.")
+        if account_client.account_scope != incident["account_scope"]:
+            raise HTTPException(status_code=409, detail="Account changed; incident remains locked.")
     try:
         resolved = state_store.resolve_protection_incident(
             incident, resolution=request.resolution, note=request.note,
         )
+    except ExposureSnapshotChanged as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if resolved is None:
         raise HTTPException(status_code=409, detail="Protection incident changed; refresh before resolving.")
-    state_store.add_audit(
-        "protection_incident_resolved",
-        "Protection incident was manually resolved",
-        payload={
-            "incident_id": incident_id, "inst_id": resolved["inst_id"],
-            "resolution": request.resolution,
-        },
-    )
     await execution_engine.notify_event(
         "protection_incident_resolved",
         "OpenPerpDesk 保护事故已解除",

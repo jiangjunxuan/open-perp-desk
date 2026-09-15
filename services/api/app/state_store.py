@@ -1230,25 +1230,40 @@ class StateStore:
             ).fetchone() is not None
 
     def record_protection_incident(self, record: dict[str, Any]) -> dict[str, Any]:
+        evidence = {
+            "inst_id": record["inst_id"],
+            "position_key": record.get("position_key"),
+            "exchange_order_id": record.get("exchange_order_id"),
+            "failure_code": record["failure_code"],
+            "failure_detail": record.get("failure_detail", ""),
+            "expected_protection_json": json.dumps(
+                record.get("expected_protection") or {}, sort_keys=True, allow_nan=False,
+            ),
+        }
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
                 """SELECT * FROM protection_incidents
                    WHERE account_scope = ? AND opening_order_id = ?
-                     AND status IN ('open', 'review')
+                   ORDER BY CASE WHEN status IN ('open', 'review') THEN 0 ELSE 1 END,
+                            created_at DESC, rowid DESC
                    LIMIT 1""",
                 (record["account_scope"], record["opening_order_id"]),
             ).fetchone()
             now = _utc_now()
-            if existing:
+            # Polling the same historical failure is not a new incident or review revision.
+            if existing and all(existing[key] == value for key, value in evidence.items()):
+                return {**dict(existing), "changed": False}
+            if existing and existing["status"] in {"open", "review"}:
                 connection.execute(
                     """UPDATE protection_incidents
                        SET failure_code = ?, failure_detail = ?, expected_protection_json = ?,
+                           inst_id = ?, position_key = ?, exchange_order_id = ?,
                            status = 'review', updated_at = ?, version = version + 1
                        WHERE incident_id = ?""",
                     (
-                        record["failure_code"], record.get("failure_detail", ""),
-                        json.dumps(record.get("expected_protection") or {}, sort_keys=True, allow_nan=False),
+                        evidence["failure_code"], evidence["failure_detail"], evidence["expected_protection_json"],
+                        evidence["inst_id"], evidence["position_key"], evidence["exchange_order_id"],
                         now, existing["incident_id"],
                     ),
                 )
@@ -1256,7 +1271,7 @@ class StateStore:
                     "SELECT * FROM protection_incidents WHERE incident_id = ?",
                     (existing["incident_id"],),
                 ).fetchone()
-                return dict(row)
+                return {**dict(row), "changed": True}
             incident_id = record.get("incident_id") or uuid4().hex
             connection.execute(
                 """INSERT INTO protection_incidents
@@ -1271,28 +1286,65 @@ class StateStore:
                     record["failure_code"], record.get("failure_detail", ""), now, now,
                 ),
             )
-            return dict(connection.execute(
+            return {**dict(connection.execute(
                 "SELECT * FROM protection_incidents WHERE incident_id = ?", (incident_id,),
-            ).fetchone())
+            ).fetchone()), "changed": True}
 
     def resolve_protection_incident(
         self, incident: dict[str, Any], *, resolution: str, note: str,
     ) -> dict[str, Any] | None:
         if resolution not in {"external_protection_verified", "position_closed"}:
             raise ValueError("invalid_protection_incident_resolution")
-        if not note.strip():
+        if not 3 <= len(note.strip()) <= 500:
             raise ValueError("protection_incident_note_required")
         now = _utc_now()
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                """SELECT * FROM protection_incidents
+                   WHERE incident_id = ? AND version = ? AND account_scope = ?
+                     AND status IN ('open', 'review')""",
+                (incident["incident_id"], incident["version"], incident["account_scope"]),
+            ).fetchone()
+            if current is None:
+                return None
+            if resolution == "position_closed":
+                position = connection.execute(
+                    "SELECT * FROM positions WHERE position_key = ?", (current["position_key"],),
+                ).fetchone()
+                if (
+                    position is None or position["account_scope"] != current["account_scope"]
+                    or position["inst_id"] != current["inst_id"]
+                    or position["status"] != "closed" or position["size"] != 0
+                ):
+                    raise ExposureSnapshotChanged("protection_incident_position_not_closed")
+                placeholders = ",".join("?" for _ in ACTIVE_ORDER_STATUSES)
+                if connection.execute(
+                    f"""SELECT 1 FROM orders WHERE account_scope = ? AND inst_id = ?
+                        AND order_kind = 'standard' AND status IN ({placeholders}) LIMIT 1""",
+                    (current["account_scope"], current["inst_id"], *ACTIVE_ORDER_STATUSES),
+                ).fetchone():
+                    raise ExposureSnapshotChanged("protection_incident_orders_pending")
             cursor = connection.execute(
                 """UPDATE protection_incidents
                    SET status = 'resolved', resolution = ?, resolution_note = ?,
                        resolved_at = ?, updated_at = ?, version = version + 1
-                   WHERE incident_id = ? AND version = ? AND status IN ('open', 'review')""",
-                (resolution, note.strip(), now, now, incident["incident_id"], incident["version"]),
+                   WHERE incident_id = ? AND version = ? AND account_scope = ?
+                     AND status IN ('open', 'review')""",
+                (resolution, note.strip(), now, now, current["incident_id"],
+                 current["version"], current["account_scope"]),
             )
             if cursor.rowcount != 1:
                 return None
+            connection.execute(
+                """INSERT INTO audit_events (event_type, severity, message, payload_json, created_at)
+                   VALUES ('protection_incident_resolved', 'warning',
+                           'Protection incident was manually resolved', ?, ?)""",
+                (json.dumps({
+                    "incident_id": current["incident_id"], "inst_id": current["inst_id"],
+                    "resolution": resolution, "reviewed_version": current["version"],
+                }), now),
+            )
             return dict(connection.execute(
                 "SELECT * FROM protection_incidents WHERE incident_id = ?",
                 (incident["incident_id"],),

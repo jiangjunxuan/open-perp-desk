@@ -381,15 +381,18 @@ tbody tr:hover { background: var(--surface); }
 .protection-incident-heading h3 { margin: 0; font-size: 12px; color: var(--danger); }
 .protection-incident-heading p { margin: 5px 0 0; font-size: 11px; }
 .protection-incident-list { display: grid; gap: 1px; }
-.protection-incident { display: grid; grid-template-columns: minmax(150px, .8fr) minmax(180px, 1fr) minmax(260px, 1.6fr) auto; align-items: center; gap: 12px; padding: 12px; background: var(--surface); }
+.protection-incident { display: grid; grid-template-columns: minmax(130px, .7fr) minmax(150px, 1fr) minmax(200px, 1.4fr); align-items: center; gap: 12px; padding: 12px; background: var(--surface); }
 .protection-incident > * { min-width: 0; }
 .protection-incident-meta, .protection-incident-evidence { display: grid; gap: 5px; }
-.protection-incident-meta strong { overflow-wrap: anywhere; }
+.protection-incident-meta strong, .protection-incident-meta span { overflow-wrap: anywhere; }
 .protection-incident-meta span, .protection-incident-evidence span { color: var(--muted); font-size: 11px; }
 .protection-incident-evidence p { margin: 0; color: var(--muted-strong); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
-.protection-incident-actions { display: grid; grid-template-columns: minmax(170px, 1fr) minmax(180px, 1.2fr) auto; align-items: center; gap: 6px; }
-.protection-incident-actions select, .protection-incident-actions input { width: 100%; font-size: 11px; }
-.protection-incident-actions .button { min-height: 36px; }
+.protection-incident-actions { display: grid; grid-column: 1 / -1; grid-template-columns: minmax(170px, .65fr) minmax(180px, 1.4fr) auto; align-items: end; gap: 8px; }
+.protection-incident-actions label { display: grid; gap: 6px; min-width: 0; color: var(--muted-strong); font-size: 12px; }
+.protection-incident-actions select, .protection-incident-actions input { width: 100%; min-height: 44px; font-size: 12px; }
+.protection-incident-actions .button { min-height: 44px; }
+.protection-incident-actions .incident-message { grid-column: 1 / -1; margin: 0; color: var(--danger); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.protection-incident-actions .incident-message:empty { display: none; }
 @media (max-width: 1023px) {
   .protection-incident { grid-template-columns: 1fr; }
   .protection-incident-actions { grid-template-columns: 1fr 1fr auto; }

@@ -143,6 +143,35 @@ class RealtimeUnitTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(StopAsyncIteration):
             await anext(events)
 
+    async def test_private_stream_pushes_incident_review_version_and_resolution(self):
+        account = SimpleNamespace(
+            configured=True, connected=True, authenticated=True, balance=[], last_message_at="now",
+        )
+        record = {
+            "account_scope": "fixture", "inst_id": SYMBOL, "opening_order_id": "incident-sse",
+            "failure_code": "attached_protection_missing",
+        }
+        first = self.store.record_protection_incident(record)
+        events = private_events(self.store, account, SimpleNamespace(configured=True, account_scope="fixture"), lambda: True)
+        self.addAsyncCleanup(close_events, events)
+
+        async def incident_frame():
+            async with asyncio.timeout(2):
+                while True:
+                    frame = await anext(events)
+                    if frame.startswith("event: protection_incidents\n"):
+                        return json.loads(frame.split("data: ", 1)[1])
+
+        self.assertEqual((await incident_frame())["data"][0]["version"], first["version"])
+        updated = self.store.record_protection_incident({**record, "failure_detail": "new evidence"})
+        payload = await incident_frame()
+        self.assertEqual(payload["data"][0]["version"], updated["version"])
+        self.assertEqual(payload["data"][0]["failure_detail"], "new evidence")
+        self.store.resolve_protection_incident(
+            updated, resolution="external_protection_verified", note="Reviewed external protection",
+        )
+        self.assertEqual((await incident_frame())["data"], [])
+
 
 class RealtimeHttpTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

@@ -127,7 +127,7 @@ class AccountSynchronizer:
                 raise OrderSnapshotConflict("order_account_scope_unverified")
             self._validate_local_order(previous, item)
         side, pos_side = _text(item.get("side"), "unknown"), _text(item.get("posSide"), "net")
-        self.store.save_exchange_order({
+        current, _ = self.store.save_exchange_order({
             "client_order_id": client_id,
             "exchange_order_id": order_id,
             "status": _text(item.get("state"), "unknown"),
@@ -148,7 +148,7 @@ class AccountSynchronizer:
             "updated_at": _timestamp(item.get("uTime")),
             "exchange_updated_ms": _exchange_ms(item.get("uTime")),
         })
-        self._record_attached_protection_failure(previous, item)
+        self._record_attached_protection_failure(current, json.loads(current["raw_json"]))
         return True
 
     def _record_attached_protection_failure(
@@ -190,6 +190,8 @@ class AccountSynchronizer:
             "failure_code": code,
             "failure_detail": detail,
         })
+        if not record["changed"]:
+            return
         self.store.add_audit(
             "attached_protection_failed",
             "OKX attached protection creation failed",
