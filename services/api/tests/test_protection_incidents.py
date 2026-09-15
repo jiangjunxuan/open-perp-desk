@@ -1,9 +1,12 @@
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, patch
 from pathlib import Path
 from types import SimpleNamespace
 
 from app.account_sync import AccountSynchronizer
+from app import main as api_main
+from fastapi import HTTPException
 from app.state_store import ExposureSnapshotChanged, StateStore
 from app.position_protection import attached_algo_client_id
 
@@ -147,6 +150,48 @@ class ProtectionIncidentTests(unittest.TestCase):
             resolution="external_protection_verified",
             note="重复提交",
         ))
+
+    def test_position_closed_resolution_requires_durable_closed_position(self):
+        incident = self.store.record_protection_incident({
+            "account_scope": "incident-fixture",
+            "inst_id": "BTC-USDT-SWAP",
+            "position_key": "BTC-USDT-SWAP:net:cross",
+            "opening_order_id": "entry-incident-1",
+            "failure_code": "attached_protection_missing",
+        })
+        request = api_main.ProtectionIncidentResolutionRequest(
+            resolution="position_closed",
+            note="仓位已归零，依据本地对账记录。",
+        )
+        notifier = AsyncMock()
+        with patch.object(api_main, "state_store", self.store), \
+                patch.object(api_main, "account_client", SimpleNamespace(account_scope="incident-fixture")), \
+                patch.object(api_main, "execution_engine", SimpleNamespace(notify_event=notifier)):
+            with self.assertRaises(HTTPException) as context:
+                import asyncio
+                asyncio.run(api_main.resolve_protection_incident(
+                    request, incident["incident_id"], None,
+                ))
+        self.assertEqual(context.exception.status_code, 409)
+        self.store.upsert_position({
+            "position_key": "BTC-USDT-SWAP:net:cross",
+            "inst_id": "BTC-USDT-SWAP",
+            "pos_side": "net",
+            "td_mode": "cross",
+            "account_scope": "incident-fixture",
+            "size": 0,
+            "entry_price": 50000,
+            "status": "closed",
+        })
+        with patch.object(api_main, "state_store", self.store), \
+                patch.object(api_main, "account_client", SimpleNamespace(account_scope="incident-fixture")), \
+                patch.object(api_main, "execution_engine", SimpleNamespace(notify_event=notifier)):
+            result = __import__("asyncio").run(api_main.resolve_protection_incident(
+                request, incident["incident_id"], None,
+            ))
+        self.assertTrue(result["accepted"])
+        self.assertEqual(self.store.protection_incident(incident["incident_id"])["status"], "resolved")
+        notifier.assert_awaited_once()
 
 
 if __name__ == "__main__":

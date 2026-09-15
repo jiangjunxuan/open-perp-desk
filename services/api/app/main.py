@@ -588,7 +588,7 @@ async def resolve_protection_incident(
         raise HTTPException(status_code=404, detail="Protection incident not found.")
     if request.resolution == "position_closed":
         position = state_store.get_position(incident["position_key"]) if incident.get("position_key") else None
-        if position and (position["status"] != "closed" or float(position["size"]) != 0):
+        if not position or position["status"] != "closed" or float(position["size"]) != 0:
             raise HTTPException(status_code=409, detail="Position is still open; cannot resolve as closed.")
     try:
         resolved = state_store.resolve_protection_incident(
