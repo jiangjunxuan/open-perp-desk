@@ -54,8 +54,12 @@ def validate_config(config: dict, *, recovery: bool = False) -> dict:
     if mode == "live" and booleans["EXECUTION_ENABLED"]:
         if not booleans["LIVE_TRADING_ENABLED"] or not environment.get("LIVE_UNLOCK_PHRASE", "").strip():
             failures.append("Live execution requires the separate live gate and unlock phrase")
-    if len(environment.get("ADMIN_API_TOKEN", "").strip()) < 16:
-        failures.append("ADMIN_API_TOKEN must contain at least 16 characters")
+    admin_token = environment.get("ADMIN_API_TOKEN", "").strip()
+    app_env = environment.get("APP_ENV", "development").strip().lower()
+    if not admin_token:
+        failures.append("ADMIN_API_TOKEN must be configured")
+    elif len(admin_token) < 16 and app_env not in {"development", "dev", "test"}:
+        failures.append("ADMIN_API_TOKEN must contain at least 16 characters outside development/test")
     if booleans["EXECUTION_ENABLED"]:
         if not all(environment.get(name, "").strip() for name in ("OKX_API_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE")):
             failures.append("Execution requires all three OKX credentials")

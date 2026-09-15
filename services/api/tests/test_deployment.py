@@ -122,7 +122,7 @@ class DeploymentConfigTests(unittest.TestCase):
         for changes in (
             {"OKX_DEMO": "false"}, {"LIVE_TRADING_ENABLED": "true"},
             {"TRADING_MODE": "invalid"}, {"EXECUTION_ENABLED": "yes"},
-            {"EXECUTION_ENABLED": "true"}, {"ADMIN_API_TOKEN": "short"},
+            {"EXECUTION_ENABLED": "true"},
             {"AUTO_TRADING_ENABLED": "true", "AUTO_TRADING_DRY_RUN": "false"},
             {"TRADINGAGENTS_ENABLED": "true"}, {"OKX_PROXY_URL": "file:///private"},
         ):
@@ -130,6 +130,20 @@ class DeploymentConfigTests(unittest.TestCase):
             model["services"]["api"]["environment"].update(changes)
             with self.subTest(changes=changes), self.assertRaises(deploy.DeploymentError):
                 deploy.validate_config(model)
+
+    def test_short_local_admin_token_is_development_only(self):
+        model = configuration()
+        model["services"]["api"]["environment"]["ADMIN_API_TOKEN"] = "admin"
+        deploy.validate_config(model)
+        model["services"]["api"]["environment"]["APP_ENV"] = "production"
+        with self.assertRaisesRegex(deploy.DeploymentError, "outside development/test"):
+            deploy.validate_config(model)
+
+    def test_empty_admin_token_is_rejected_in_every_environment(self):
+        model = configuration()
+        model["services"]["api"]["environment"]["ADMIN_API_TOKEN"] = ""
+        with self.assertRaisesRegex(deploy.DeploymentError, "must be configured"):
+            deploy.validate_config(model)
 
     def test_restore_rejects_worker_even_when_it_is_dry_run(self):
         model = configuration()
