@@ -43,11 +43,30 @@ jobs:
               "LIVE_TRADING_ENABLED=false",
               "AUTO_TRADING_ENABLED=false",
               "AUTO_TRADING_DRY_RUN=true",
+              "TRADINGVIEW_ENABLED=true",
+              "TRADINGVIEW_WEBHOOK_SECRET=" + secrets.token_hex(32),
+              "TRADINGVIEW_EXECUTION_ENABLED=false",
+              "TRADINGVIEW_DRY_RUN=true",
+              "TRADINGVIEW_SYMBOLS=BTC-USDT-SWAP",
+              "TRADINGVIEW_DEFAULT_SIZE=3",
+              "TRADINGVIEW_SIGNAL_TTL_SECONDS=45",
+              "TRADINGVIEW_MAX_AGE_SECONDS=60",
+              "TRADINGVIEW_ACCOUNT_EQUITY=2345",
+              "TRADINGVIEW_DAILY_PNL_PCT=-0.5",
+              "TRADINGVIEW_CURRENT_NOTIONAL=1.5",
           ]) + "\n")
           os.chmod(path, 0o600)
           PY
           docker compose config --quiet
           ./infra/openperpdesk.sh preflight
+          if TRADINGVIEW_SYMBOLS= ./infra/openperpdesk.sh preflight; then
+            echo "An explicitly empty TradingView allowlist must fail preflight."
+            exit 1
+          fi
+          if TRADINGVIEW_DRY_RUN=tru ./infra/openperpdesk.sh preflight; then
+            echo "A malformed TradingView Dry Run flag must fail preflight."
+            exit 1
+          fi
       - name: container build, persistence and recovery drill
         run: |
           set -eu
@@ -61,6 +80,54 @@ jobs:
           curl --fail --silent http://127.0.0.1:8080/live.js | grep 'openLiveStream' >/dev/null
           curl --fail --silent http://127.0.0.1:8080/assets/reports/marked.js | grep 'Marked' >/dev/null
           curl --fail --silent http://127.0.0.1:8080/assets/reports/purify.min.js | grep 'DOMPurify' >/dev/null
+          docker compose exec -T api python - <<'PY'
+          import json, os, time, urllib.request
+          from datetime import datetime, timezone
+          from app import tradingview
+          expected = {
+              "TRADINGVIEW_ENABLED": "true", "TRADINGVIEW_EXECUTION_ENABLED": "false",
+              "TRADINGVIEW_DRY_RUN": "true", "TRADINGVIEW_SYMBOLS": "BTC-USDT-SWAP",
+              "TRADINGVIEW_DEFAULT_SIZE": "3", "TRADINGVIEW_SIGNAL_TTL_SECONDS": "45",
+              "TRADINGVIEW_MAX_AGE_SECONDS": "60", "TRADINGVIEW_ACCOUNT_EQUITY": "2345",
+              "TRADINGVIEW_DAILY_PNL_PCT": "-0.5", "TRADINGVIEW_CURRENT_NOTIONAL": "1.5",
+          }
+          assert all(os.environ.get(name) == value for name, value in expected.items())
+          assert len(os.environ.get("TRADINGVIEW_WEBHOOK_SECRET", "")) == 64
+          assert tradingview.status()["configured"] and tradingview.status()["dry_run"]
+          assert tradingview.numeric_context() == {
+              "account_equity": 2345, "daily_pnl_pct": -0.5, "current_notional": 1.5,
+          }
+          payload = {
+              "secret": os.environ["TRADINGVIEW_WEBHOOK_SECRET"], "alert_id": "ci-compose-hold",
+              "symbol": "BTC-USDT-SWAP", "action": "hold", "dry_run": True,
+              "timestamp": datetime.now(timezone.utc).isoformat(),
+          }
+          body = json.dumps(payload).encode()
+          signal, size, _, _ = tradingview.to_signal(tradingview.parse_body(body), body=body)
+          assert size == 3 and 44 <= (signal.expires_at - signal.created_at).total_seconds() <= 45
+          url = "http://web/api/v1/integrations/tradingview"
+          def send():
+              request = urllib.request.Request(url + "/webhook", data=body, headers={"Content-Type": "application/json"})
+              with urllib.request.urlopen(request, timeout=3) as response:
+                  assert response.status == 202
+                  return json.load(response)
+          receipt = send()
+          assert receipt["accepted"] and receipt["dry_run"] and not receipt["idempotent"]
+          request = urllib.request.Request(url + "/alerts", headers={"X-Admin-Token": os.environ["ADMIN_API_TOKEN"]})
+          deadline = time.monotonic() + 10
+          while True:
+              with urllib.request.urlopen(request, timeout=3) as response:
+                  rows = json.load(response)["data"]
+              assert len(rows) == 1
+              if rows[0]["status"] == "observed":
+                  break
+              assert time.monotonic() < deadline, "TradingView hold was not processed"
+              time.sleep(0.1)
+          assert rows[0]["client_order_id"] is None
+          assert os.environ["TRADINGVIEW_WEBHOOK_SECRET"] not in json.dumps(rows)
+          assert send()["idempotent"]
+          print("Compose TradingView environment and Nginx hold receipt passed; no trading performed.")
+          PY
           python infra/realtime-smoke.py --base-url http://127.0.0.1:8080
           ./infra/openperpdesk.sh smoke http://127.0.0.1:8080
           docker compose exec -T api python -c \

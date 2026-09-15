@@ -3,7 +3,9 @@
 import argparse
 import fcntl
 import json
+import math
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -68,6 +70,51 @@ def validate_config(config: dict, *, recovery: bool = False) -> dict:
             failures.append("Non-dry-run automation requires enabled Demo execution")
     if booleans["TRADINGAGENTS_ENABLED"] and not environment.get("TRADINGAGENTS_PATH", "").strip():
         failures.append("TradingAgents requires TRADINGAGENTS_PATH")
+    for name, default in {
+        "TRADINGVIEW_ENABLED": "false",
+        "TRADINGVIEW_EXECUTION_ENABLED": "false",
+        "TRADINGVIEW_DRY_RUN": "true",
+    }.items():
+        value = environment.get(name, default).strip().lower()
+        if value not in {"true", "false"}:
+            failures.append(f"{name} must be true or false")
+        booleans[name] = value == "true"
+    if booleans["TRADINGVIEW_ENABLED"]:
+        secret = environment.get("TRADINGVIEW_WEBHOOK_SECRET", "").strip()
+        if not secret or len(secret) > 256:
+            failures.append("TradingView requires a webhook secret of 1 to 256 characters")
+        elif len(secret) < 32 and app_env not in {"development", "dev", "test"}:
+            failures.append("TRADINGVIEW_WEBHOOK_SECRET must contain at least 32 characters outside development/test")
+        symbols = environment.get(
+            "TRADINGVIEW_SYMBOLS", environment.get("MARKET_SYMBOLS", "BTC-USDT-SWAP,ETH-USDT-SWAP"),
+        ).split(",")
+        if not any(symbol.strip() for symbol in symbols) or any(
+            symbol.strip() and not re.fullmatch(r"[A-Z0-9]+-[A-Z0-9]+-SWAP", symbol.strip().upper())
+            for symbol in symbols
+        ):
+            failures.append("TRADINGVIEW_SYMBOLS must contain a nonempty OKX perpetual instrument allowlist")
+        if booleans["TRADINGVIEW_EXECUTION_ENABLED"] and not booleans["TRADINGVIEW_DRY_RUN"] and not booleans["EXECUTION_ENABLED"]:
+            failures.append("Non-dry-run TradingView execution requires EXECUTION_ENABLED=true")
+        for name in ("TRADINGVIEW_SIGNAL_TTL_SECONDS", "TRADINGVIEW_MAX_AGE_SECONDS"):
+            try:
+                if not 15 <= int(environment.get(name, "300")) <= 3600:
+                    raise ValueError
+            except ValueError:
+                failures.append(f"{name} must be an integer between 15 and 3600")
+        for name, default, lower, inclusive in (
+            ("TRADINGVIEW_DEFAULT_SIZE", "1", 0, False),
+            ("TRADINGVIEW_ACCOUNT_EQUITY", environment.get("AUTO_TRADING_ACCOUNT_EQUITY", "1000"), 0, False),
+            ("TRADINGVIEW_DAILY_PNL_PCT", "0", None, True),
+            ("TRADINGVIEW_CURRENT_NOTIONAL", "0", 0, True),
+        ):
+            try:
+                number = float(environment.get(name, default))
+                if not math.isfinite(number) or (
+                    lower is not None and (number < lower if inclusive else number <= lower)
+                ):
+                    raise ValueError
+            except ValueError:
+                failures.append(f"{name} must be finite and within its permitted range")
     for name in ("OKX_PROXY_URL", "PUSHPLUS_PROXY_URL"):
         value = environment.get(name, "")
         try:

@@ -57,6 +57,11 @@ def _truthy(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).strip().lower() == "true"
 
 
+def _dry_run() -> bool:
+    # Only an explicit false may remove this execution restriction.
+    return os.getenv("TRADINGVIEW_DRY_RUN", "true").strip().lower() != "false"
+
+
 def enabled() -> bool:
     return _truthy("TRADINGVIEW_ENABLED")
 
@@ -72,7 +77,7 @@ def status() -> dict[str, object]:
         "enabled": enabled(),
         "configured": configured_now,
         "execution_enabled": execution_enabled,
-        "dry_run": not execution_enabled or _truthy("TRADINGVIEW_DRY_RUN", "true"),
+        "dry_run": not execution_enabled or _dry_run(),
         "symbols": sorted(_allowed_symbols()),
         "max_age_seconds": _max_age_seconds(),
         "signal_ttl_seconds": _ttl_seconds(),
@@ -232,7 +237,7 @@ def to_signal(
 def execution_dry_run(payload: TradingViewPayload) -> bool:
     if not _truthy("TRADINGVIEW_EXECUTION_ENABLED"):
         return True
-    if _truthy("TRADINGVIEW_DRY_RUN", "true"):
+    if _dry_run():
         return True
     return payload.dry_run is True
 

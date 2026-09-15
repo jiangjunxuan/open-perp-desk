@@ -57,6 +57,8 @@ python infra/realtime-smoke.py --base-url http://127.0.0.1:8080
 
 `preflight` 会在不打印密钥的前提下检查 `.env` 权限、Demo/实盘模式、
 管理员令牌、执行凭据、自动 Worker、TradingAgents 路径和代理协议。
+启用 TradingView 时，还会检查独立 Webhook 密钥、非空合约白名单、时效和
+数值参数；生产密钥至少 32 个字符，非 Dry Run 执行仍需全局执行开关。
 校验输入来自 `docker compose config --format json` 的最终解析结果，包含
 Compose 默认值、环境变量覆盖和覆盖文件，不再手工解析 `.env`。
 Demo 部署要求 `TRADING_MODE=demo`、`OKX_DEMO=true` 且实盘闸门关闭；

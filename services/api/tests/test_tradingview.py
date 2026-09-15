@@ -120,6 +120,22 @@ class TradingViewNormalizationTests(unittest.TestCase):
                 with self.assertRaisesRegex(tradingview.TradingViewWebhookError, "invalid_simulation_context"):
                     tradingview.numeric_context()
 
+    def test_dry_run_requires_explicit_false_even_without_deployment_preflight(self):
+        payload = tradingview.parse_body(json.dumps(alert(dry_run=False)).encode())
+        for value in ("", "tru", "0", "no", "invalid", "true"):
+            with self.subTest(value=value), patch.dict(os.environ, {
+                "TRADINGVIEW_EXECUTION_ENABLED": "true", "TRADINGVIEW_DRY_RUN": value,
+            }):
+                self.assertTrue(tradingview.execution_dry_run(payload))
+                self.assertTrue(tradingview.status()["dry_run"])
+        with patch.dict(os.environ, {
+            "TRADINGVIEW_EXECUTION_ENABLED": "true", "TRADINGVIEW_DRY_RUN": " false ",
+        }):
+            self.assertFalse(tradingview.execution_dry_run(payload))
+            self.assertFalse(tradingview.status()["dry_run"])
+            payload.dry_run = True
+            self.assertTrue(tradingview.execution_dry_run(payload))
+
 
 class TradingViewEndpointTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -277,6 +293,15 @@ class TradingViewEndpointTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"TRADINGVIEW_EXECUTION_ENABLED": "true", "TRADINGVIEW_DRY_RUN": "false"}):
             await self.worker.run_once()
         self.assertTrue(self.execution.submit_signal.await_args.kwargs["dry_run"])
+
+    async def test_malformed_dry_run_flag_never_queues_executable_instruction(self):
+        with patch.dict(os.environ, {"TRADINGVIEW_EXECUTION_ENABLED": "true", "TRADINGVIEW_DRY_RUN": "tru"}):
+            response = await self.post(alert(dry_run=False))
+            self.assertEqual(response.status_code, 202)
+            self.assertTrue(response.json()["dry_run"])
+            await self.worker.run_once()
+        self.assertTrue(self.execution.submit_signal.await_args.kwargs["dry_run"])
+        self.assertEqual(self.store.list_tradingview_alerts()[0]["status"], "preview")
 
     async def test_execution_disabled_after_receipt_rejects(self):
         with patch.dict(os.environ, {"TRADINGVIEW_EXECUTION_ENABLED": "true", "TRADINGVIEW_DRY_RUN": "false"}):

@@ -145,6 +145,68 @@ class DeploymentConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(deploy.DeploymentError, "must be configured"):
             deploy.validate_config(model)
 
+    def test_tradingview_preview_and_enabled_demo_execution_configuration(self):
+        model = configuration()
+        environment = model["services"]["api"]["environment"]
+        environment.update(
+            APP_ENV="production", TRADINGVIEW_ENABLED="true",
+            TRADINGVIEW_WEBHOOK_SECRET="fixture-webhook-secret-never-log-32",
+            TRADINGVIEW_SYMBOLS="BTC-USDT-SWAP,ETH-USDT-SWAP",
+        )
+        deploy.validate_config(model)
+        environment.update(
+            TRADINGVIEW_EXECUTION_ENABLED="true", TRADINGVIEW_DRY_RUN="false",
+            EXECUTION_ENABLED="true", OKX_API_KEY="fixture", OKX_SECRET_KEY="fixture",
+            OKX_PASSPHRASE="fixture",
+        )
+        deploy.validate_config(model)
+
+    def test_tradingview_invalid_flags_and_missing_global_gate_rejected(self):
+        for changes in (
+            {"TRADINGVIEW_ENABLED": "yes"}, {"TRADINGVIEW_EXECUTION_ENABLED": "1"},
+            {"TRADINGVIEW_DRY_RUN": "tru"}, {"TRADINGVIEW_DRY_RUN": ""},
+            {"TRADINGVIEW_ENABLED": "true"},
+            {"TRADINGVIEW_ENABLED": "true", "TRADINGVIEW_WEBHOOK_SECRET": "fixture",
+             "TRADINGVIEW_EXECUTION_ENABLED": "true", "TRADINGVIEW_DRY_RUN": "false"},
+        ):
+            model = configuration()
+            model["services"]["api"]["environment"].update(changes)
+            with self.subTest(changes=changes), self.assertRaises(deploy.DeploymentError):
+                deploy.validate_config(model)
+
+    def test_tradingview_production_secret_and_allowlist_validation_redacts_values(self):
+        for changes in (
+            {"TRADINGVIEW_WEBHOOK_SECRET": "fixture-secret"},
+            {"TRADINGVIEW_WEBHOOK_SECRET": "x" * 257},
+            {"TRADINGVIEW_SYMBOLS": ""}, {"TRADINGVIEW_SYMBOLS": " , "},
+            {"TRADINGVIEW_SYMBOLS": "BTCUSDT"}, {"TRADINGVIEW_SYMBOLS": "BTC-USDT-SWAP,ETHUSDT"},
+        ):
+            model = configuration()
+            environment = model["services"]["api"]["environment"]
+            environment.update(
+                APP_ENV="production", TRADINGVIEW_ENABLED="true",
+                TRADINGVIEW_WEBHOOK_SECRET="fixture-webhook-secret-never-log-32",
+            )
+            environment.update(changes)
+            with self.subTest(changes=changes), self.assertRaises(deploy.DeploymentError) as raised:
+                deploy.validate_config(model)
+            self.assertNotIn(environment["TRADINGVIEW_WEBHOOK_SECRET"], str(raised.exception))
+
+    def test_tradingview_numeric_parameters_must_be_finite_and_usable(self):
+        for name, value in (
+            ("TRADINGVIEW_DEFAULT_SIZE", "0"), ("TRADINGVIEW_DEFAULT_SIZE", "nan"),
+            ("TRADINGVIEW_ACCOUNT_EQUITY", "-1"), ("TRADINGVIEW_DAILY_PNL_PCT", "inf"),
+            ("TRADINGVIEW_CURRENT_NOTIONAL", "-1"), ("TRADINGVIEW_MAX_AGE_SECONDS", "14"),
+            ("TRADINGVIEW_SIGNAL_TTL_SECONDS", "3601"), ("TRADINGVIEW_MAX_AGE_SECONDS", "30.5"),
+        ):
+            model = configuration()
+            model["services"]["api"]["environment"].update(
+                TRADINGVIEW_ENABLED="true", TRADINGVIEW_WEBHOOK_SECRET="fixture",
+            )
+            model["services"]["api"]["environment"][name] = value
+            with self.subTest(name=name, value=value), self.assertRaisesRegex(deploy.DeploymentError, name):
+                deploy.validate_config(model)
+
     def test_restore_rejects_worker_even_when_it_is_dry_run(self):
         model = configuration()
         model["services"]["api"]["environment"]["AUTO_TRADING_ENABLED"] = "true"

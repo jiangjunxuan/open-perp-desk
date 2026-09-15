@@ -38,6 +38,14 @@ TRADING_MODE=demo
 OKX_DEMO=true
 ```
 
+Docker Compose 会显式向 API 容器传递全部 `TRADINGVIEW_*` 配置；修改 `.env`
+后必须重新创建 API 容器，仅重启旧容器不会更新环境变量。先运行
+`./infra/openperpdesk.sh preflight`，再通过 `./infra/openperpdesk.sh up` 更新。
+生产和预发布环境的 Webhook 密钥至少 32 个字符，所有环境最多 256 个字符；
+预检不会打印密钥。预检同时检查开关、合约白名单、信号时效和数值参数。
+显式空白名单不会被 Compose 替换为默认合约；Dry Run 只有明确配置为
+`false` 才能解除，空值或拼写错误即使跳过部署预检也保持预览模式。
+
 实盘不会因为 TradingView 配置而自动放行，仍需满足项目独立的实盘配置、人工
 解锁和急停闸门。
 
