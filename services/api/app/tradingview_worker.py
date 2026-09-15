@@ -80,7 +80,17 @@ class TradingViewWorker:
                 # The executor persists its order reservation before sending.
                 # Unknown outcomes are reconciled there, never retried here.
                 self.last_error = type(exc).__name__
-                await self._finish(job, "unconfirmed", {"reasons": ["execution_result_unconfirmed"]})
+                order = None
+                if not job["dry_run"] and job.get("client_order_id"):
+                    order = await asyncio.to_thread(self.store.get_order, job["client_order_id"])
+                status, result = "unconfirmed", {"reasons": ["execution_result_unconfirmed"]}
+                if order and order["status"] == "rejected":
+                    status, result = "rejected", {
+                        "accepted": False, "reasons": ["previous_order_not_accepted"],
+                    }
+                elif order and order["status"] in {"submitted", "live", "partially_filled", "filled", "canceled"}:
+                    status, result = "submitted", {"accepted": True, "reasons": []}
+                await self._finish(job, status, result)
             return True
 
     async def _finish(self, job, status, result) -> None:
@@ -123,6 +133,8 @@ class TradingViewWorker:
         )
         accepted = bool(result.get("accepted"))
         status = ("preview" if job["dry_run"] else "submitted") if accepted else "rejected"
+        if not accepted and "order_submission_unconfirmed" in result.get("reasons", []):
+            status, accepted = "unconfirmed", None
         await self._finish(job, status, {
             "accepted": accepted, "reasons": result.get("reasons", []),
             "client_order_id": (result.get("order") or {}).get("client_order_id"),

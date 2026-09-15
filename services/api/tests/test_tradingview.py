@@ -341,6 +341,54 @@ class TradingViewEndpointTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(.05)
         self.assertEqual(self.worker.snapshot()["last_error"], "TimeoutError")
 
+    async def test_existing_unconfirmed_order_is_not_reported_as_rejected(self):
+        self.execution.submit_signal.return_value = {
+            "accepted": False, "idempotent": True,
+            "reasons": ["order_submission_unconfirmed"],
+            "order": {"client_order_id": "opdpending", "status": "submission_unknown"},
+        }
+        payload = alert()
+        with patch.dict(os.environ, {"TRADINGVIEW_EXECUTION_ENABLED": "true", "TRADINGVIEW_DRY_RUN": "false"}):
+            await self.post(payload)
+            await self.worker.run_once()
+        receipt = (await self.post(payload)).json()
+        self.assertEqual(receipt["status"], "unconfirmed")
+        self.assertIsNone(receipt["execution_accepted"])
+        self.assertEqual(receipt["client_order_id"], "opdpending")
+        self.assertEqual(receipt["reasons"], ["order_submission_unconfirmed"])
+        self.assertFalse(await self.worker.run_once())
+        self.execution.submit_signal.assert_awaited_once()
+
+    async def test_exception_receipt_uses_durable_order_evidence(self):
+        for order_status, receipt_status, accepted in [
+            ("rejected", "rejected", False),
+            ("submitting", "unconfirmed", None),
+            ("submission_unknown", "unconfirmed", None),
+            ("filled", "submitted", True),
+        ]:
+            with self.subTest(order_status=order_status):
+                payload = alert(alert_id=f"durable-{order_status}")
+                with patch.dict(os.environ, {"TRADINGVIEW_EXECUTION_ENABLED": "true", "TRADINGVIEW_DRY_RUN": "false"}):
+                    receipt = (await self.post(payload)).json()
+
+                    async def fail_after_record(*_args, **_kwargs):
+                        self.store.save_order({
+                            "client_order_id": receipt["client_order_id"], "status": order_status,
+                            "inst_id": "BTC-USDT-SWAP", "side": "buy", "size": payload["size"],
+                            "pos_side": "net", "td_mode": "isolated", "ord_type": "market",
+                        })
+                        raise RuntimeError("private-exception-must-not-be-published")
+
+                    self.execution.submit_signal.side_effect = fail_after_record
+                    await self.worker.run_once()
+                final = (await self.post(payload)).json()
+                self.assertEqual(final["status"], receipt_status)
+                self.assertIs(final["execution_accepted"], accepted)
+                self.assertEqual(final["client_order_id"], receipt["client_order_id"])
+                self.assertNotIn("private-exception", json.dumps(final))
+                self.assertFalse(await self.worker.run_once())
+        self.assertEqual(self.execution.submit_signal.await_count, 4)
+
     async def test_processing_cancellation_is_durable(self):
         entered = asyncio.Event()
         async def blocked(*args, **kwargs):
