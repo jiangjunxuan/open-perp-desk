@@ -45,6 +45,10 @@ class OkxAccountStream:
     def configured(self) -> bool:
         return all((self.api_key, self.secret_key, self.passphrase))
 
+    @property
+    def account_ready(self) -> bool:
+        return self.connected and self.authenticated and bool(self.balance)
+
     async def start(self) -> None:
         if self._task is None and self.configured:
             self._task = asyncio.create_task(
@@ -107,6 +111,7 @@ class OkxAccountStream:
                 ) as socket:
                     self.connected = True
                     self.authenticated = False
+                    self.balance = []
                     self.last_error = None
                     delay = 1.0
                     await socket.send(json.dumps(self.login_message()))
@@ -131,6 +136,7 @@ class OkxAccountStream:
             finally:
                 self.connected = False
                 self.authenticated = False
+                self.balance = []
             await asyncio.sleep(delay)
             delay = min(delay * 2, 30.0)
 
@@ -138,6 +144,7 @@ class OkxAccountStream:
         message = decode_message(raw)
 
         if message.get("event") == "login":
+            self.balance = []
             if str(message.get("code", "")) == "0":
                 self.authenticated = True
                 self.last_error = None
@@ -211,6 +218,7 @@ class OkxAccountStream:
             "demo": self.demo,
             "connected": self.connected,
             "authenticated": self.authenticated,
+            "account_ready": self.account_ready,
             "proxy_configured": self.proxy_url is not None,
             "last_message_at": self.last_message_at,
             "last_error": self.last_error,

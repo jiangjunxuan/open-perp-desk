@@ -24,6 +24,7 @@ const state = {
   controlUpdates: 0,
   statusRequest: 0,
   privateFeedState: "locked",
+  privateAccountReady: false,
   privateUpdates: 0,
   strategyDirty: false,
   workerModeDirty: false,
@@ -1133,6 +1134,8 @@ function updatePrivateActionAvailability() {
     || state.status?.safety_control?.emergency_stopped === true
     || state.status?.safety_control?.execution_allowed !== true;
   $("#lock-live").disabled = !unlocked;
+  $("#execute-signal").disabled = !unlocked || state.submitting
+    || !state.analysis?.signal || !executionGateOpen(state.status);
   document.querySelectorAll("button[aria-busy='true']").forEach((button) => {
     button.disabled = true;
   });
@@ -1814,6 +1817,8 @@ function executionGateOpen(status) {
     && state.marketStream?.tickers?.[state.symbol]?.fresh === true
     && state.controlFeedState === "open"
     && state.controlSnapshotFresh
+    && state.privateFeedState === "open"
+    && state.privateAccountReady
     && status.risk_engine_ready === true
     && status.safety_control?.emergency_stopped !== true
     && status.safety_control?.execution_allowed === true
@@ -1848,14 +1853,14 @@ function applyStatus(status) {
     ? "在线" : publicStream.candles_connected ? "等待数据" : publicStream.candles_last_error ? "重连中" : "连接中",
   !candlesKnown ? "neutral" : publicStream.candles_fresh ? "good" : "warning");
   const accountStream = status.account_stream || {};
-  const accountStreamReady = accountStream.connected && accountStream.authenticated;
+  const accountStreamReady = accountStream.connected && accountStream.authenticated && accountStream.account_ready;
   setState(
     "#state-account-stream",
     accountStreamReady
       ? "在线"
       : accountStream.configured
         ? accountStream.connected
-          ? "认证中"
+          ? accountStream.authenticated ? "等待数据" : "认证中"
           : "连接中"
         : "未配置",
     accountStreamReady
@@ -2181,6 +2186,7 @@ function lockPrivateAccess() {
   privateFeed?.close();
   privateFeed = null;
   state.privateFeedState = "locked";
+  state.privateAccountReady = false;
   state.token = "";
   state.privateUpdates += 1;
   state.adjustments = [];
@@ -2202,6 +2208,11 @@ function lockPrivateAccess() {
 }
 
 function clearPrivateDisplay(status = "账户推送断开", note = "实时账户数据不可用") {
+  state.privateAccountReady = false;
+  state.privateUpdates += 1;
+  state.performanceRequest += 1;
+  state.activityRequest += 1;
+  clearTimeout(state.performanceTimer);
   renderPositions([]);
   renderOrders([]);
   renderFills([]);
@@ -2210,23 +2221,37 @@ function clearPrivateDisplay(status = "账户推送断开", note = "实时账户
   renderAccountBills({ configured: Boolean(state.token) });
   renderActivity([]);
   setText("#metric-equity", "--");
+  setText("#metric-pnl", "--");
   setText("#metric-equity-note", note);
   setState("#positions-tag", status, "warning");
   setText("#pnl-summary", "暂无实时账户数据");
-  updatePrivateActionAvailability();
+  for (const kind of ["positions", "orders", "fills"]) {
+    state.records[kind] = null;
+    $(`#${kind}-body`).innerHTML = emptyRecordRow(kind, false, escapeHtml(note));
+    $(`#${kind}-query`).disabled = true;
+    setText(`#${kind}-filter-count`, status);
+    setText(`#ledger-count-${kind}`, "--");
+  }
+  $("#orders-status").disabled = true;
+  if (state.status) applyStatus(state.status);
+  else updatePrivateActionAvailability();
 }
 
 async function refreshLivePerformance() {
   const token = state.token;
   const request = ++state.performanceRequest;
-  if (!token) return;
+  if (!token || state.privateFeedState !== "open" || !state.privateAccountReady) return;
   try {
     const report = await api(`/api/v1/performance/report?initial_equity=${encodeURIComponent($("#equity-input").value)}`);
-    if (token !== state.token || request !== state.performanceRequest) return;
+    if (token !== state.token || request !== state.performanceRequest
+        || state.privateFeedState !== "open" || !state.privateAccountReady) return;
     renderPerformance(report.data);
     setText("#pnl-summary", `净 PnL ${formatNumber(report.data?.net_pnl, 4)} · 回撤 ${formatNumber(report.data?.max_drawdown_pct, 2)}% · ${report.data?.fills || 0} 笔成交`);
   } catch {
-    if (token === state.token) setText("#performance-basis", "绩效更新失败 · 保留上次数据");
+    if (token === state.token && request === state.performanceRequest
+        && state.privateFeedState === "open" && state.privateAccountReady) {
+      setText("#performance-basis", "绩效更新失败 · 保留上次数据");
+    }
   }
 }
 
@@ -2237,6 +2262,8 @@ function applyPrivateEvent(event, payload) {
     lockPrivateAccess();
     return;
   }
+  if (["account", "positions", "orders", "fills", "bills"].includes(event)
+      && (state.privateFeedState !== "open" || event !== "account" && !state.privateAccountReady)) return;
   state.privateUpdates += 1;
   if (event === "positions") {
     renderPositions(payload.data);
@@ -2254,21 +2281,22 @@ function applyPrivateEvent(event, payload) {
     renderActivity(payload.data);
   } else if (event === "bills") renderAccountBills(payload);
   else if (event === "account") {
-    const ready = payload.connected && payload.authenticated;
+    const connected = payload.connected === true && payload.authenticated === true;
+    const ready = connected && payload.ready === true;
     if (!ready) {
       clearPrivateDisplay(
-        payload.configured ? "账户回报断开" : "私有凭据未配置",
-        payload.configured ? "实时账户数据不可用" : "OKX 私有凭据未配置",
+        payload.configured ? connected ? "等待账户回报" : "账户回报断开" : "私有凭据未配置",
+        payload.configured ? connected ? "等待本次连接的账户数据" : "实时账户数据不可用" : "OKX 私有凭据未配置",
       );
       return;
     }
-    setState("#positions-tag", ready ? "实时同步" : payload.configured ? "账户回报断开" : "私有凭据未配置", ready ? "good" : "warning");
-    const balance = payload.balance?.[0];
-    if (ready && balance) {
-      const equity = formatNumber(balance.totalEq, 2);
-      setText("#metric-equity", equity);
-      setText("#metric-equity-note", equity === "--" ? "账户总权益缺失" : "OKX 账户实时回报");
-    }
+    state.privateAccountReady = true;
+    setState("#positions-tag", "实时同步", "good");
+    const equity = formatNumber(payload.balance?.[0]?.totalEq, 2);
+    setText("#metric-equity", equity);
+    setText("#metric-equity-note", equity === "--" ? "账户总权益缺失" : "OKX 账户实时回报");
+    if (state.status) applyStatus(state.status);
+    else updatePrivateActionAvailability();
   } else if (event === "bill_import") {
     const previous = billHistoryState.job?.status;
     billHistoryState.jobRequest += 1;
@@ -2341,8 +2369,7 @@ async function loadPrivate() {
     if (token !== state.token) return false;
     const activityRequest = ++state.activityRequest;
     const privateUpdates = state.privateUpdates;
-    const [account, positions, orders, fills, pnl, report, activity, bills, handoffs, adjustments, incidents] = await Promise.all([
-      api("/api/v1/account/overview"),
+    const [positions, orders, fills, pnl, report, activity, bills, handoffs, adjustments, incidents] = await Promise.all([
       api("/api/v1/positions"),
       api("/api/v1/orders"),
       api("/api/v1/fills"),
@@ -2356,17 +2383,13 @@ async function loadPrivate() {
     ]);
     if (token !== state.token) return false;
     if (privateUpdates !== state.privateUpdates && state.privateFeedState === "open") return true;
-    if (state.privateFeedState !== "open") {
+    if (state.privateFeedState !== "open" || !state.privateAccountReady) {
       clearPrivateDisplay(
         state.privateFeedState === "connecting" ? "账户推送连接中" : "等待实时推送",
-        "REST 已完成校验，等待账户实时事件",
+        "等待账户实时事件",
       );
       return true;
     }
-    const accountRow = account.balance?.[0] || {};
-    const equity = accountRow.totalEq;
-    setText("#metric-equity", formatNumber(equity, 2));
-    setText("#metric-equity-note", account.configured ? "OKX 账户快照" : "OKX 私有凭据未配置");
     renderPositions(positions.data);
     renderProtectionHandoffs(handoffs.data);
     renderProtectionAdjustments(adjustments.data);
@@ -2381,7 +2404,6 @@ async function loadPrivate() {
       "#pnl-summary",
       `净 PnL ${formatNumber(report.data?.net_pnl ?? pnl.data?.net_pnl, 4)} · 回撤 ${formatNumber(report.data?.max_drawdown_pct, 2)}% · ${report.data?.fills || pnl.data?.fills || 0} 笔成交`,
     );
-    setText("#positions-tag", "已同步");
     return true;
   } catch (error) {
     setMessage(`私有数据同步失败：${error.message}`, "error");

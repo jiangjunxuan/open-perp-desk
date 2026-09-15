@@ -45,13 +45,19 @@ async def private_events(store, account, account_client, authorized, rate_scope=
     heartbeat_at = float("-inf")
     while authorized():
         scope, market_scope = account_client.account_scope, rate_scope()
-        current_revision = (store.revision, scope, market_scope)
+        stream_state = (account.connected, account.authenticated, account.account_ready)
+        current_revision = (store.revision, scope, market_scope, stream_state)
+        if revision is not None and revision[3] != stream_state:
+            # Browsers clear live account values on disconnect. Re-send the
+            # ledger after recovery even when its stored content is unchanged.
+            previous = {}
         payloads = {
             "account": {
                 "configured": account.configured,
                 "connected": account.connected,
                 "authenticated": account.authenticated,
-                "balance": account.balance if account.connected and account.authenticated else [],
+                "ready": all(stream_state),
+                "balance": account.balance if all(stream_state) else [],
                 "last_message_at": account.last_message_at,
             },
         }
@@ -80,7 +86,8 @@ async def private_events(store, account, account_client, authorized, rate_scope=
                     "analyses": {"data": store.analysis_index(limit=1)},
                 }
             payloads.update(await asyncio.to_thread(read_state))
-            if scope != account_client.account_scope or market_scope != rate_scope():
+            if (scope != account_client.account_scope or market_scope != rate_scope()
+                    or stream_state != (account.connected, account.authenticated, account.account_ready)):
                 continue
             revision = current_revision
         if not authorized():
@@ -89,6 +96,10 @@ async def private_events(store, account, account_client, authorized, rate_scope=
             if not authorized():
                 yield event_frame("locked", {})
                 return
+            if stream_state != (account.connected, account.authenticated, account.account_ready):
+                revision = None
+                previous = {}
+                break
             comparable = {key: value for key, value in payload.items() if key != "last_message_at"}
             encoded = json.dumps(comparable, sort_keys=True)
             if encoded != previous.get(name):

@@ -239,6 +239,8 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
         ...state.status, execution_enabled: true, risk_engine_ready: true, trading_mode: "demo",
         safety_control: {execution_allowed: true, emergency_stopped: false},
       };
+      state.privateFeedState = "open";
+      state.privateAccountReady = true;
       state.controlFeedState = "offline";
       const disconnectedExecutionLocked = !executionGateOpen(allowed);
       connectControlFeed();
@@ -267,16 +269,61 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
       state.token = "ui-fixture-not-a-credential";
       state.privateFeedState = "open";
       connectPrivateFeed();
-      applyPrivateEvent("account", { configured: true, connected: true, authenticated: true, balance: [{totalEq: "4321"}] });
+      const privateCallbacks = latest;
+      privateCallbacks.onState("open");
+      applyPrivateEvent("account", { configured: true, connected: true, authenticated: true, ready: true, balance: [{totalEq: "4321"}] });
       const accountUpdated = $("#metric-equity").textContent === "4,321" && $("#positions-tag").textContent === "实时同步";
-      latest.onState("offline");
+      privateCallbacks.onState("offline");
       const privateDataCleared = $("#metric-equity").textContent === "--"
+        && $("#metric-pnl").textContent === "--"
         && $("#positions-tag").textContent === "账户推送断开"
         && $("#pnl-summary").textContent === "暂无实时账户数据";
-      applyPrivateEvent("account", { configured: true, connected: true, authenticated: true, balance: [{adjEq: "999"}] });
+      privateCallbacks.onEvent("account", { configured: true, connected: true, authenticated: true, ready: true, balance: [{totalEq: "999999"}] });
+      const offlineAccountIgnored = $("#metric-equity").textContent === "--";
+      privateCallbacks.onState("open");
+      privateCallbacks.onEvent("heartbeat", {});
+      const privateHeartbeatCannotUnlock = !executionGateOpen(allowed) && !state.privateAccountReady;
+      privateCallbacks.onEvent("account", { configured: true, connected: true, authenticated: true, ready: false, balance: [{totalEq: "999999"}] });
+      const privateLoginCannotUnlock = !executionGateOpen(allowed) && !state.privateAccountReady
+        && $("#metric-equity").textContent === "--" && $("#positions-tag").textContent === "等待账户回报";
+      api = async () => ({configured: true, balance: [{totalEq: "999999"}], data: []});
+      await loadPrivate();
+      const restCannotRestoreDisconnectedAccount = $("#metric-equity").textContent === "--"
+        && !state.privateAccountReady && state.records.positions === null;
+      api = oldApi;
+      privateCallbacks.onEvent("account", { configured: true, connected: true, authenticated: true, ready: true, balance: [{totalEq: "4321"}] });
+      applyStatus({...allowed, account_stream: {configured: true, connected: true, authenticated: true, account_ready: false}});
+      const accountLoginShowsWaiting = $("#state-account-stream").textContent === "等待数据";
+      applyStatus({...allowed, account_stream: {configured: true, connected: true, authenticated: true, account_ready: true}});
+      const accountRecoveryShowsReady = $("#top-execution").textContent === "模拟盘执行已启用"
+        && $("#state-account-stream").textContent === "在线";
+      let resolvePerformance;
+      api = () => new Promise(resolve => { resolvePerformance = resolve; });
+      const latePerformance = refreshLivePerformance();
+      privateCallbacks.onState("offline");
+      const privateDisconnectUpdatesGateLabels = $("#top-execution").textContent === "执行已锁定"
+        && $("#mobile-execution").textContent === "执行已锁定"
+        && $("#ticket-lock-label").textContent === "执行已锁定" && $("#execute-signal").disabled;
+      privateCallbacks.onState("open");
+      privateCallbacks.onEvent("account", { configured: true, connected: true, authenticated: true, ready: true, balance: [{totalEq: "5432"}] });
+      resolvePerformance({data: {ending_equity: 999999, net_pnl: 777, fills: 3}});
+      await latePerformance;
+      api = oldApi;
+      const stalePerformanceRejected = $("#performance-net-pnl").textContent === "--"
+        && $("#metric-equity").textContent === "5,432";
+      privateCallbacks.onEvent("account", { configured: true, connected: false, authenticated: false, balance: [] });
+      privateCallbacks.onEvent("positions", {data: []});
+      privateCallbacks.onEvent("orders", {data: []});
+      const disconnectedLedgerIgnored = state.records.positions === null && state.records.orders === null
+        && $("#metric-pnl").textContent === "--";
+      privateCallbacks.onEvent("account", { configured: true, connected: true, authenticated: true, ready: true, balance: [] });
+      const emptyBalanceCleared = $("#metric-equity").textContent === "--";
+      privateCallbacks.onEvent("positions", {data: []});
+      const confirmedZeroPositionPnl = $("#metric-pnl").textContent === "0";
+      applyPrivateEvent("account", { configured: true, connected: true, authenticated: true, ready: true, balance: [{adjEq: "999"}] });
       const adjustedEquityNotTotal = $("#metric-equity").textContent === "--"
         && $("#metric-equity-note").textContent === "账户总权益缺失";
-      applyPrivateEvent("account", { configured: true, connected: true, authenticated: true, balance: [{totalEq: "0", adjEq: "999"}] });
+      applyPrivateEvent("account", { configured: true, connected: true, authenticated: true, ready: true, balance: [{totalEq: "0", adjEq: "999"}] });
       const zeroEquityPreserved = $("#metric-equity").textContent === "0";
       $("#fast-period").value = "17";
       state.strategyDirty = true;
@@ -287,6 +334,9 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
       openLiveStream = oldOpen;
       return { disconnected, wrongPeriodIgnored, realPriceUpdated, disconnectedQuoteCleared,
         pauseRejectsPendingSnapshot, noSnapshotFallback, auxiliaryDataCleared, privateDataCleared, marketDisconnectLocksExecution,
+        offlineAccountIgnored, privateHeartbeatCannotUnlock, privateLoginCannotUnlock, restCannotRestoreDisconnectedAccount,
+        accountLoginShowsWaiting, accountRecoveryShowsReady, privateDisconnectUpdatesGateLabels,
+        stalePerformanceRejected, disconnectedLedgerIgnored, emptyBalanceCleared, confirmedZeroPositionPnl,
         disconnectedExecutionLocked, reconnectingExecutionLocked, heartbeatCannotUnlock,
         freshControlStatusAccepted, staleStatusRejected, accountUpdated, adjustedEquityNotTotal, zeroEquityPreserved,
         draftPreserved, accessRevoked };

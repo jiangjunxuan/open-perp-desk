@@ -32,8 +32,11 @@ heartbeats, reconnect with backoff and receive a complete current snapshot.
 Background tabs close their feeds and reopen on return. Pausing the chart stops
 its live display without stopping execution or account events.
 The browser's execution controls stay locked during reconnection until a new
-control-state snapshot and fresh market event arrive; a heartbeat alone cannot unlock them. Late
-REST status responses cannot replace a newer pushed safety state.
+control-state snapshot, a fresh market event and a ready private account event
+arrive. Neither a heartbeat nor a successful OKX login can unlock them. Each
+private WebSocket connection must receive its own account data before reporting
+`ready`; old balances are discarded on disconnect and login. Late REST status
+responses cannot replace a newer pushed safety state.
 The quote display uses SSE only. It does not substitute periodically fetched
 REST tickers when the stream is disconnected. Auxiliary market data and private
 account data are cleared while their stream is disconnected, so the UI never
@@ -44,7 +47,11 @@ Private feeds require the administrator token in the `X-Admin-Token` header.
 Tokens are never put in URLs or persistent browser storage. Revocation stops
 private delivery and clears the displayed private state. A REST account sync may
 validate credentials and repair the ledger, but it does not repopulate the
-browser while the private event stream is unavailable. Public feeds contain only
+browser while the private event stream is unavailable or its upstream account is
+not ready. Disconnects invalidate in-flight ledger and performance requests;
+unavailable balances and PnL show `--`, not zero. Account readiness transitions
+republish the durable ledger even if its stored content has not changed, so the
+cleared browser recovers without waiting for a new trade. Public feeds contain only
 the already-public market and system-status information.
 
 REST candle history loads on entry, interval changes, manual refresh and
@@ -81,12 +88,17 @@ prevent a container replacement forever.
 
 `services/api/tests/test_realtime.py` uses real loopback HTTP/WebSocket servers
 and an isolated database to verify private authentication, multi-client safety
-updates and order/fill persistence without manual reconciliation.
+updates, interruption of in-flight snapshots and order/fill persistence without
+manual reconciliation. Recovery checks include a successful login without new
+account data, and unchanged-ledger replay once the account becomes ready.
 `services/api/tests/test_realtime_positions.py` covers eight WS/REST position
 ordering cases, including delayed responses, closures, replayed caches and
 protection updates.
 `infra/realtime-ui-checks.mjs` checks the running public feed, pause/resume,
-stable focus, stale/incorrect-interval rejection and private UI fixtures.
+stable focus, stale/incorrect-interval rejection and private UI fixtures. Private
+checks reject disconnected events and late performance responses, require new
+account data before unlocking, and distinguish unavailable PnL from a confirmed
+zero-position PnL.
 `infra/chart-annotation-ui-checks.mjs` checks drawing, editing, deletion/undo,
 time/price anchors, persistence, corrupt-storage recovery and mobile layouts.
 `infra/okx-private-smoke.py` is the deployment-time read-only probe for private

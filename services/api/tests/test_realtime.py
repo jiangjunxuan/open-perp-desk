@@ -104,7 +104,7 @@ class RealtimeUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_revocation_interrupts_initial_private_snapshot(self):
         account = SimpleNamespace(
-            configured=True, connected=True, authenticated=True,
+            configured=True, connected=True, authenticated=True, account_ready=True,
             balance=[{"totalEq": "1000"}], last_message_at="now",
         )
         allowed = True
@@ -121,7 +121,7 @@ class RealtimeUnitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_private_stream_revocation_and_committed_state(self):
         account = SimpleNamespace(
-            configured=True, connected=True, authenticated=True,
+            configured=True, connected=True, authenticated=True, account_ready=True,
             balance=[{"totalEq": "1000"}], last_message_at="now",
         )
         client = SimpleNamespace(configured=True, account_scope="fixture")
@@ -143,9 +143,66 @@ class RealtimeUnitTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(StopAsyncIteration):
             await anext(events)
 
+    async def test_private_reconnect_republishes_unchanged_ledger(self):
+        account = SimpleNamespace(
+            configured=True, connected=True, authenticated=True, account_ready=True,
+            balance=[{"totalEq": "1000"}], last_message_at="now",
+        )
+        client = SimpleNamespace(configured=True, account_scope="fixture")
+        events = private_events(self.store, account, client, lambda: True)
+        self.addAsyncCleanup(close_events, events)
+
+        async def snapshot():
+            payloads = {}
+            async with asyncio.timeout(2):
+                while True:
+                    frame = await anext(events)
+                    name = frame.splitlines()[0].removeprefix("event: ")
+                    payloads[name] = json.loads(frame.split("data: ", 1)[1])
+                    if name == "analyses":
+                        return payloads
+
+        initial = await snapshot()
+        revision = self.store.revision
+        account.connected = account.authenticated = False
+        disconnected = await snapshot()
+        self.assertFalse(disconnected["account"]["connected"])
+        account.connected = account.authenticated = True
+        account.account_ready = False
+        waiting = await snapshot()
+        self.assertTrue(waiting["account"]["authenticated"])
+        self.assertFalse(waiting["account"]["ready"])
+        self.assertEqual(waiting["account"]["balance"], [])
+        account.account_ready = True
+        recovered = await snapshot()
+        self.assertTrue(recovered["account"]["authenticated"])
+        self.assertTrue(recovered["account"]["ready"])
+        for name in ("positions", "orders", "fills", "bills"):
+            self.assertEqual(initial[name], recovered[name])
+        self.assertEqual(self.store.revision, revision)
+
+    async def test_private_disconnect_interrupts_inflight_snapshot(self):
+        account = SimpleNamespace(
+            configured=True, connected=True, authenticated=True, account_ready=True,
+            balance=[{"totalEq": "1000"}], last_message_at="now",
+        )
+        events = private_events(
+            self.store, account, SimpleNamespace(configured=True, account_scope="fixture"), lambda: True,
+        )
+        self.addAsyncCleanup(close_events, events)
+        self.assertIn("event: account", await anext(events))
+        account.connected = account.authenticated = False
+        async with asyncio.timeout(2):
+            while True:
+                frame = await anext(events)
+                if frame.startswith("event: account\n"):
+                    self.assertFalse(json.loads(frame.split("data: ", 1)[1])["connected"])
+                    break
+                self.assertTrue(frame.startswith("event: heartbeat\n"), frame)
+
     async def test_private_stream_pushes_incident_review_version_and_resolution(self):
         account = SimpleNamespace(
-            configured=True, connected=True, authenticated=True, balance=[], last_message_at="now",
+            configured=True, connected=True, authenticated=True, account_ready=True, balance=[], last_message_at="now",
         )
         record = {
             "account_scope": "fixture", "inst_id": SYMBOL, "opening_order_id": "incident-sse",

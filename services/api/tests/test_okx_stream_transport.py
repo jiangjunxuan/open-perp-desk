@@ -141,14 +141,24 @@ class WebSocketTransportTests(unittest.IsolatedAsyncioTestCase):
             try:
                 await asyncio.gather(market.start(), account.start(), algo.start())
                 await wait_for(lambda: market.fresh and market.candles_fresh and account.fills and algo.orders)
+                self.assertTrue(account.account_ready)
                 exchange.emit = False
                 await asyncio.gather(*(socket.close(code=1000) for socket in list(exchange.sockets.values())))
                 await wait_for(lambda: not any((market.connected, market.candles_connected, account.connected, algo.connected)))
                 self.assertFalse(account.authenticated or algo.authenticated or market.fresh or market.candles_fresh)
+                self.assertFalse(account.account_ready)
+                self.assertEqual(account.balance, [])
                 await wait_for(lambda: len(exchange.connection_count) == 4 and min(exchange.connection_count.values()) >= 2)
                 await wait_for(lambda: market.connected and market.candles_connected and account.authenticated and algo.authenticated)
                 self.assertFalse(market.fresh or market.candles_fresh)
                 self.assertTrue(market.tickers and market.candles)
+                self.assertFalse(account.account_ready)
+                self.assertEqual(account.balance, [])
+                await exchange.sockets["/private"].send(json.dumps({
+                    "arg": {"channel": "account"}, "data": [{"totalEq": "2000"}],
+                }))
+                await wait_for(lambda: account.account_ready)
+                self.assertEqual(account.balance, [{"totalEq": "2000"}])
             finally:
                 await asyncio.gather(market.stop(), account.stop(), algo.stop())
 
