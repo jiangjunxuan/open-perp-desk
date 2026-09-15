@@ -35,13 +35,17 @@ The browser's execution controls stay locked during reconnection until a new
 control-state snapshot and fresh market event arrive; a heartbeat alone cannot unlock them. Late
 REST status responses cannot replace a newer pushed safety state.
 The quote display uses SSE only. It does not substitute periodically fetched
-REST tickers when the stream is disconnected. Normal UI status is "已连接";
-disconnects are explicit and browser order submission remains locked.
+REST tickers when the stream is disconnected. Auxiliary market data and private
+account data are cleared while their stream is disconnected, so the UI never
+labels an old snapshot as current. Normal UI status is "已连接"; disconnects
+are explicit and browser order submission remains locked.
 
 Private feeds require the administrator token in the `X-Admin-Token` header.
 Tokens are never put in URLs or persistent browser storage. Revocation stops
-private delivery and clears the displayed private state. Public feeds contain
-only the already-public market and system-status information.
+private delivery and clears the displayed private state. A REST account sync may
+validate credentials and repair the ledger, but it does not repopulate the
+browser while the private event stream is unavailable. Public feeds contain only
+the already-public market and system-status information.
 
 REST candle history loads on entry, interval changes, manual refresh and
 reconnection to repair gaps; there is no 15-second market refresh timer.

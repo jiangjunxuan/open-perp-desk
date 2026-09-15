@@ -835,9 +835,9 @@ function renderMarketOverview(overview) {
   if (overview) state.marketOverview = overview;
   const snapshot = state.marketFeedState === "open" && !state.marketPaused ? state.marketStream : null;
   const funding = snapshot?.funding_rate?.[state.symbol]?.fresh
-    ? snapshot.funding_rate[state.symbol].data : state.marketOverview?.funding_rate || {};
+    ? snapshot.funding_rate[state.symbol].data : {};
   const openInterest = snapshot?.open_interest?.[state.symbol]?.fresh
-    ? snapshot.open_interest[state.symbol].data : state.marketOverview?.open_interest || {};
+    ? snapshot.open_interest[state.symbol].data : {};
   const fundingRate = funding.fundingRate == null || funding.fundingRate === "" ? NaN : Number(funding.fundingRate);
   const oi = Number(openInterest.oi || openInterest.oiCcy || NaN);
   setText(
@@ -2123,7 +2123,12 @@ function connectMarketFeed() {
   const bar = state.bar;
   marketFeed = openLiveStream(`/api/v1/market/events?bar=${encodeURIComponent(bar)}`, {
     onState(status) {
-      if (status === "offline") state.marketHistoryNeedsSync = true;
+      if (status === "offline") {
+        state.marketHistoryNeedsSync = true;
+        state.marketStream = null;
+        renderWatchlist({});
+        renderMarketOverview();
+      }
       state.marketFeedState = status;
       updateMarketRefreshControl();
     },
@@ -2196,6 +2201,21 @@ function lockPrivateAccess() {
   updatePrivateActionAvailability();
 }
 
+function clearPrivateDisplay(status = "账户推送断开", note = "实时账户数据不可用") {
+  renderPositions([]);
+  renderOrders([]);
+  renderFills([]);
+  renderPnl([]);
+  renderPerformance({});
+  renderAccountBills({ configured: Boolean(state.token) });
+  renderActivity([]);
+  setText("#metric-equity", "--");
+  setText("#metric-equity-note", note);
+  setState("#positions-tag", status, "warning");
+  setText("#pnl-summary", "暂无实时账户数据");
+  updatePrivateActionAvailability();
+}
+
 async function refreshLivePerformance() {
   const token = state.token;
   const request = ++state.performanceRequest;
@@ -2235,6 +2255,13 @@ function applyPrivateEvent(event, payload) {
   } else if (event === "bills") renderAccountBills(payload);
   else if (event === "account") {
     const ready = payload.connected && payload.authenticated;
+    if (!ready) {
+      clearPrivateDisplay(
+        payload.configured ? "账户回报断开" : "私有凭据未配置",
+        payload.configured ? "实时账户数据不可用" : "OKX 私有凭据未配置",
+      );
+      return;
+    }
     setState("#positions-tag", ready ? "实时同步" : payload.configured ? "账户回报断开" : "私有凭据未配置", ready ? "good" : "warning");
     const balance = payload.balance?.[0];
     if (ready && balance) {
@@ -2286,9 +2313,10 @@ function connectPrivateFeed() {
       if (token !== state.token) return;
       state.privateFeedState = status;
       if (status === "locked") lockPrivateAccess();
-      else if (status !== "open") {
-        setState("#positions-tag", "账户推送重连中", "warning");
-        setText("#metric-equity-note", "账户推送重连中 · 保留上次数据");
+      else if (status === "connecting") {
+        clearPrivateDisplay("账户推送连接中", "等待实时账户数据");
+      } else if (status !== "open") {
+        clearPrivateDisplay("账户推送断开", "实时账户数据不可用");
       }
       scheduleBillImportPoll();
     },
@@ -2328,6 +2356,13 @@ async function loadPrivate() {
     ]);
     if (token !== state.token) return false;
     if (privateUpdates !== state.privateUpdates && state.privateFeedState === "open") return true;
+    if (state.privateFeedState !== "open") {
+      clearPrivateDisplay(
+        state.privateFeedState === "connecting" ? "账户推送连接中" : "等待实时推送",
+        "REST 已完成校验，等待账户实时事件",
+      );
+      return true;
+    }
     const accountRow = account.balance?.[0] || {};
     const equity = accountRow.totalEq;
     setText("#metric-equity", formatNumber(equity, 2));

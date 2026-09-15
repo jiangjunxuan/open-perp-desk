@@ -198,6 +198,12 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
       const wrongPeriodIgnored = state.marketStream === null;
       latest.onEvent("market", { bar: state.bar, tickers: { [state.symbol]: record }, candles: {} });
       const realPriceUpdated = $("#market-price").textContent === "100";
+      latest.onState("offline");
+      const disconnectedQuoteCleared = $("#market-price").textContent === "--"
+        && $("#market-funding").textContent === "--"
+        && $("#market-oi").textContent === "--";
+      latest.onState("open");
+      latest.onEvent("market", { bar: state.bar, tickers: { [state.symbol]: record }, candles: {} });
       const oldApi = api;
       const replies = [];
       api = () => new Promise(resolve => replies.push(resolve));
@@ -215,6 +221,13 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
       };
       state.marketPaused = false;
       state.marketFeedState = "offline";
+      state.marketOverview = {
+        funding_rate: { fundingRate: "0.1" },
+        open_interest: { oi: "123" },
+      };
+      renderMarketOverview();
+      const auxiliaryDataCleared = $("#market-funding").textContent === "--"
+        && $("#market-oi").textContent === "--";
       await loadMarket();
       const noSnapshotFallback = $("#market-price").textContent === "100"
         && requests.length === 1 && requests[0].includes("/market/candles")
@@ -253,8 +266,13 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
         && !executionGateOpen(state.status) && $("#execute-signal").disabled;
       state.token = "ui-fixture-not-a-credential";
       state.privateFeedState = "open";
+      connectPrivateFeed();
       applyPrivateEvent("account", { configured: true, connected: true, authenticated: true, balance: [{totalEq: "4321"}] });
       const accountUpdated = $("#metric-equity").textContent === "4,321" && $("#positions-tag").textContent === "实时同步";
+      latest.onState("offline");
+      const privateDataCleared = $("#metric-equity").textContent === "--"
+        && $("#positions-tag").textContent === "账户推送断开"
+        && $("#pnl-summary").textContent === "暂无实时账户数据";
       applyPrivateEvent("account", { configured: true, connected: true, authenticated: true, balance: [{adjEq: "999"}] });
       const adjustedEquityNotTotal = $("#metric-equity").textContent === "--"
         && $("#metric-equity-note").textContent === "账户总权益缺失";
@@ -267,7 +285,8 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
       applyPrivateEvent("locked", {});
       const accessRevoked = state.token === "" && $("#metric-equity").textContent === "--" && $("#execute-signal").disabled;
       openLiveStream = oldOpen;
-      return { disconnected, wrongPeriodIgnored, realPriceUpdated, pauseRejectsPendingSnapshot, noSnapshotFallback, marketDisconnectLocksExecution,
+      return { disconnected, wrongPeriodIgnored, realPriceUpdated, disconnectedQuoteCleared,
+        pauseRejectsPendingSnapshot, noSnapshotFallback, auxiliaryDataCleared, privateDataCleared, marketDisconnectLocksExecution,
         disconnectedExecutionLocked, reconnectingExecutionLocked, heartbeatCannotUnlock,
         freshControlStatusAccepted, staleStatusRejected, accountUpdated, adjustedEquityNotTotal, zeroEquityPreserved,
         draftPreserved, accessRevoked };
