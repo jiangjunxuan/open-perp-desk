@@ -154,16 +154,28 @@ PUSHPLUS_PROXY_URL=http://user:password@proxy.example.com:8080
 WebSocket 非本机端点必须使用 `wss://` 并校验证书；`ws://` 仅允许
 回环目标与本机测试代理。
 
-配置 OKX Demo 私有凭据后，可用下面的只读验收脚本验证账户、持仓、订单、成交
-和原生保护订单流。脚本不会导入执行客户端，也不会发送交易请求；输出只包含
-连接状态和记录数量：
+配置 OKX Demo 私有凭据并更新 API 容器后，用下面的命令在运行中的容器内
+验证账户、持仓、订单、成交和原生保护订单流：
 
 ```bash
-python infra/okx-private-smoke.py --timeout 45
+./infra/openperpdesk.sh private-smoke --timeout 45
 ```
 
-脚本默认拒绝 `OKX_DEMO=false`。对真实账户的只读连接也必须显式加
-`--allow-live`，并在人工审批记录中保留命令输出和时间。
+该命令通过标准输入运行只读脚本，使用现有 API 容器的 OKX 密钥、端点和代理，
+无需在主机安装 API 依赖，也不会把密钥放进命令行。尚未重新创建容器的 `.env`
+修改不会自动生效。它不导入 API 主程序或执行客户端，不启动 Worker，不发交易请求。
+主机报告保存在 `outputs/okx-private-verification.json`，权限为 `600`，
+只包含连接状态和记录数量；失败时不沿用旧成功文件。
+
+`--timeout` 限制 WebSocket 登录与全部 REST 查询的总时长，取值 5 至 300 秒，
+另留连接关闭时间。查询结束时两条私有 WebSocket 必须仍处于连接且认证状态。
+登录与只读列表通过并不证明订单成交、状态推送或持仓保护闭环通过；
+报告明确保留 `order_lifecycle_verified=false`、`trading_performed=false`。
+
+默认拒绝 `OKX_DEMO=false`。对真实账户的只读连接也必须显式加 `--allow-live`，
+并在人工审批记录中保留命令输出和时间。非 Docker 开发可在已安全导出 OKX 环境变量、
+已安装 API 依赖的 Shell 中运行 `python infra/okx-private-smoke.py --timeout 45`；
+此直接入口不会自动读取 `.env`。不要用 `source .env` 执行未经审核的文件。
 
 PushPlus 配置后，服务会对关键运行事件发送通知，包括风控拒绝、订单失败、
 Worker 启停/异常、急停/恢复、成交回报、原生止盈止损状态变化和账户同步异常。

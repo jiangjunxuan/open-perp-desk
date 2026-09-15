@@ -25,7 +25,7 @@
 ## 3. 真实 OKX Demo 验收
 
 - [ ] `OKX_DEMO=true`、`TRADING_MODE=demo`
-- [ ] `python infra/okx-private-smoke.py --timeout 45` 成功
+- [ ] `./infra/openperpdesk.sh private-smoke --timeout 45` 在目标 API 容器内成功，报告时间与本次验收一致
 - [ ] 私有 REST 余额、持仓、账户配置、挂单、历史订单和成交数量已核对
 - [ ] 私有账户 WebSocket 登录成功并收到账户/持仓/订单事件
 - [ ] `orders-algo` WebSocket 登录成功并收到原生保护订单状态

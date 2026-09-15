@@ -216,6 +216,48 @@ class Deployment:
         with (self.root / "services/api/app/database_maintenance.py").open("rb") as program:
             return self.compose("exec", "-T", "api", "python", "-", command, stdin=program, stdout=stdout)
 
+    def private_smoke(self, *, timeout: float = 45, allow_live: bool = False) -> dict:
+        if not 5 <= timeout <= 300:
+            raise DeploymentError("Private smoke timeout must be between 5 and 300 seconds.")
+        output = self.root / "outputs/okx-private-verification.json"
+        output.unlink(missing_ok=True)
+        self.require_environment_file()
+        started = datetime.now(timezone.utc)
+        with (self.root / "infra/okx-private-smoke.py").open("rb") as program:
+            result = self.compose(
+                "exec", "-T", "api", "python", "-", "--timeout", str(timeout), "--output", "-",
+                *(("--allow-live",) if allow_live else ()), stdin=program, timeout=timeout + 15,
+            )
+        try:
+            report = json.loads(result.stdout)
+            row_names = {"balance", "positions", "config", "pending_orders",
+                         "orders_history", "fills_history", "pending_algo_orders"}
+            flags = {"demo", "proxy_configured", "private_ws_connected", "private_ws_authenticated",
+                     "algo_ws_connected", "algo_ws_authenticated", "order_lifecycle_verified", "trading_performed"}
+            if not isinstance(report, dict) or set(report) != flags | {"checked_at", "scope", "rows"}:
+                raise ValueError("unexpected report fields")
+            if any(type(report[key]) is not bool for key in flags):
+                raise ValueError("invalid flags")
+            if report["scope"] != "private_rest_and_websocket_read_only" or report["trading_performed"] or report["order_lifecycle_verified"]:
+                raise ValueError("invalid scope")
+            if not report["demo"] and not allow_live:
+                raise ValueError("live probe not approved")
+            if not all(report[key] for key in flags if key.startswith(("private_ws_", "algo_ws_"))):
+                raise ValueError("private streams not ready")
+            if not isinstance(report["rows"], dict) or set(report["rows"]) != row_names:
+                raise ValueError("invalid row keys")
+            if any(type(count) is not int or count < 0 for count in report["rows"].values()):
+                raise ValueError("invalid row counts")
+            checked = datetime.fromisoformat(report["checked_at"])
+            if checked.tzinfo is None or not started <= checked <= datetime.now(timezone.utc):
+                raise ValueError("stale report")
+        except (ValueError, TypeError, KeyError) as error:
+            raise DeploymentError("Private smoke returned invalid or incomplete evidence; no report was published.") from error
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_json(output, report)
+        print(json.dumps(report, ensure_ascii=True, indent=2))
+        return report
+
     def api_containers(self) -> list[dict]:
         raw = self.compose("ps", "--all", "--format", "json", "api").stdout
         try:
@@ -327,6 +369,9 @@ def main() -> None:
     for name in ("up", "down", "restart", "status", "preflight", "backup"):
         commands.add_parser(name)
     commands.add_parser("smoke").add_argument("origin", nargs="?")
+    private_smoke = commands.add_parser("private-smoke")
+    private_smoke.add_argument("--timeout", type=float, default=45)
+    private_smoke.add_argument("--allow-live", action="store_true")
     commands.add_parser("restore").add_argument("source", type=Path)
     commands.add_parser("logs").add_argument("service", nargs="?")
     args = parser.parse_args()
@@ -341,7 +386,9 @@ def main() -> None:
         deployment.compose(*arguments, stdout=None, timeout=None)
     else:
         with deployment.lock():
-            if args.command == "backup":
+            if args.command == "private-smoke":
+                deployment.private_smoke(timeout=args.timeout, allow_live=args.allow_live)
+            elif args.command == "backup":
                 deployment.backup()
             elif args.command == "restore":
                 deployment.restore(args.source.absolute())

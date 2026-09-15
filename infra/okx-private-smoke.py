@@ -12,12 +12,17 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[1] if __file__ != "<stdin>" else Path.cwd()
 sys.path.insert(0, str(ROOT / "services/api"))
 
+from app.database_maintenance import write_json  # noqa: E402
 from app.okx_account import OkxAccountClient  # noqa: E402
 from app.okx_account_stream import OkxAccountStream  # noqa: E402
 from app.okx_algo_stream import OkxAlgoOrderStream  # noqa: E402
+
+
+class PrivateProbeError(RuntimeError):
+    """Only fixed, non-secret diagnostic messages may be raised here."""
 
 
 async def wait_for_authentication(
@@ -32,37 +37,48 @@ async def wait_for_authentication(
                 algo_stream.last_error,
             ) if error]
             if errors and all(error in {"OkxAuthenticationError", "login_failed"} for error in errors):
-                raise RuntimeError("Private WebSocket authentication was rejected.")
+                raise PrivateProbeError("Private WebSocket authentication was rejected.")
             await asyncio.sleep(0.1)
 
 
-async def run_probe(*, timeout: float, allow_live: bool, output: Path) -> dict:
+async def run_probe(*, timeout: float, allow_live: bool, output: Path | None) -> dict:
+    if output is not None:
+        output.unlink(missing_ok=True)
     account = OkxAccountClient()
     account_stream = OkxAccountStream()
     algo_stream = OkxAlgoOrderStream()
     if not account.configured:
-        raise RuntimeError("OKX private credentials are not configured.")
+        raise PrivateProbeError("OKX private credentials are not configured.")
     if not account.demo and not allow_live:
-        raise RuntimeError("Refusing a live private probe without --allow-live.")
+        raise PrivateProbeError("Refusing a live private probe without --allow-live.")
 
-    await asyncio.gather(account_stream.start(), algo_stream.start())
     try:
-        await wait_for_authentication(account_stream, algo_stream, timeout)
-        balance, positions, config, pending, orders, fills, algo_orders = await asyncio.gather(
-            account.balance(),
-            account.positions(),
-            account.config(),
-            account.pending_orders(),
-            account.orders_history(limit=100),
-            account.fills_history(limit=100),
-            account.pending_algo_orders(limit=100),
-        )
+        async with asyncio.timeout(timeout):
+            await asyncio.gather(account_stream.start(), algo_stream.start())
+            await wait_for_authentication(account_stream, algo_stream, timeout)
+            async with asyncio.TaskGroup() as group:
+                reads = [group.create_task(call) for call in (
+                    account.balance(),
+                    account.positions(),
+                    account.config(),
+                    account.pending_orders(),
+                    account.orders_history(limit=100),
+                    account.fills_history(limit=100),
+                    account.pending_algo_orders(limit=100),
+                )]
+            balance, positions, config, pending, orders, fills, algo_orders = (
+                task.result() for task in reads
+            )
+            if not all(stream.connected and stream.authenticated for stream in (account_stream, algo_stream)):
+                raise PrivateProbeError("Private WebSocket disconnected during the probe.")
         result = {
             "checked_at": datetime.now(timezone.utc).isoformat(),
             "scope": "private_rest_and_websocket_read_only",
             "demo": account.demo,
             "proxy_configured": bool(os.getenv("OKX_PROXY_URL", "").strip()),
+            "private_ws_connected": account_stream.connected,
             "private_ws_authenticated": account_stream.authenticated,
+            "algo_ws_connected": algo_stream.connected,
             "algo_ws_authenticated": algo_stream.authenticated,
             "rows": {
                 "balance": len(balance),
@@ -73,13 +89,15 @@ async def run_probe(*, timeout: float, allow_live: bool, output: Path) -> dict:
                 "fills_history": len(fills),
                 "pending_algo_orders": len(algo_orders),
             },
+            "order_lifecycle_verified": False,
             "trading_performed": False,
         }
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
-        return result
     finally:
         await asyncio.gather(account_stream.stop(), algo_stream.stop())
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_json(output, result)
+    return result
 
 
 def main() -> None:
@@ -90,6 +108,7 @@ def main() -> None:
         "--output",
         type=Path,
         default=ROOT / "outputs/okx-private-verification.json",
+        help="JSON report path; use - for stdout only.",
     )
     args = parser.parse_args()
     if not 5 <= args.timeout <= 300:
@@ -98,11 +117,18 @@ def main() -> None:
         result = asyncio.run(run_probe(
             timeout=args.timeout,
             allow_live=args.allow_live,
-            output=args.output,
+            output=None if args.output == Path("-") else args.output,
         ))
-    except (RuntimeError, TimeoutError, OSError) as error:
+    except PrivateProbeError as error:
         print(f"Private OKX smoke failed: {error}", file=sys.stderr)
-        raise SystemExit(1) from error
+        raise SystemExit(1) from None
+    except TimeoutError:
+        print("Private OKX smoke failed: probe deadline exceeded.", file=sys.stderr)
+        raise SystemExit(1) from None
+    except Exception as error:
+        # Provider messages and exceptions may reflect keys or proxy credentials.
+        print(f"Private OKX smoke failed ({type(error).__name__}); no report was published.", file=sys.stderr)
+        raise SystemExit(1) from None
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

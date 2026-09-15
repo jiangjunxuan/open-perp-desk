@@ -196,6 +196,9 @@ WebSocket、订单状态/成交回报、PushPlus token、服务器构建、宝�
 SHA-256 清单；`restore` 先保存旧库，再强制以禁用执行、停用 Worker 和持久急停状态启动。
 默认 Web 仅绑定 `127.0.0.1`，交给宝塔或其他 HTTPS 反向代理对外提供访问。
 这些维护流程已有本地故障注入测试，但不能替代目标服务器上的真实容器演练。
+配置真实 OKX Demo 凭据后，`./infra/openperpdesk.sh private-smoke` 可直接使用运行中
+API 容器的连接配置做只读 REST/私有 WebSocket 验收，输出受保护的连接与记录数量报告。
+此检查不下单，也不等同于真实 Demo 的成交与保护闭环验收。
 
 ## 开源协议
 

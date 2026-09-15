@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from contextlib import closing, redirect_stdout
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -35,6 +36,21 @@ def configuration():
     }}}
 
 
+def private_report():
+    return {
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "scope": "private_rest_and_websocket_read_only",
+        "demo": True, "proxy_configured": False,
+        "private_ws_connected": True, "private_ws_authenticated": True,
+        "algo_ws_connected": True, "algo_ws_authenticated": True,
+        "trading_performed": False, "order_lifecycle_verified": False,
+        "rows": {name: 0 for name in (
+            "balance", "positions", "config", "pending_orders",
+            "orders_history", "fills_history", "pending_algo_orders",
+        )},
+    }
+
+
 class FakeDeployment(deploy.Deployment):
     """Command contract fixture, not evidence of a running Docker engine."""
 
@@ -49,11 +65,14 @@ class FakeDeployment(deploy.Deployment):
         self.running = True
         self.fail_runtime = False
         self.stays_running = False
+        self.probe_changes = {}
         self.snapshot = root / "source.sqlite3"
         StateStore(str(self.snapshot))
         helper = root / "services/api/app/database_maintenance.py"
         helper.parent.mkdir(parents=True)
         shutil.copyfile(ROOT / "services/api/app/database_maintenance.py", helper)
+        (root / "infra").mkdir()
+        shutil.copyfile(ROOT / "infra/okx-private-smoke.py", root / "infra/okx-private-smoke.py")
 
     def compose(self, *args, **kwargs):
         self.calls.append(args)
@@ -68,6 +87,10 @@ class FakeDeployment(deploy.Deployment):
         elif args[0] == "stop":
             if not self.stays_running:
                 self.running = False
+        elif "--output" in args:
+            self.probe_program = kwargs["stdin"].read()
+            self.probe_timeout = kwargs["timeout"]
+            output = json.dumps({**private_report(), **self.probe_changes}).encode()
         elif args[-1] == "info":
             output = json.dumps({"format": 1, "database": self.model["services"]["api"]["environment"]["STATE_DB_PATH"]}).encode()
         elif "restore" in args:
@@ -211,6 +234,63 @@ class DeploymentCommandTests(unittest.TestCase):
             [None, "fixture-secret-never-log"],
         )
         self.assertNotIn("fixture-secret-never-log", self.output.getvalue())
+
+    def test_private_smoke_uses_running_container_environment_and_private_report(self):
+        result = self.deployment.private_smoke(timeout=20)
+        self.assertEqual(self.deployment.calls, [
+            ("exec", "-T", "api", "python", "-", "--timeout", "20", "--output", "-"),
+        ])
+        self.assertEqual(self.deployment.probe_timeout, 35)
+        self.assertIn(b"run_probe", self.deployment.probe_program)
+        self.assertNotIn(b"fixture-secret", self.deployment.probe_program)
+        destination = self.root / "outputs/okx-private-verification.json"
+        self.assertEqual(json.loads(destination.read_text()), result)
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+
+    def test_private_smoke_rejects_stale_unsafe_and_secret_bearing_reports(self):
+        destination = self.root / "outputs/okx-private-verification.json"
+        destination.parent.mkdir()
+        for changes in (
+            {"demo": False}, {"trading_performed": True}, {"order_lifecycle_verified": True},
+            {"private_ws_authenticated": False}, {"algo_ws_connected": False},
+            {"demo": "true"}, {"checked_at": "2000-01-01T00:00:00+00:00"},
+            {"checked_at": "2000-01-01T00:00:00"}, {"rows": {"balance": -1}},
+            {"rows": {**private_report()["rows"], "balance": True}},
+            {"api_key": "fixture-secret-never-print"},
+        ):
+            with self.subTest(changes=changes):
+                self.deployment.probe_changes = changes
+                destination.write_text('{"old":true}')
+                with self.assertRaises(deploy.DeploymentError):
+                    self.deployment.private_smoke()
+                self.assertFalse(destination.exists())
+        self.assertNotIn("fixture-secret-never-print", self.output.getvalue())
+
+    def test_private_smoke_live_requires_explicit_readonly_acknowledgement(self):
+        self.deployment.probe_changes = {"demo": False}
+        report = self.deployment.private_smoke(allow_live=True)
+        self.assertFalse(report["demo"] or report["trading_performed"])
+        self.assertEqual(self.deployment.calls[-1][-1], "--allow-live")
+
+    def test_private_smoke_cli_and_invalid_timeout(self):
+        for timeout in (0, 301, float("inf"), float("nan")):
+            with self.subTest(timeout=timeout), self.assertRaises(deploy.DeploymentError):
+                self.deployment.private_smoke(timeout=timeout)
+        self.assertEqual(self.deployment.calls, [])
+        with patch.object(deploy.sys, "argv", ["deploy", "private-smoke", "--timeout", "12"]), \
+             patch.object(deploy, "Deployment", return_value=self.deployment):
+            deploy.main()
+        self.assertEqual(self.deployment.probe_timeout, 27)
+        self.assertNotIn("--allow-live", self.deployment.calls[-1])
+
+    def test_failed_container_private_probe_removes_previous_report(self):
+        destination = self.root / "outputs/okx-private-verification.json"
+        destination.parent.mkdir()
+        destination.write_text('{"old":true}')
+        with patch.object(self.deployment, "compose", side_effect=deploy.DeploymentError("fixture failed")), \
+             self.assertRaises(deploy.DeploymentError):
+            self.deployment.private_smoke()
+        self.assertFalse(destination.exists())
 
     def test_backup_is_validated_private_and_has_checksum_manifest(self):
         result = self.deployment.backup()
