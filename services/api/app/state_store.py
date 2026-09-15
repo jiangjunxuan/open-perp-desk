@@ -970,6 +970,102 @@ class StateStore:
             ).fetchone()
         return dict(row)
 
+    def review_protection_record(
+        self, kind, record, position, *, expected_generation, allocation, status, resolution, note,
+        replacement=None,
+    ):
+        tables = {
+            "handoff": ("protection_handoffs", "handoff_id", {
+                "opening_cancel_pending", "native_pending", "cancel_pending", "native_cancel_pending",
+                "ready", "closing", "native_executing", "complete",
+            }),
+            "adjustment": ("protection_adjustments", "adjustment_id", {"prepared", "accepted", "complete", "superseded"}),
+        }
+        if kind not in tables or status not in tables[kind][2] or resolution not in {"resume", "position_closed"}:
+            raise ValueError("invalid_protection_review")
+        if not 3 <= len(note.strip()) <= 500:
+            raise ValueError("review_note_required")
+        if replacement is not None and (kind != "adjustment" or status != "superseded" or resolution != "resume"):
+            raise ValueError("invalid_protection_review_replacement")
+        table, key, _ = tables[kind]
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                f"SELECT * FROM {table} WHERE {key} = ? AND version = ? AND account_scope = ? AND status = 'review'",
+                (record[key], record["version"], record["account_scope"]),
+            ).fetchone()
+            generation = connection.execute("SELECT generation FROM execution_generation WHERE singleton = 1").fetchone()[0]
+            present = connection.execute("SELECT * FROM positions WHERE position_key = ?", (record["position_key"],)).fetchone()
+            if not current or generation != expected_generation or not present or any(
+                present[field] != position[field] for field in (
+                    "account_scope", "inst_id", "pos_side", "td_mode", "size", "status",
+                    "exchange_trade_id", "lifecycle_generation",
+                )
+            ):
+                raise ExposureSnapshotChanged("review_snapshot_changed")
+            if present["account_scope"] != record["account_scope"] or present["inst_id"] != record["inst_id"]:
+                raise ExposureSnapshotChanged("review_account_changed")
+            if present["status"] == "closed" and present["size"] == 0:
+                placeholders = ",".join("?" for _ in ACTIVE_ORDER_STATUSES)
+                if connection.execute(
+                    f"""SELECT 1 FROM orders WHERE account_scope = ? AND inst_id = ?
+                        AND order_kind = 'standard' AND status IN ({placeholders}) LIMIT 1""",
+                    (record["account_scope"], record["inst_id"], *ACTIVE_ORDER_STATUSES),
+                ).fetchone():
+                    raise ExposureSnapshotChanged("review_orders_pending")
+            else:
+                if resolution == "position_closed" or allocation is None:
+                    raise ExposureSnapshotChanged("review_position_not_closed")
+                saved = connection.execute(
+                    "SELECT * FROM position_lot_snapshots WHERE account_scope = ? AND position_key = ?",
+                    (record["account_scope"], record["position_key"]),
+                ).fetchone()
+                if not saved or json.loads(saved["snapshot_json"]) != allocation or any(
+                    saved[left] != present[right] for left, right in (
+                        ("position_trade_id", "exchange_trade_id"), ("position_size", "size"),
+                        ("lifecycle_generation", "lifecycle_generation"),
+                    )
+                ) or (
+                    allocation.get("status") != "verified"
+                    or allocation.get("policy_version") != LOT_RECONSTRUCTION_VERSION
+                    or allocation.get("execution_generation") != generation
+                ):
+                    raise ExposureSnapshotChanged("review_lot_changed")
+            now = _utc_now()
+            connection.execute(
+                f"""UPDATE {table} SET status = ?, last_error = NULL, version = version + 1, updated_at = ?
+                    WHERE {key} = ? AND version = ? AND status = 'review'""",
+                (status, now, record[key], record["version"]),
+            )
+            if replacement is not None:
+                self._verify_adjustment_lot(connection, replacement, present, generation)
+                if connection.execute(
+                    """SELECT 1 FROM protection_handoffs WHERE account_scope = ? AND inst_id = ?
+                       AND status != 'complete' LIMIT 1""", (record["account_scope"], record["inst_id"]),
+                ).fetchone():
+                    raise ExposureSnapshotChanged("protection_handoff_pending")
+                connection.execute(
+                    """INSERT INTO protection_adjustments
+                       (adjustment_id, account_scope, inst_id, position_key, opening_order_id,
+                        lot_id, evidence_json, target_size, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (replacement["adjustment_id"], record["account_scope"], record["inst_id"], record["position_key"],
+                     replacement["opening_order_id"], replacement["lot_id"],
+                     json.dumps(replacement["evidence"], sort_keys=True, allow_nan=False),
+                     replacement["target_size"], now, now),
+                )
+            connection.execute(
+                """INSERT INTO audit_events (event_type, severity, message, payload_json, created_at)
+                   VALUES ('protection_review_resolved', 'warning', 'Protection maintenance review completed', ?, ?)""",
+                (json.dumps({
+                    "kind": kind, "record_id": record[key], "inst_id": record["inst_id"],
+                    "reviewed_version": record["version"], "status": status, "resolution": resolution,
+                    "previous_error": record["last_error"], "note": note.strip(),
+                    "replacement_id": replacement["adjustment_id"] if replacement else None,
+                }), now),
+            )
+            return dict(connection.execute(f"SELECT * FROM {table} WHERE {key} = ?", (record[key],)).fetchone())
+
     def finalize_submission(
         self,
         client_order_id: str,

@@ -27,9 +27,10 @@ HANDOFF_LABELS = {
 def handoff_summaries(store, account_scope):
     return [{
         **{key: row[key] for key in (
-            "handoff_id", "inst_id", "lot_id", "reason", "status", "close_sequence", "last_error",
+            "handoff_id", "inst_id", "lot_id", "reason", "status", "close_sequence", "last_error", "version",
         )},
         "opening_order_id": json.loads(row["evidence_json"])["opening_order_id"],
+        "expected_protection": effective_evidence(row),
     } for row in store.protection_handoffs(account_scope)]
 
 

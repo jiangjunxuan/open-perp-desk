@@ -66,6 +66,7 @@ async def main():
                 "realtime_viewports": len(report["realtime"]),
                 "annotation_groups": len(report["annotations"]),
                 "protection_incident_groups": len(report["protectionIncidents"]),
+                "protection_review_groups": len(report["protectionReview"]),
                 "browser_errors": report["browserErrors"],
                 "exchange_mutations": len(exchange.posts),
                 "execution_enabled": False,

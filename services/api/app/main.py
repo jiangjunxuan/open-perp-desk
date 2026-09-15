@@ -22,8 +22,9 @@ from .risk_engine import RiskEngine
 from .execution_engine import ExecutionEngine
 from .order_preflight import OrderPreflight
 from .position_lots import positions_with_lots
-from .protection_handoff import handoff_summaries
+from .protection_handoff import HANDOFF_LABELS, HandoffError, handoff_summaries
 from .protection_incident import incident_summaries
+from .protection_review import ProtectionReviewer, ProtectionReviewError
 from .ai_analysis import AIAnalysisError, TradingAgentsAdapter
 from .account_sync import AccountSynchronizer
 from .account_history import AccountHistoryImporter
@@ -35,7 +36,7 @@ from .account_reconciler import AccountReconciler
 from .equity_baseline import EquityBaselineSampler
 from .automation_worker import AutomationWorker
 from .backtest import BacktestEngine
-from .state_store import BillImportBusy, ExposureSnapshotChanged, StateStore
+from .state_store import BillImportBusy, ExposureSnapshotChanged, OrderSnapshotConflict, StateStore
 from .safety_control import SafetyController
 from .strategy_engine import StrategyEngine
 from .trading_signal import TradeSignal
@@ -569,6 +570,48 @@ def stored_protection_adjustments(_: None = Depends(require_admin_token)) -> dic
 @app.get("/api/v1/protection/incidents")
 def stored_protection_incidents(_: None = Depends(require_admin_token)) -> dict[str, object]:
     return {"data": incident_summaries(state_store, account_client.account_scope)}
+
+
+class ProtectionReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    expected_version: int = Field(ge=0, strict=True)
+    resolution: Literal["resume", "position_closed"]
+    note: str = Field(min_length=3, max_length=500)
+
+
+@app.post("/api/v1/protection/{kind}/{record_id}/review")
+async def review_protection(
+    request: ProtectionReviewRequest,
+    kind: Literal["handoffs", "adjustments"],
+    record_id: str = RoutePath(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"),
+    _: None = Depends(require_admin_token),
+) -> dict[str, object]:
+    record = (state_store.protection_handoff if kind == "handoffs" else state_store.protection_adjustment)(record_id)
+    if not record or record["account_scope"] != account_client.account_scope:
+        raise HTTPException(status_code=404, detail="Protection maintenance record not found.")
+    singular = "handoff" if kind == "handoffs" else "adjustment"
+    try:
+        async with asyncio.timeout(45):
+            resolved = await ProtectionReviewer(state_store, account_sync).review(
+                singular, record, expected_version=request.expected_version,
+                resolution=request.resolution, note=request.note,
+            )
+    except (ProtectionReviewError, ExposureSnapshotChanged, HandoffError, OrderSnapshotConflict) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception:
+        raise HTTPException(status_code=502, detail="Protection review evidence unavailable.") from None
+    from .protection_adjustment import ADJUSTMENT_LABELS, adjustment_summaries
+    label = (HANDOFF_LABELS if kind == "handoffs" else ADJUSTMENT_LABELS).get(resolved["status"], "待核对")
+    await execution_engine.notify_event(
+        "protection_review_resolved", "OpenPerpDesk 保护维护复核完成",
+        f"{record['inst_id']} 的保护维护已复核，状态：{label}。复核接口未发出交易请求。",
+        payload={"kind": singular, "record_id": record_id, "status": resolved["status"]}, severity="warning",
+    )
+    return {
+        "accepted": True, "trading_performed": False,
+        "data": handoff_summaries(state_store, account_client.account_scope) if kind == "handoffs"
+        else adjustment_summaries(state_store, account_client.account_scope),
+    }
 
 
 class ProtectionIncidentResolutionRequest(BaseModel):

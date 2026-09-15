@@ -18,15 +18,16 @@ class AdjustmentError(ValueError):
 ADJUSTMENT_LABELS = {
     "prepared": "保护数量调整待执行", "submitted": "保护数量调整待确认",
     "accepted": "保护数量调整待确认", "review": "保护数量需人工核对",
-    "complete": "保护数量已同步", "superseded": "原生保护已触发", "rejected": "保护数量调整被拒绝",
+    "complete": "保护数量已同步", "superseded": "原数量维护已结束", "rejected": "保护数量调整被拒绝",
 }
 
 
 def adjustment_summaries(store, account_scope):
     return [{
-        key: row[key] for key in (
-            "adjustment_id", "inst_id", "opening_order_id", "lot_id", "target_size", "status", "last_error",
-        )
+        **{key: row[key] for key in (
+            "adjustment_id", "inst_id", "opening_order_id", "lot_id", "target_size", "status", "last_error", "version",
+        )},
+        "expected_protection": json.loads(row["evidence_json"]),
     } for row in store.protection_adjustments(account_scope)]
 
 

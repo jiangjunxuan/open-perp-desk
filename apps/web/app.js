@@ -1413,15 +1413,25 @@ async function resolveProtectionIncident(button) {
 function renderProtectionHandoffs(rows) {
   state.handoffs = rows || [];
   const entries = [
-    ...state.handoffs.map(row => ({ ...row, label: handoffStates[row.status] || "接管待核对" })),
-    ...state.adjustments.map(row => ({ ...row, label: adjustmentLabel(row) })),
+    ...state.handoffs.map(row => ({ ...row, kind: "handoffs", id: row.handoff_id, label: handoffStates[row.status] || "接管待核对" })),
+    ...state.adjustments.map(row => ({ ...row, kind: "adjustments", id: row.adjustment_id, label: adjustmentLabel(row) })),
   ];
+  const focused = $("#protection-handoff-list").contains(document.activeElement) ? document.activeElement.dataset : null;
   $("#protection-handoffs").hidden = !entries.length;
   setText("#protection-handoff-title", `保护维护 · ${entries.length} 笔待完成`);
   $("#protection-handoff-list").innerHTML = entries.map(row => `<li>
     <strong>${escapeHtml(row.inst_id)}</strong><span class="mono-cell">${escapeHtml(row.opening_order_id)}</span>
     <span class="lot-protection-state">${escapeHtml(row.label)}</span>
+    ${row.status === "review" && Number.isInteger(row.version) ? `<button class="button secondary icon-button" type="button"
+      data-review-kind="${row.kind}" data-review-protection="${escapeHtml(row.id)}"
+      title="复核保护维护" aria-label="复核 ${escapeHtml(row.inst_id)} ${escapeHtml(row.opening_order_id)}"><i data-icon="shield-check" aria-hidden="true"></i></button>` : ""}
   </li>`).join("");
+  renderIcons($("#protection-handoff-list"));
+  if (focused?.reviewProtection) {
+    [...$("#protection-handoff-list").querySelectorAll("[data-review-protection]")].find(button =>
+      button.dataset.reviewProtection === focused.reviewProtection && button.dataset.reviewKind === focused.reviewKind)?.focus({ preventScroll: true });
+  }
+  updateProtectionReview();
 }
 
 function lotExecutionLabel(status) {
@@ -2171,6 +2181,7 @@ function lockPrivateAccess() {
   state.adjustments = [];
   state.incidents = [];
   state.incidentRequests.clear();
+  clearProtectionReviews();
   renderProtectionHandoffs([]);
   renderProtectionIncidents([]);
   renderPositions([]);
@@ -3169,6 +3180,7 @@ renderIcons();
 loadChartAnnotations();
 initializeResearch();
 initializeBillHistory();
+initializeProtectionReviews();
 showView(location.hash.slice(1));
 tickClock();
 setInterval(tickClock, 1000);

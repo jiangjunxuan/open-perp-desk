@@ -766,6 +766,19 @@
         <button class="button primary" id="save-token" type="submit">解锁私有数据</button>
       </form>
     </dialog>
+    <dialog id="protection-review-dialog" aria-labelledby="protection-review-title">
+      <form class="auth-box" id="protection-review-form">
+        <div class="dialog-heading"><h2 id="protection-review-title">保护维护复核</h2><button class="button secondary icon-button" id="close-protection-review" type="button" aria-label="关闭复核" title="关闭复核"><i data-icon="x" aria-hidden="true"></i></button></div>
+        <dl id="protection-review-evidence" class="protection-review-evidence"></dl>
+        <label for="protection-review-resolution">处理方式<select id="protection-review-resolution">
+          <option value="resume">恢复原流程</option><option value="position_closed">仓位归零后结案</option>
+        </select></label>
+        <p class="auth-note">恢复后可能继续撤单或平仓；执行开关和实盘闸门保持不变。</p>
+        <label for="protection-review-note">复核依据<textarea id="protection-review-note" rows="3" minlength="3" maxlength="500" required aria-describedby="protection-review-message"></textarea></label>
+        <p id="protection-review-message" class="settings-message" role="status" aria-live="polite"></p>
+        <div class="protection-review-actions"><button class="button secondary icon-button" id="refresh-protection-review" type="button" aria-label="重新读取复核记录" title="重新读取复核记录"><i data-icon="refresh-cw" aria-hidden="true"></i></button><button class="button danger" id="submit-protection-review" type="submit">核验并恢复</button></div>
+      </form>
+    </dialog>
     <dialog id="chart-note-dialog" aria-labelledby="chart-note-title">
       <form class="auth-box" id="chart-note-form">
         <div class="dialog-heading"><h2 id="chart-note-title">图表标记</h2><button class="button secondary icon-button" id="close-chart-note" type="button" aria-label="取消标记" title="取消标记"><i data-icon="x" aria-hidden="true"></i></button></div>
@@ -779,6 +792,7 @@
     <script src="/assets/reports/purify.min.js"></script>
     <script src="/research.js"></script>
     <script src="/account-history.js"></script>
+    <script src="/protection-review.js"></script>
     <script src="/live.js"></script>
     <script src="/app.js"></script>
   </body>

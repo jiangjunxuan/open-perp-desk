@@ -376,6 +376,16 @@ tbody tr:hover { background: var(--surface); }
 .protection-handoffs ul { list-style: none; margin: 0; padding: 0; }
 .protection-handoffs li { display: flex; flex-wrap: wrap; gap: 8px 20px; padding: 8px 0; font-size: 12px; }
 .protection-handoffs li > * { min-width: 0; overflow-wrap: anywhere; }
+.protection-handoffs li { align-items: center; }
+.protection-handoffs li .icon-button { margin-left: auto; flex-shrink: 0; }
+.protection-review-evidence { display: grid; gap: 8px; margin: 0; }
+.protection-review-evidence > div { display: grid; grid-template-columns: 86px minmax(0, 1fr); gap: 12px; font-size: 12px; line-height: 1.6; }
+.protection-review-evidence dt { color: var(--muted); }
+.protection-review-evidence dd { margin: 0; overflow-wrap: anywhere; font-family: var(--mono); }
+.protection-review-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+#protection-review-note { width: 100%; min-height: 80px; resize: vertical; font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--control-border); border-radius: var(--radius-control); padding: 8px 10px; }
+#protection-review-form select, #submit-protection-review { min-height: 44px; }
+#protection-review-form { min-width: 0; }
 .protection-incidents { padding: 14px 0; border-top: 1px solid var(--danger-border); background: var(--danger-soft); }
 .protection-incident-heading { display: flex; align-items: start; justify-content: space-between; gap: 16px; padding: 0 12px 10px; }
 .protection-incident-heading h3 { margin: 0; font-size: 12px; color: var(--danger); }

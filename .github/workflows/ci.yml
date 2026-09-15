@@ -143,6 +143,7 @@ jobs:
       - run: node --check apps/web/research.js
       - run: node --check apps/web/theme.js
       - run: node --check apps/web/account-history.js
+      - run: node --check apps/web/protection-review.js
       - run: node --check apps/web/live.js
       - run: node --test infra/appearance.test.mjs infra/live.test.mjs
       - run: bash -n infra/openperpdesk.sh
