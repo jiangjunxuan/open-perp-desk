@@ -1,6 +1,7 @@
 import asyncio
 import os
 import secrets
+import sqlite3
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -36,11 +37,12 @@ from .account_reconciler import AccountReconciler
 from .equity_baseline import EquityBaselineSampler
 from .automation_worker import AutomationWorker
 from .backtest import BacktestEngine
-from .state_store import BillImportBusy, ExposureSnapshotChanged, OrderSnapshotConflict, StateStore
+from .state_store import BillImportBusy, ExposureSnapshotChanged, OrderSnapshotConflict, StateStore, TradingViewAlertConflict, TradingViewQueueFull
 from .safety_control import SafetyController
 from .strategy_engine import StrategyEngine
 from .trading_signal import TradeSignal
 from . import tradingview
+from .tradingview_worker import TradingViewWorker
 from .realtime import control_events, private_events
 
 
@@ -74,6 +76,9 @@ execution_engine = ExecutionEngine(
     pushplus_client,
     safety_controller,
     preflight=OrderPreflight(account_client, market_client, state_store),
+)
+tradingview_worker = TradingViewWorker(
+    state_store, execution_engine, market_data_fresh=lambda: market_stream.fresh,
 )
 account_sync = AccountSynchronizer(
     state_store,
@@ -124,9 +129,11 @@ async def lifespan(_: FastAPI):
     await account_valuation.start()
     await account_performance.start()
     await automation_worker.start()
+    await tradingview_worker.start()
     try:
         yield
     finally:
+        await tradingview_worker.close()
         await equity_baseline.stop()
         await account_performance.close()
         await account_valuation.close()
@@ -275,7 +282,7 @@ def system_status() -> dict[str, object]:
             "account_readonly_configured": account_client.configured,
             "account_stream_configured": account_stream.configured,
             "tradingagents_configured": tradingagents.configured,
-            "tradingview": tradingview.status(),
+            "tradingview": {**tradingview.status(), "worker": tradingview_worker.snapshot()},
         },
         "market_stream": {
             "connected": market_stream.connected,
@@ -1256,79 +1263,57 @@ async def tradingview_webhook(
         raise HTTPException(status_code=404, detail="tradingview_integration_disabled")
     if not tradingview.configured():
         raise HTTPException(status_code=503, detail="tradingview_secret_not_configured")
-    body = await request.body()
+    async def bounded_body() -> bytes:
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > tradingview.MAX_BODY_BYTES:
+                raise HTTPException(status_code=413, detail="payload_too_large")
+            body.extend(chunk)
+        return bytes(body)
+
+    try:
+        body = await asyncio.wait_for(bounded_body(), 1)
+    except TimeoutError as exc:
+        raise HTTPException(status_code=408, detail="webhook_body_timeout") from exc
     try:
         payload = tradingview.parse_body(body)
     except tradingview.TradingViewWebhookError as exc:
-        state_store.add_audit(
-            "tradingview_webhook_rejected",
-            "TradingView webhook payload was rejected",
-            severity="warning",
-            payload={"code": exc.code},
-        )
         raise HTTPException(status_code=422, detail=exc.code) from exc
     if not tradingview.verify_secret(payload, x_tradingview_token):
-        state_store.add_audit(
-            "tradingview_webhook_unauthorized",
-            "TradingView webhook secret did not match",
-            severity="warning",
-        )
         raise HTTPException(status_code=401, detail="invalid_tradingview_secret")
     try:
         signal, size, side, alert_id = tradingview.to_signal(payload, body=body)
+        context = tradingview.numeric_context()
     except tradingview.TradingViewWebhookError as exc:
-        state_store.add_audit(
-            "tradingview_signal_rejected",
-            "TradingView alert could not become a structured signal",
-            severity="warning",
-            payload={"code": exc.code},
-        )
         raise HTTPException(status_code=422, detail=exc.code) from exc
-    context = tradingview.numeric_context()
     dry_run = tradingview.execution_dry_run(payload)
     try:
-        result = await execution_engine.submit_signal(
-            signal,
-            account_equity=context["account_equity"],
-            daily_pnl_pct=context["daily_pnl_pct"],
-            current_notional=context["current_notional"],
-            size=size,
-            dry_run=dry_run,
-            side_override=side,
-            idempotency_key=f"tradingview:{alert_id}",
-            market_data_fresh=market_stream.fresh,
+        created, receipt = await asyncio.to_thread(
+            state_store.enqueue_tradingview_alert, alert_id,
+            tradingview.instruction_fingerprint(payload, signal, size, side),
+            {
+                "signal": signal.model_dump(mode="json"), "context": context,
+                "size": size, "side": side, "dry_run": dry_run,
+                "execution_scope": tradingview_worker.execution_scope(),
+                "client_order_id": execution_engine.client_order_id(signal, f"tradingview:{alert_id}") if not dry_run else None,
+            },
         )
-    except OkxTradeError as exc:
-        state_store.add_audit(
-            "tradingview_execution_error",
-            "TradingView signal execution returned an exchange error",
-            severity="error",
-            payload={"alert_id": alert_id, "inst_id": signal.inst_id, "error": type(exc).__name__},
-        )
-        raise HTTPException(status_code=502, detail="tradingview_execution_error") from exc
-    state_store.add_audit(
-        "tradingview_signal_processed",
-        "TradingView alert passed through the structured execution boundary",
-        severity="info" if result.get("accepted") else "warning",
-        payload={
-            "alert_id": alert_id,
-            "inst_id": signal.inst_id,
-            "action": signal.action,
-            "dry_run": dry_run,
-            "accepted": bool(result.get("accepted")),
-            "idempotent": bool(result.get("idempotent")),
-            "reasons": result.get("reasons", []),
-        },
-    )
-    return {
-        "accepted": bool(result.get("accepted")),
-        "idempotent": bool(result.get("idempotent")),
-        "dry_run": dry_run,
-        "alert_id": alert_id,
-        "inst_id": signal.inst_id,
-        "action": signal.action,
-        "result": result,
-    }
+    except TradingViewAlertConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TradingViewQueueFull as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except sqlite3.OperationalError as exc:
+        raise HTTPException(status_code=503, detail="tradingview_inbox_unavailable") from exc
+    tradingview_worker.notify()
+    return {"accepted": True, "idempotent": not created, **receipt}
+
+
+@app.get("/api/v1/integrations/tradingview/alerts")
+def tradingview_alerts(
+    limit: int = Query(default=30, ge=1, le=100),
+    _: None = Depends(require_admin_token),
+) -> dict[str, object]:
+    return {"data": state_store.list_tradingview_alerts(limit)}
 
 
 @app.post("/api/v1/execution/signals")

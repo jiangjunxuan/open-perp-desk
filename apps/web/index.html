@@ -321,6 +321,42 @@
                 <button class="button secondary" id="test-notification" type="button" disabled><i data-icon="bell" aria-hidden="true"></i><span>测试 PushPlus</span></button>
                 <button class="button secondary" id="resume-trading" type="button" disabled><i data-icon="play" aria-hidden="true"></i><span>解除急停</span></button>
               </div>
+              <details class="tradingview-setup" data-views="risk" hidden>
+                <summary>TradingView 信号接入</summary>
+                <div class="tradingview-setup-body">
+                  <div class="tradingview-summary"><strong id="tradingview-setup-status">未启用</strong><span id="tradingview-symbols" class="mono">--</span></div>
+                  <div class="tradingview-endpoint">
+                    <label for="tradingview-webhook-url">Webhook 地址</label>
+                    <div class="copy-field">
+                      <input id="tradingview-webhook-url" type="text" readonly value="/api/v1/integrations/tradingview/webhook" spellcheck="false">
+                      <button class="button secondary icon-button" id="copy-tradingview-url" type="button" aria-label="复制 Webhook 地址" title="复制 Webhook 地址"><i data-icon="copy" aria-hidden="true"></i></button>
+                    </div>
+                    <span id="tradingview-endpoint-state" class="settings-message"></span>
+                  </div>
+                  <div class="tradingview-endpoint">
+                    <div class="tradingview-template-heading">
+                      <span id="tradingview-template-label">测试 Alert · 仅接收，不下单</span>
+                      <button class="button secondary icon-button" id="copy-tradingview-template" type="button" aria-label="复制测试 Alert" title="复制测试 Alert"><i data-icon="copy" aria-hidden="true"></i></button>
+                    </div>
+                    <pre id="tradingview-payload-template" tabindex="0" role="region" aria-labelledby="tradingview-template-label">{
+  "secret": "REPLACE_WITH_SERVER_SECRET",
+  "alert_id": "test-{{exchange}}-{{ticker}}-{{time}}-{{timenow}}",
+  "symbol": "{{exchange}}:{{ticker}}",
+  "action": "hold",
+  "dry_run": true,
+  "timestamp": "{{timenow}}"
+}</pre>
+                  </div>
+                  <span id="tradingview-setup-message" class="settings-message" role="status" aria-live="polite"></span>
+                  <div class="tradingview-alert-heading"><h3>最近告警</h3><span id="tradingview-alert-state" class="tag" role="status">管理员未解锁</span></div>
+                  <div class="table-wrap tradingview-alert-table" tabindex="0" role="region" aria-label="TradingView 最近告警">
+                    <table>
+                      <thead><tr><th>接收时间</th><th>合约 / 动作</th><th>处理结果</th></tr></thead>
+                      <tbody id="tradingview-alert-body"><tr><td colspan="3" class="table-empty">管理员未解锁</td></tr></tbody>
+                    </table>
+                  </div>
+                </div>
+              </details>
               <details class="live-safety-settings" data-views="risk" hidden>
                 <summary>实盘安全闸门</summary>
                 <p class="settings-helper">默认关闭。只有服务器配置、管理员令牌和人工解锁同时满足时，实盘订单才会被允许。</p>

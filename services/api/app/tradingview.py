@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -11,6 +12,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from .trading_signal import TradeSignal
+
+MAX_BODY_BYTES = 16 * 1024
 
 
 class TradingViewWebhookError(ValueError):
@@ -24,11 +27,10 @@ class TradingViewWebhookError(ValueError):
 class TradingViewPayload(BaseModel):
     """Accepted alert fields.
 
-    TradingView alert messages are user-authored JSON, so unknown fields are
-    retained by Pydantic but never forwarded to the exchange.
+    Unknown fields are ignored and never persisted or sent to the exchange.
     """
 
-    model_config = ConfigDict(extra="allow", allow_inf_nan=False)
+    model_config = ConfigDict(extra="ignore", allow_inf_nan=False)
 
     secret: str | None = Field(default=None, min_length=1, max_length=256)
     token: str | None = Field(default=None, min_length=1, max_length=256)
@@ -71,13 +73,30 @@ def status() -> dict[str, object]:
         "configured": configured_now,
         "execution_enabled": execution_enabled,
         "dry_run": not execution_enabled or _truthy("TRADINGVIEW_DRY_RUN", "true"),
+        "symbols": sorted(_allowed_symbols()),
+        "max_age_seconds": _max_age_seconds(),
+        "signal_ttl_seconds": _ttl_seconds(),
     }
 
 
 def parse_body(body: bytes) -> TradingViewPayload:
+    if len(body) > MAX_BODY_BYTES:
+        raise TradingViewWebhookError("payload_too_large")
+
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise TradingViewWebhookError("duplicate_json_key")
+            result[key] = value
+        return result
+
+    def invalid_constant(_):
+        raise TradingViewWebhookError("invalid_json")
+
     try:
-        decoded = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        decoded = json.loads(body.decode("utf-8"), object_pairs_hook=pairs, parse_constant=invalid_constant)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise TradingViewWebhookError("invalid_json") from exc
     if not isinstance(decoded, dict):
         raise TradingViewWebhookError("json_object_required")
@@ -90,7 +109,7 @@ def parse_body(body: bytes) -> TradingViewPayload:
 def verify_secret(payload: TradingViewPayload, header_token: str | None) -> bool:
     expected = os.getenv("TRADINGVIEW_WEBHOOK_SECRET", "").strip()
     provided = (header_token or payload.secret or payload.token or "").strip()
-    return bool(expected and provided and secrets.compare_digest(provided, expected))
+    return bool(expected and provided and secrets.compare_digest(provided.encode(), expected.encode()))
 
 
 def _base_symbol(raw: str) -> str:
@@ -115,7 +134,7 @@ def normalize_instrument(raw: str | None) -> str:
 
 
 def _allowed_symbols() -> set[str]:
-    raw = os.getenv("TRADINGVIEW_SYMBOLS", os.getenv("MARKET_SYMBOLS", ""))
+    raw = os.getenv("TRADINGVIEW_SYMBOLS", os.getenv("MARKET_SYMBOLS", "BTC-USDT-SWAP,ETH-USDT-SWAP"))
     return {item.strip().upper() for item in raw.split(",") if item.strip()}
 
 
@@ -123,7 +142,7 @@ def _alert_id(payload: TradingViewPayload, body: bytes) -> str:
     value = (payload.alert_id or payload.id or "").strip()
     if value:
         return value
-    return hashlib.sha256(body).hexdigest()[:32]
+    raise TradingViewWebhookError("alert_id_required")
 
 
 def _ttl_seconds() -> int:
@@ -143,14 +162,16 @@ def _max_age_seconds() -> int:
 def _default_size() -> float:
     try:
         value = float(os.getenv("TRADINGVIEW_DEFAULT_SIZE", "1"))
-    except ValueError:
-        value = 1.0
-    return value if value > 0 else 1.0
+    except ValueError as exc:
+        raise TradingViewWebhookError("invalid_default_size") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise TradingViewWebhookError("invalid_default_size")
+    return value
 
 
 def _check_timestamp(payload: TradingViewPayload, now: datetime) -> None:
     if payload.timestamp is None:
-        return
+        raise TradingViewWebhookError("timestamp_required")
     timestamp = payload.timestamp
     if timestamp.tzinfo is None:
         raise TradingViewWebhookError("timestamp_timezone_required")
@@ -169,12 +190,21 @@ def to_signal(
     _check_timestamp(payload, current)
     instrument = normalize_instrument(payload.inst_id or payload.symbol or payload.ticker)
     allowed = _allowed_symbols()
-    if allowed and instrument not in allowed:
+    if not allowed:
+        raise TradingViewWebhookError("symbol_allowlist_empty")
+    if instrument not in allowed:
         raise TradingViewWebhookError("symbol_not_allowed")
     if payload.action == "close" and payload.side is None:
         raise TradingViewWebhookError("close_side_required")
     try:
-        expires_at = payload.expires_at or current + timedelta(seconds=_ttl_seconds())
+        expires_at = min(
+            current + timedelta(seconds=_ttl_seconds()),
+            payload.timestamp + timedelta(seconds=_max_age_seconds()),
+        )
+        if payload.expires_at is not None:
+            if payload.expires_at.tzinfo is None:
+                raise TradingViewWebhookError("timestamp_timezone_required")
+            expires_at = min(expires_at, payload.expires_at)
         signal = TradeSignal(
             inst_id=instrument,
             action=payload.action,
@@ -188,6 +218,8 @@ def to_signal(
             created_at=current,
             expires_at=expires_at,
         )
+    except TradingViewWebhookError:
+        raise
     except ValueError as exc:
         raise TradingViewWebhookError("invalid_signal") from exc
     size = payload.size if payload.size is not None else _default_size()
@@ -206,11 +238,13 @@ def numeric_context() -> dict[str, float]:
     def value(name: str, fallback: str) -> float:
         try:
             number = float(os.getenv(name, fallback))
-        except ValueError:
-            number = float(fallback)
+        except ValueError as exc:
+            raise TradingViewWebhookError("invalid_simulation_context") from exc
+        if not math.isfinite(number):
+            raise TradingViewWebhookError("invalid_simulation_context")
         return number
 
-    return {
+    context = {
         "account_equity": value(
             "TRADINGVIEW_ACCOUNT_EQUITY",
             os.getenv("AUTO_TRADING_ACCOUNT_EQUITY", "1000"),
@@ -218,3 +252,16 @@ def numeric_context() -> dict[str, float]:
         "daily_pnl_pct": value("TRADINGVIEW_DAILY_PNL_PCT", "0"),
         "current_notional": value("TRADINGVIEW_CURRENT_NOTIONAL", "0"),
     }
+    if context["account_equity"] <= 0 or context["current_notional"] < 0:
+        raise TradingViewWebhookError("invalid_simulation_context")
+    return context
+
+
+def instruction_fingerprint(payload: TradingViewPayload, signal: TradeSignal, size: float, side: str | None) -> str:
+    instruction = {
+        **signal.model_dump(mode="json", exclude={"created_at", "expires_at"}),
+        "size": size, "side": side, "dry_run": payload.dry_run,
+        "timestamp": payload.timestamp.astimezone(timezone.utc).isoformat(),
+        "expires_at": payload.expires_at.astimezone(timezone.utc).isoformat() if payload.expires_at else None,
+    }
+    return hashlib.sha256(json.dumps(instruction, sort_keys=True, allow_nan=False).encode()).hexdigest()

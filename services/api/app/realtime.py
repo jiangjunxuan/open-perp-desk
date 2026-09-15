@@ -79,6 +79,7 @@ async def private_events(store, account, account_client, authorized, rate_scope=
                     "orders": {"data": store.list_orders()},
                     "fills": {"data": store.list_fills()},
                     "activity": {"data": store.list_audit()},
+                    "tradingview_alerts": {"data": store.list_tradingview_alerts()},
                     "bills": {
                         "configured": account_client.configured,
                         **store.bill_snapshot(account_client.account_scope),

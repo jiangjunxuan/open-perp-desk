@@ -46,6 +46,7 @@ const state = {
   draftRevision: 0,
   activityRows: null,
   activityRequest: 0,
+  tradingviewAlerts: null,
   backtest: null,
   backtestRequest: 0,
 };
@@ -1097,6 +1098,7 @@ function renderStrategy(strategy) {
 
 function updatePrivateActionAvailability() {
   const unlocked = Boolean(state.token);
+  if (!unlocked) renderTradingViewAlerts(null);
   const worker = state.status?.automation_worker || {};
   const integrations = state.status?.integrations || {};
   const executionAllowed = state.status?.safety_control?.execution_allowed !== false;
@@ -1825,6 +1827,77 @@ function executionGateOpen(status) {
     && (status.trading_mode === "demo" || (status.trading_mode === "live" && status.live_safety?.allowed === true));
 }
 
+function updateTradingViewSetup(status) {
+  const endpoint = new URL("/api/v1/integrations/tradingview/webhook", window.location.origin).href;
+  $("#tradingview-webhook-url").value = endpoint;
+  const integration = status?.integrations?.tradingview || {};
+  setState("#tradingview-setup-status",
+    !integration.enabled ? "未启用" : !integration.configured ? "密钥未配置"
+      : integration.dry_run ? "仅预览" : "执行闸门受控",
+    !integration.configured ? "neutral" : integration.dry_run ? "warning" : "good",
+  );
+  setText("#tradingview-symbols", (integration.symbols || []).join(" / ") || "--");
+  const local = ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
+  setText("#tradingview-endpoint-state", local ? "本地地址 · 外部 Alert 无法访问"
+    : location.protocol !== "https:" ? "未加密连接 · 部署前需配置 HTTPS"
+      : location.port && location.port !== "443" ? "非标准端口 · TradingView 不可投递"
+        : "HTTPS 地址 · 外部可达性尚未验证");
+}
+
+function renderTradingViewAlerts(rows, note = "") {
+  state.tradingviewAlerts = Array.isArray(rows) ? rows : null;
+  const list = state.token ? state.tradingviewAlerts : null;
+  setText("#tradingview-alert-state", note || (!state.token ? "管理员未解锁"
+    : !list ? "连接中" : `最近 ${list.length} 条`));
+  const body = $("#tradingview-alert-body");
+  if (!list?.length) {
+    body.innerHTML = `<tr><td colspan="3" class="table-empty">${escapeHtml(note || (!state.token
+      ? "管理员未解锁" : list ? "暂无告警" : "等待告警记录"))}</td></tr>`;
+    return;
+  }
+  const statuses = {
+    queued: "已排队", processing: "处理中", preview: "预览通过", submitted: "委托已提交",
+    observed: "已接收 · 观望", rejected: "已拒绝", expired: "已过期",
+    interrupted: "处理中断 · 需查单", unconfirmed: "结果待确认",
+  };
+  const reasons = {
+    ...executionReasons,
+    processing_interrupted: "不自动重发，需核对订单",
+    execution_result_unconfirmed: "执行结果未确认，不自动重发",
+    execution_scope_changed: "交易账户或模式已变更",
+    tradingview_integration_disabled: "接入已关闭",
+    tradingview_execution_disabled: "执行权限已关闭",
+    symbol_not_allowed: "合约不在白名单",
+    restored_inbox_requires_review: "来自恢复备份，需核对订单，不自动重发",
+  };
+  body.innerHTML = list.map(row => `<tr>
+    <td class="mono-cell">${escapeHtml(formatTime(row.created_at))}<span class="tradingview-detail">${escapeHtml(row.alert_id)}</span></td>
+    <td>${escapeHtml(row.inst_id)}<span class="tradingview-detail">${escapeHtml(({open_long: "开多", open_short: "开空", close: "平仓", hold: "观望"})[row.action] || row.action)} · ${row.dry_run ? "仅预览" : "执行请求"}</span></td>
+    <td><span data-tone="${["preview", "submitted", "observed"].includes(row.status) ? "good" : "warning"}">${escapeHtml(statuses[row.status] || row.status)}</span><span class="tradingview-detail">${escapeHtml((row.reasons || []).map(reason => reasons[reason] || reason).join("；"))}</span>${row.client_order_id ? `<span class="tradingview-detail mono">${escapeHtml(row.client_order_id)}</span>` : ""}</td>
+  </tr>`).join("");
+}
+
+async function copyTradingViewValue(selector, message) {
+  const element = $(selector);
+  const text = element.value ?? element.textContent;
+  try {
+    await navigator.clipboard.writeText(text || "");
+    setText("#tradingview-setup-message", message);
+  } catch {
+    if (element instanceof HTMLInputElement) {
+      element.focus();
+      element.select();
+    } else {
+      element.focus();
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      window.getSelection().removeAllRanges();
+      window.getSelection().addRange(range);
+    }
+    setText("#tradingview-setup-message", "复制权限不可用 · 内容已选中");
+  }
+}
+
 function applyStatus(status) {
   state.status = status;
   const mode = String(status.trading_mode || "demo").toUpperCase();
@@ -1894,6 +1967,7 @@ function applyStatus(status) {
   setState("#state-pushplus", status.integrations?.pushplus_configured ? "已配置" : "未配置", status.integrations?.pushplus_configured ? "good" : "neutral");
   setState("#state-ai", status.integrations?.tradingagents_configured ? "已配置" : "未启用", status.integrations?.tradingagents_configured ? "good" : "neutral");
   const tradingView = status.integrations?.tradingview || {};
+  updateTradingViewSetup(status);
   setState(
     "#state-tradingview",
     !tradingView.enabled
@@ -2213,6 +2287,7 @@ function lockPrivateAccess() {
   renderPnl([]);
   renderPerformance({});
   renderAccountBills({ configured: false });
+  renderTradingViewAlerts(null);
   setText("#metric-equity", "--");
   setText("#metric-equity-note", "管理员访问已锁定");
   setText("#positions-tag", "需要令牌");
@@ -2269,6 +2344,7 @@ async function refreshLivePerformance() {
 
 function applyPrivateEvent(event, payload) {
   if (!state.token) return;
+  if (event === "tradingview_alerts" && state.privateFeedState !== "open") return;
   if (event === "heartbeat") return;
   if (event === "locked") {
     lockPrivateAccess();
@@ -2291,7 +2367,8 @@ function applyPrivateEvent(event, payload) {
   } else if (event === "activity") {
     state.activityRequest += 1;
     renderActivity(payload.data);
-  } else if (event === "bills") renderAccountBills(payload);
+  } else if (event === "tradingview_alerts") renderTradingViewAlerts(payload.data);
+  else if (event === "bills") renderAccountBills(payload);
   else if (event === "account") {
     const connected = payload.connected === true && payload.authenticated === true;
     const ready = connected && payload.ready === true;
@@ -2355,8 +2432,10 @@ function connectPrivateFeed() {
       if (status === "locked") lockPrivateAccess();
       else if (status === "connecting") {
         clearPrivateDisplay("账户推送连接中", "等待实时账户数据");
+        renderTradingViewAlerts(null, "推送连接中");
       } else if (status !== "open") {
         clearPrivateDisplay("账户推送断开", "实时账户数据不可用");
+        renderTradingViewAlerts(null, "推送连接断开");
       }
       scheduleBillImportPoll();
     },
@@ -3058,6 +3137,8 @@ $("#run-worker").addEventListener("click", runWorkerOnce);
 $("#test-notification").addEventListener("click", testNotification);
 $("#save-strategy").addEventListener("click", saveStrategy);
 $("#toggle-worker").addEventListener("click", toggleWorker);
+$("#copy-tradingview-url").addEventListener("click", () => copyTradingViewValue("#tradingview-webhook-url", "Webhook 地址已复制。"));
+$("#copy-tradingview-template").addEventListener("click", () => copyTradingViewValue("#tradingview-payload-template", "测试 Alert 已复制。"));
 $("#unlock-live").addEventListener("click", unlockLive);
 $("#lock-live").addEventListener("click", lockLive);
 $("#preview-signal").addEventListener("click", () => submitSignal(true));

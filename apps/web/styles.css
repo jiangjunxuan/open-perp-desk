@@ -180,6 +180,23 @@ input::placeholder { color: var(--muted); }
 .private-access > [data-icon] { color: var(--warning); }
 .private-access .button { margin-left: auto; }
 .private-access.is-unlocked { display: none; }
+.tradingview-setup { margin-top: 16px; border-top: 1px solid var(--border-soft); }
+.tradingview-setup summary { min-height: 48px; padding: 14px 0; color: var(--muted-strong); font-size: 12px; font-weight: 600; }
+.tradingview-setup-body { display: grid; gap: 14px; padding: 0 0 16px; }
+.tradingview-summary { display: flex; gap: 8px 16px; flex-wrap: wrap; font-size: 12px; }
+.tradingview-summary > span { color: var(--muted); overflow-wrap: anywhere; }
+.tradingview-endpoint { display: grid; gap: 6px; }
+.tradingview-endpoint > label { color: var(--muted); font-size: 12px; }
+.copy-field { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.copy-field input { flex: 1 1 auto; min-width: 0; font: 12px var(--mono); }
+.copy-field .button { flex: 0 0 auto; }
+.tradingview-template-heading, .tradingview-alert-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--muted); }
+.tradingview-alert-heading h3 { margin: 0; color: var(--text); font-size: 12px; }
+#tradingview-payload-template { margin: 0; padding: 12px; max-height: 240px; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--surface-soft); font: 12px/1.6 var(--mono); }
+.tradingview-alert-table { max-height: 340px; }
+.tradingview-alert-table table { min-width: 560px; width: 100%; }
+.tradingview-alert-table td { white-space: normal; vertical-align: top; max-width: 260px; overflow-wrap: anywhere; }
+.tradingview-detail { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; }
 .button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 8px 12px; border: 1px solid var(--control-border); border-radius: var(--radius-control); color: var(--text); background: var(--surface-raised); font-size: 12px; font-weight: 500; white-space: nowrap; transition: background var(--transition-fast), border-color var(--transition-fast); }
 .button:hover:not(:disabled) { border-color: var(--muted); background: var(--control-hover); }
 .button:active:not(:disabled) { background: var(--control-active); }

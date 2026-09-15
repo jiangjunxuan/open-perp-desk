@@ -67,6 +67,8 @@
 - [ ] TradingAgents 真实模型服务与外部数据工具的端到端研究验收
 - [x] 回测和历史重放
 - [x] TradingView Webhook 信号桥接、合约白名单、过期校验和幂等执行（默认关闭，见 `docs/TRADINGVIEW.md`）
+- [x] TradingView 持久化接收与异步处理、重复内容冲突拦截、原始时效与账户身份绑定、中断不重发和中文告警推送面板（本机测试，不代表真实 TradingView/OKX 验收）
+- [ ] 真实 TradingView Alert 经目标 HTTPS 入口到 OKX Demo 的端到端验收
 - [x] 策略配置页面和完整启停联动
 - [x] Web Worker 运行时启停和 Dry Run 安全控制
 - [x] Worker 周期互斥、账户快照失败停机、合约步长与非有限数值边界测试

@@ -191,6 +191,16 @@ def restore_database(source: Path, target: Path, *, offline: bool = False) -> di
                     ("Database restored; reconcile account and orders before manual resume.", now),
                 )
                 connection.execute("UPDATE strategies SET enabled=0, updated_at=?", (now,))
+                if connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tradingview_alerts'"
+                ).fetchone():
+                    # A saved queued alert may have executed after the backup
+                    # was taken. Restoring it must not authorize another send.
+                    connection.execute(
+                        """UPDATE tradingview_alerts SET status='interrupted', updated_at=?,
+                            result_json=?, owner=NULL WHERE status IN ('queued', 'processing')""",
+                        (now, json.dumps({"reasons": ["restored_inbox_requires_review"]})),
+                    )
                 connection.execute(
                     "INSERT INTO audit_events(event_type, severity, message, payload_json, created_at) VALUES(?, ?, ?, ?, ?)",
                     ("database_restored", "warning", "Database restored with execution stopped.",

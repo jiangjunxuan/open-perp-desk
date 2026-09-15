@@ -159,6 +159,27 @@ class DatabaseMaintenanceTests(unittest.TestCase):
         self.assertIsNone(json.loads((archive / "manifest.json").read_text())["snapshot"])
         maintenance.validate_database(target)
 
+    def test_restore_never_replays_queued_or_processing_tradingview_alerts(self):
+        instruction = {
+            "signal": {"inst_id": "BTC-USDT-SWAP", "action": "open_long"},
+            "dry_run": False, "client_order_id": "opdBackupFixture",
+        }
+        for identifier in ("completed", "processing", "queued"):
+            self.store.enqueue_tradingview_alert(identifier, identifier, instruction)
+        self.store.claim_tradingview_alert("old-worker", 1)
+        self.store.finish_tradingview_alert("completed", "old-worker", "submitted", {"accepted": True})
+        self.store.claim_tradingview_alert("old-worker", 1)
+        restored_path = self.root / "restored.sqlite3"
+        maintenance.restore_database(self.source, restored_path, offline=True)
+        restored = StateStore(str(restored_path))
+        rows = {row["alert_id"]: row for row in restored.list_tradingview_alerts()}
+        self.assertEqual(rows["completed"]["status"], "submitted")
+        for identifier in ("processing", "queued"):
+            self.assertEqual(rows[identifier]["status"], "interrupted")
+            self.assertEqual(rows[identifier]["reasons"], ["restored_inbox_requires_review"])
+            self.assertEqual(rows[identifier]["client_order_id"], "opdBackupFixture")
+        self.assertIsNone(restored.claim_tradingview_alert("new-worker", 1000))
+
     def test_recovery_archive_retains_wal_committed_before_crash(self):
         target = self.root / "wal-target.sqlite3"
         StateStore(str(target))

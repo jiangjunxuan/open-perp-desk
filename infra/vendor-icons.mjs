@@ -10,7 +10,7 @@ const icons = [
   "scroll-text", "key-round", "refresh-cw", "pause", "play", "x",
   "circle-stop", "chevron-right", "bell", "flask-conical", "scan-line",
   "lock-keyhole", "panel-left-close", "panel-left-open", "download", "sun", "moon",
-  "mouse-pointer-2", "minus", "trending-up", "type", "pencil", "trash-2", "undo-2", "eraser",
+  "mouse-pointer-2", "minus", "trending-up", "type", "pencil", "trash-2", "undo-2", "eraser", "copy",
 ];
 
 await mkdir(destination, { recursive: true });

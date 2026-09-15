@@ -67,6 +67,8 @@ async def main():
                 "annotation_groups": len(report["annotations"]),
                 "protection_incident_groups": len(report["protectionIncidents"]),
                 "protection_review_groups": len(report["protectionReview"]),
+                "tradingview_checks": len(report["tradingView"]["checks"]),
+                "tradingview_layouts": len(report["tradingView"]["layouts"]),
                 "browser_errors": report["browserErrors"],
                 "exchange_mutations": len(exchange.posts),
                 "execution_enabled": False,

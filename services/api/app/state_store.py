@@ -55,6 +55,13 @@ class ValuationLeaseLost(RuntimeError):
 class PerformanceLeaseLost(RuntimeError):
     """Canceled or superseded account-performance work cannot publish."""
 
+class TradingViewAlertConflict(ValueError):
+    """An alert identifier was reused for a different instruction."""
+
+
+class TradingViewQueueFull(ValueError):
+    """The bounded durable inbox cannot accept another alert."""
+
 
 class StateStore:
     """Small durable store for the control plane.
@@ -77,10 +84,10 @@ class StateStore:
         self._initialize()
 
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
+    def _connection(self, *, timeout: float = 10) -> Iterator[sqlite3.Connection]:
         if recovery_marker(self.path).exists():
             raise RuntimeError("State database recovery is incomplete; API access is locked.")
-        connection = sqlite3.connect(self.path, timeout=10)
+        connection = sqlite3.connect(self.path, timeout=timeout)
         connection.row_factory = sqlite3.Row
         try:
             yield connection
@@ -292,6 +299,22 @@ class StateStore:
                     payload_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS tradingview_alerts (
+                    alert_id TEXT PRIMARY KEY,
+                    fingerprint TEXT NOT NULL,
+                    inst_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    dry_run INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    instruction_json TEXT NOT NULL,
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    owner TEXT,
+                    deadline_ms INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_tradingview_queue
+                    ON tradingview_alerts(status, created_at);
                 CREATE TABLE IF NOT EXISTS position_lot_snapshots (
                     account_scope TEXT NOT NULL,
                     position_key TEXT NOT NULL,
@@ -2593,6 +2616,91 @@ class StateStore:
                     (now,),
                 )
             return int(cursor.rowcount)
+
+    @staticmethod
+    def _tradingview_summary(row) -> dict[str, Any]:
+        result = json.loads(row["result_json"])
+        return {
+            "alert_id": row["alert_id"], "inst_id": row["inst_id"], "action": row["action"],
+            "dry_run": bool(row["dry_run"]), "status": row["status"],
+            "created_at": row["created_at"], "updated_at": row["updated_at"],
+            "execution_accepted": result.get("accepted"),
+            "client_order_id": result.get("client_order_id") or json.loads(row["instruction_json"]).get("client_order_id"),
+            "reasons": result.get("reasons", []),
+        }
+
+    def enqueue_tradingview_alert(
+        self, alert_id: str, fingerprint: str, instruction: dict[str, Any],
+    ) -> tuple[bool, dict[str, Any]]:
+        now = _utc_now()
+        with self._connection(timeout=1) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM tradingview_alerts WHERE alert_id = ?", (alert_id,),
+            ).fetchone()
+            if existing:
+                if existing["fingerprint"] != fingerprint:
+                    raise TradingViewAlertConflict("alert_id_payload_conflict")
+                return False, self._tradingview_summary(existing)
+            pending = connection.execute(
+                "SELECT COUNT(*) FROM tradingview_alerts WHERE status IN ('queued', 'processing')",
+            ).fetchone()[0]
+            if pending >= 1000:
+                raise TradingViewQueueFull("tradingview_queue_full")
+            signal = instruction["signal"]
+            connection.execute(
+                """INSERT INTO tradingview_alerts
+                    (alert_id, fingerprint, inst_id, action, dry_run, instruction_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (alert_id, fingerprint, signal["inst_id"], signal["action"], int(instruction["dry_run"]),
+                 json.dumps(instruction, allow_nan=False), now, now),
+            )
+            return True, self._tradingview_summary(connection.execute(
+                "SELECT * FROM tradingview_alerts WHERE alert_id = ?", (alert_id,),
+            ).fetchone())
+
+    def claim_tradingview_alert(self, owner: str, now_ms: int) -> dict[str, Any] | None:
+        with self._connection(timeout=1) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            # A process may have exited after submitting an order. Never
+            # automatically replay an interrupted instruction.
+            connection.execute(
+                """UPDATE tradingview_alerts SET status = 'interrupted', updated_at = ?,
+                    result_json = ? WHERE status = 'processing' AND deadline_ms <= ?""",
+                (_utc_now(), json.dumps({"reasons": ["processing_interrupted"]}), now_ms),
+            )
+            row = connection.execute(
+                "SELECT * FROM tradingview_alerts WHERE status = 'queued' ORDER BY created_at, rowid LIMIT 1",
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """UPDATE tradingview_alerts SET status = 'processing', owner = ?, deadline_ms = ?,
+                    updated_at = ? WHERE alert_id = ? AND status = 'queued'""",
+                (owner, now_ms + 120_000, _utc_now(), row["alert_id"]),
+            )
+            return {"alert_id": row["alert_id"], **json.loads(row["instruction_json"])}
+
+    def finish_tradingview_alert(
+        self, alert_id: str, owner: str, status: str, result: dict[str, Any],
+    ) -> bool:
+        if status not in {"preview", "submitted", "observed", "rejected", "expired", "interrupted", "unconfirmed"}:
+            raise ValueError("invalid_tradingview_result_status")
+        with self._connection(timeout=1) as connection:
+            updated = connection.execute(
+                """UPDATE tradingview_alerts SET status = ?, result_json = ?, updated_at = ?
+                    WHERE alert_id = ? AND owner = ? AND status = 'processing'""",
+                (status, json.dumps(result, allow_nan=False), _utc_now(), alert_id, owner),
+            )
+            return updated.rowcount == 1
+
+    def list_tradingview_alerts(self, limit: int = 30) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM tradingview_alerts ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (max(1, min(limit, 100)),),
+            ).fetchall()
+            return [self._tradingview_summary(row) for row in rows]
 
     def add_audit(
         self,
