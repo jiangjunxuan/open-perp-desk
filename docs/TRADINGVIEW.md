@@ -71,6 +71,8 @@ TradingView Alert 的消息使用 JSON。`timestamp`（带时区）和 `alert_id
 
 `open_short` 要求价格满足 `take_profit < entry_price < stop_loss`。
 `close` 必须提供 `side`（`buy` 或 `sell`），避免在双向持仓下错误平仓。
+开仓方向由 `open_long` / `open_short` 唯一决定；若额外提供的 `side`
+与动作矛盾则直接拒绝，同义方向不影响去重。
 符号支持 `BTC-USDT-SWAP`、`BTCUSDT` 和常见的 `BINANCE:BTCUSDT.P` 形式，
 最终都会转换为 OKX 永续合约名称，并且必须在 `TRADINGVIEW_SYMBOLS` 白名单中。
 

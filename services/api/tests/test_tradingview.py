@@ -54,6 +54,18 @@ class TradingViewNormalizationTests(unittest.TestCase):
         with self.assertRaisesRegex(tradingview.TradingViewWebhookError, "close_side_required"):
             signal_for(action="close", entry_price=None, stop_loss=None, take_profit=None)
 
+    def test_open_direction_cannot_be_overridden_by_side(self):
+        for action, side, stop, target in [
+            ("open_long", "sell", 49000, 52000),
+            ("open_short", "buy", 52000, 49000),
+        ]:
+            with self.subTest(action=action), self.assertRaisesRegex(
+                tradingview.TradingViewWebhookError, "side_action_mismatch"
+            ):
+                signal_for(action=action, side=side, stop_loss=stop, take_profit=target)
+        self.assertIsNone(signal_for(action="open_long", side="buy")[2])
+        self.assertEqual(signal_for(action="close", side="buy")[2], "buy")
+
     def test_missing_old_naive_and_future_timestamp_rejected(self):
         for timestamp, reason in [
             (None, "timestamp_required"),
@@ -218,6 +230,17 @@ class TradingViewEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.worker.run_once())
         self.assertEqual((await self.post(payload)).json()["status"], "preview")
         self.execution.submit_signal.assert_awaited_once()
+
+    async def test_open_side_alias_deduplicates_but_conflict_is_rejected(self):
+        payload = alert()
+        await self.post(payload)
+        duplicate = await self.post({**payload, "side": "buy"})
+        self.assertEqual(duplicate.status_code, 202)
+        self.assertTrue(duplicate.json()["idempotent"])
+        conflict = await self.post({**payload, "side": "sell"})
+        self.assertEqual(conflict.status_code, 422)
+        self.assertEqual(conflict.json()["detail"], "side_action_mismatch")
+        self.execution.submit_signal.assert_not_awaited()
 
     async def test_concurrent_delivery_has_one_claim(self):
         payload = alert()

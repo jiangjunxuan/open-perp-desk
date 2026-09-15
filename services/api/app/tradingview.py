@@ -196,6 +196,9 @@ def to_signal(
         raise TradingViewWebhookError("symbol_not_allowed")
     if payload.action == "close" and payload.side is None:
         raise TradingViewWebhookError("close_side_required")
+    expected_side = {"open_long": "buy", "open_short": "sell"}.get(payload.action)
+    if expected_side and payload.side is not None and payload.side != expected_side:
+        raise TradingViewWebhookError("side_action_mismatch")
     try:
         expires_at = min(
             current + timedelta(seconds=_ttl_seconds()),
@@ -223,7 +226,7 @@ def to_signal(
     except ValueError as exc:
         raise TradingViewWebhookError("invalid_signal") from exc
     size = payload.size if payload.size is not None else _default_size()
-    return signal, size, payload.side, _alert_id(payload, body)
+    return signal, size, payload.side if payload.action == "close" else None, _alert_id(payload, body)
 
 
 def execution_dry_run(payload: TradingViewPayload) -> bool:
