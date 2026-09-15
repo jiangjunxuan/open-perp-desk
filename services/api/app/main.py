@@ -894,7 +894,17 @@ class SafetyReasonRequest(BaseModel):
 
 @app.get("/api/v1/safety/status")
 def safety_status() -> dict[str, object]:
-    return safety_controller.snapshot()
+    snapshot = safety_controller.snapshot()
+    execution_enabled = trade_client.enabled
+    live_execution_allowed = trade_client.live_gate.allowed
+    return {
+        **snapshot,
+        "execution_enabled": execution_enabled,
+        "live_execution_allowed": live_execution_allowed,
+        "order_submission_allowed": (
+            snapshot["execution_allowed"] and execution_enabled
+        ),
+    }
 
 
 @app.post("/api/v1/safety/emergency-stop")

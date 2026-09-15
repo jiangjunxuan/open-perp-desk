@@ -132,6 +132,20 @@ class LiveEmergencySafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(reopened.emergency_stopped)
         self.assertFalse(LiveSafetyGate().allowed)
 
+    async def test_safety_status_separates_emergency_control_from_order_permission(self):
+        initial = await self.client.get("/api/v1/safety/status")
+        self.assertEqual(initial.status_code, 200)
+        self.assertTrue(initial.json()["execution_allowed"])
+        self.assertFalse(initial.json()["execution_enabled"])
+        self.assertFalse(initial.json()["live_execution_allowed"])
+        self.assertFalse(initial.json()["order_submission_allowed"])
+
+        self.safety.stop("status test")
+        stopped = await self.client.get("/api/v1/safety/status")
+        self.assertEqual(stopped.status_code, 200)
+        self.assertFalse(stopped.json()["execution_allowed"])
+        self.assertFalse(stopped.json()["order_submission_allowed"])
+
     async def test_delayed_unlock_response_reflects_newer_emergency_stop(self):
         notifying = asyncio.Event()
         release = asyncio.Event()
