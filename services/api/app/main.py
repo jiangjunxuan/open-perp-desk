@@ -854,6 +854,7 @@ async def emergency_stop(
     request: SafetyReasonRequest,
     _: None = Depends(require_admin_token),
 ) -> dict[str, object]:
+    trade_client.live_gate.lock()
     safety_controller.stop(request.reason)
     state_store.add_audit(
         "emergency_stop",
@@ -864,7 +865,7 @@ async def emergency_stop(
     await execution_engine.notify_event(
         "emergency_stop",
         "OpenPerpDesk 已触发急停",
-        f"新订单已停止放行：{request.reason}。",
+        f"新订单已停止放行，实盘闸门已回锁：{request.reason}。",
         payload={"reason": request.reason},
         severity="warning",
     )
@@ -884,8 +885,8 @@ async def resume_trading(
     )
     await execution_engine.notify_event(
         "emergency_resume",
-        "OpenPerpDesk 已恢复执行",
-        f"急停闸门已解除：{request.reason}。",
+        "OpenPerpDesk 已解除急停",
+        f"急停闸门已解除，实盘仍需独立人工解锁：{request.reason}。",
         payload={"reason": request.reason},
     )
     return safety_controller.snapshot()
@@ -896,6 +897,9 @@ async def unlock_live(
     request: LiveUnlockRequest,
     _: None = Depends(require_admin_token),
 ) -> dict[str, object]:
+    if safety_controller.emergency_stopped:
+        trade_client.live_gate.lock()
+        raise HTTPException(status_code=423, detail="Live safety unlock is blocked while emergency stop is active.")
     unlocked = trade_client.live_gate.unlock(request.phrase)
     if not unlocked:
         raise HTTPException(status_code=403, detail="Live safety unlock rejected.")
@@ -911,7 +915,8 @@ async def unlock_live(
         "实盘安全闸门已在当前进程内人工解锁。",
         severity="warning",
     )
-    return {"unlocked": True, "live_safety": trade_client.live_gate.snapshot()}
+    snapshot = trade_client.live_gate.snapshot()
+    return {"unlocked": snapshot["unlocked"], "live_safety": snapshot}
 
 
 @app.post("/api/v1/safety/live/lock")
@@ -926,7 +931,8 @@ async def lock_live(
         "实盘安全闸门已锁定，后续实盘订单将被阻止。",
         severity="warning",
     )
-    return {"unlocked": False, "live_safety": trade_client.live_gate.snapshot()}
+    snapshot = trade_client.live_gate.snapshot()
+    return {"unlocked": snapshot["unlocked"], "live_safety": snapshot}
 
 
 class RiskEvaluateRequest(BaseModel):

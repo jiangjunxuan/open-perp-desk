@@ -1126,7 +1126,10 @@ function updatePrivateActionAvailability() {
   $("#resume-trading").disabled = !unlocked;
   $("#unlock-live").disabled = !unlocked
     || state.status?.live_safety?.configuration_enabled !== true
-    || state.status?.live_safety?.mode_is_live !== true;
+    || state.status?.live_safety?.mode_is_live !== true
+    || state.status?.live_safety?.allowed === true
+    || state.status?.safety_control?.emergency_stopped === true
+    || state.status?.safety_control?.execution_allowed !== true;
   $("#lock-live").disabled = !unlocked;
   document.querySelectorAll("button[aria-busy='true']").forEach((button) => {
     button.disabled = true;
@@ -1800,11 +1803,13 @@ function applyStatus(status) {
   const liveSafety = status.live_safety || {};
   setText(
     "#live-safety-message",
-    liveSafety.allowed
-      ? "实盘闸门已解锁，仅在当前进程内有效。"
-      : liveSafety.mode_is_live
-        ? "实盘配置存在，但仍需要人工解锁。"
-        : "当前不是实盘模式，解锁按钮保持关闭。",
+    status.safety_control?.emergency_stopped
+      ? "急停已触发，实盘闸门保持锁定。"
+      : liveSafety.allowed
+        ? "实盘闸门已解锁，仅在当前进程内有效。"
+        : liveSafety.mode_is_live
+          ? "实盘配置存在，但仍需要人工解锁。"
+          : "当前不是实盘模式，解锁按钮保持关闭。",
   );
   setText("#unlock-live", liveSafety.allowed ? "实盘已解锁" : "解锁实盘");
   setText("#execution-state", executionLabel);
@@ -1844,6 +1849,7 @@ function applyStatus(status) {
 }
 
 async function unlockLive() {
+  if ($("#unlock-live").disabled) return;
   if (!state.token) {
     setMessage("请先输入管理员令牌", "error");
     return;
@@ -1855,18 +1861,23 @@ async function unlockLive() {
   }
   setBusy("#unlock-live", true, "解锁中...");
   try {
-    await api("/api/v1/safety/live/unlock", {
+    const payload = await api("/api/v1/safety/live/unlock", {
       method: "POST",
       body: JSON.stringify({ phrase }),
     });
     $("#live-unlock-phrase").value = "";
-    setMessage("实盘安全闸门已在当前进程内解锁", "good");
     await loadStatus();
+    const allowed = payload.live_safety?.allowed === true
+      && state.status?.live_safety?.allowed === true
+      && state.status?.safety_control?.emergency_stopped !== true;
+    setMessage(allowed ? "实盘安全闸门已在当前进程内解锁" : "实盘闸门未放行", allowed ? "good" : "normal");
   } catch (error) {
     setText("#live-safety-message", `实盘解锁失败：${error.message}`);
     setMessage("实盘解锁失败", "error");
   } finally {
     setBusy("#unlock-live", false);
+    setText("#unlock-live", state.status?.live_safety?.allowed ? "实盘已解锁" : "解锁实盘");
+    updatePrivateActionAvailability();
   }
 }
 
@@ -1896,14 +1907,14 @@ async function setEmergencyStop(path, message) {
   const button = path.endsWith("emergency-stop") ? "#emergency-stop" : "#resume-trading";
   if ($(button).hasAttribute("aria-busy")) return;
   setBusy(button, true);
-  setMessage(path.endsWith("emergency-stop") ? "正在触发急停..." : "正在恢复执行闸门...");
+  setMessage(path.endsWith("emergency-stop") ? "正在触发急停..." : "正在解除急停...");
   try {
     const payload = await api(path, {
       method: "POST",
       body: JSON.stringify({ reason: message }),
     });
     setText("#state-stop", payload.emergency_stopped ? "已急停" : "未触发");
-    setMessage(payload.emergency_stopped ? "新订单已停止放行" : "执行闸门已恢复", "good");
+    setMessage(payload.emergency_stopped ? "新订单已停止放行" : "急停已解除，实盘闸门保持锁定", "good");
     await loadStatus();
   } catch (error) {
     setMessage(`安全操作失败：${error.message}`, "error");

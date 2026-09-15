@@ -212,6 +212,40 @@ async function exerciseManagement() {
     checks.notificationUnauthorizedLocks = !state.token && $("#test-notification").disabled && !notificationState.busy;
     checks.notificationRequestsScoped = calls.slice(beforeNotification).every(call =>
       call.url === "/api/v1/notifications/test" && call.options?.method === "POST");
+    const beforeLive = calls.length;
+    const lockedLive = {...original.status, trading_mode: "live",
+      live_safety: {configuration_enabled: true, mode_is_live: true, allowed: false, unlocked: false},
+      safety_control: {emergency_stopped: false, execution_allowed: true}};
+    const stoppedLive = {...lockedLive, safety_control: {emergency_stopped: true, execution_allowed: false}};
+    state.token = "local-management-fixture-only";
+    applyStatus(stoppedLive);
+    $("#live-unlock-phrase").value = "local-ui-fixture-phrase";
+    await unlockLive();
+    checks.liveEmergencyNoRequest = calls.length === beforeLive;
+    applyStatus(lockedLive);
+    let finishUnlock;
+    response = url => url === "/api/v1/system/status" ? Promise.resolve(stoppedLive)
+      : new Promise(resolve => { finishUnlock = resolve; });
+    const pendingUnlock = unlockLive();
+    await unlockLive();
+    checks.liveDuplicateBlocked = calls.length === beforeLive + 1 && $("#unlock-live").disabled;
+    applyStatus(stoppedLive);
+    finishUnlock({unlocked: false, live_safety: stoppedLive.live_safety});
+    await pendingUnlock;
+    checks.liveEmergencyWinsLateResponse = $("#unlock-live").disabled
+      && !$("#unlock-live").hasAttribute("aria-busy")
+      && $("#action-message").textContent === "实盘闸门未放行";
+    const unlockedLive = {...lockedLive, live_safety: {...lockedLive.live_safety, allowed: true, unlocked: true}};
+    applyStatus(lockedLive);
+    $("#live-unlock-phrase").value = "local-ui-fixture-phrase";
+    response = async url => url === "/api/v1/system/status" ? unlockedLive
+      : {unlocked: true, live_safety: unlockedLive.live_safety};
+    await unlockLive();
+    checks.liveSuccessLabelAndLock = $("#unlock-live").disabled
+      && $("#unlock-live").textContent === "实盘已解锁" && $("#live-unlock-phrase").value === "";
+    checks.liveRequestsScoped = calls.slice(beforeLive).every(call =>
+      call.url === "/api/v1/safety/live/unlock" || call.url === "/api/v1/system/status");
+    applyStatus(original.status);
     state.token = "local-management-fixture-only";
     state.status = original.status;
     updatePrivateActionAvailability();

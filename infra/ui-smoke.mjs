@@ -523,6 +523,17 @@ try {
           applyStatus({ ...fixture, trading_mode: "demo", safety_control: { execution_allowed: true, emergency_stopped: true } });
           checks.emergencyLocked = document.querySelector("#execute-signal").disabled
             && document.querySelector("#top-execution").textContent === "急停已触发";
+          const liveGate = { allowed: false, configuration_enabled: true, mode_is_live: true };
+          applyStatus({ ...fixture, live_safety: liveGate,
+            safety_control: { execution_allowed: false, emergency_stopped: true } });
+          checks.emergencyPreventsUnlock = document.querySelector("#unlock-live").disabled
+            && document.querySelector("#live-safety-message").textContent.includes("急停已触发");
+          applyStatus({ ...fixture, live_safety: liveGate });
+          checks.resumeRequiresLiveUnlock = !document.querySelector("#unlock-live").disabled
+            && document.querySelector("#execute-signal").disabled
+            && document.querySelector("#live-safety-message").textContent.includes("仍需要人工解锁");
+          applyStatus({ ...fixture, live_safety: { ...liveGate, allowed: true } });
+          checks.liveAlreadyUnlocked = document.querySelector("#unlock-live").disabled;
           applyStatus({ ...fixture, risk_limits: { max_leverage: null } });
           checks.missingLimitsUnknown = [...document.querySelectorAll(".risk-limits dd")].every(el => el.textContent === "--");
           applyStatus({ ...fixture, market_stream: { candles_connected: true, candles_fresh: false },
