@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.parse
+import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -166,20 +167,50 @@ class Deployment:
 
     def smoke(self, origin: str | None = None, *, readiness: bool = True) -> None:
         origin = origin or binding_origin(self.compose("port", "web", "80").stdout.decode())
+        environment = effective_environment(self.config())
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+        def fetch(path: str, headers: dict[str, str] | None = None) -> tuple[int, bytes]:
+            request = urllib.request.Request(origin.rstrip("/") + path, headers=headers or {})
+            try:
+                with opener.open(request, timeout=10) as response:
+                    return response.status, response.read()
+            except urllib.error.HTTPError as error:
+                try:
+                    return error.code, error.read()
+                finally:
+                    error.close()
+
         paths = ["/", "/assets/icons/chart-candlestick.svg", "/api/v1/health"]
         if readiness:
             paths.append("/api/v1/health/readiness")
         for path in paths:
-            with opener.open(origin.rstrip("/") + path, timeout=10) as response:
-                data = response.read()
-                if path.endswith(".svg") and b"<svg" not in data:
-                    raise DeploymentError("Web icon asset is missing from the image.")
-                if path == "/api/v1/health" and json.loads(data).get("status") != "ok":
-                    raise DeploymentError("API process health check failed.")
-                if path.endswith("readiness") and json.loads(data).get("ready") is not True:
-                    raise DeploymentError("API readiness check failed.")
-        print("Smoke passed: web, local icon asset, API health" + (" and readiness." if readiness else "."))
+            status, data = fetch(path)
+            if status != 200:
+                raise DeploymentError(f"Smoke request failed: {path} returned HTTP {status}.")
+            if path.endswith(".svg") and b"<svg" not in data:
+                raise DeploymentError("Web icon asset is missing from the image.")
+            if path == "/api/v1/health" and json.loads(data).get("status") != "ok":
+                raise DeploymentError("API process health check failed.")
+            if path.endswith("readiness") and json.loads(data).get("ready") is not True:
+                raise DeploymentError("API readiness check failed.")
+
+        admin_token = environment.get("ADMIN_API_TOKEN", "").strip()
+        if not admin_token:
+            raise DeploymentError("Smoke cannot verify private API access without an admin token.")
+        unauthenticated, _ = fetch("/api/v1/account/overview")
+        if unauthenticated != 401:
+            raise DeploymentError("Private API did not reject an unauthenticated request.")
+        authenticated, _ = fetch(
+            "/api/v1/account/overview",
+            {"X-Admin-Token": admin_token},
+        )
+        if authenticated not in {200, 502}:
+            raise DeploymentError("Configured admin token could not pass private API authentication.")
+        print(
+            "Smoke passed: web, local icon asset, API health, private API authentication"
+            + (" and readiness." if readiness else "."),
+        )
 
     def running_maintenance(self, command: str, *, stdout=subprocess.PIPE):
         with (self.root / "services/api/app/database_maintenance.py").open("rb") as program:

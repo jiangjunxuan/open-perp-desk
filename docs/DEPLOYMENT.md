@@ -61,6 +61,9 @@ Live 模式必须保持 `OKX_DEMO=false`；需要执行时才额外要求
 `LIVE_TRADING_ENABLED=true`、`EXECUTION_ENABLED=true` 和人工解锁短语。
 执行关闭的 Live 配置可用于只读核对和恢复，但不会获得下单权限。
 `up` 和 `restart` 会自动再次执行 preflight，检查失败时不会启动或重启服务。
+`smoke` 除了检查 Web、图标、健康和 readiness，还会验证未带令牌的私有接口返回
+401，以及使用已配置管理员令牌后能够通过鉴权；账户凭据未配置时允许接口返回
+明确的只读空态。
 
 `api` 和 `web` 都带有 Compose healthcheck；API 的优雅停止时间为 30 秒，
 Web 为 15 秒，便于升级时让 WebSocket 和正在处理的请求自然结束。

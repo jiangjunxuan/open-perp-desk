@@ -11,6 +11,7 @@ import unittest
 from contextlib import closing, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 from app.database_maintenance import MaintenanceError, file_digest
 from app.state_store import StateStore
@@ -166,6 +167,50 @@ class DeploymentCommandTests(unittest.TestCase):
         with self.assertRaisesRegex(deploy.DeploymentError, "600"):
             self.deployment.preflight()
         self.assertFalse(self.deployment.calls)
+
+    def test_smoke_verifies_private_api_authentication_without_printing_token(self):
+        requests = []
+
+        class Response:
+            def __init__(self, status, data):
+                self.status = status
+                self.data = data
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self):
+                return self.data
+
+        class Opener:
+            def open(self, request, timeout):
+                del timeout
+                path = request.full_url.removeprefix("http://fixture")
+                requests.append((path, request.headers.get("X-admin-token")))
+                if path == "/api/v1/account/overview":
+                    if request.headers.get("X-admin-token") != "fixture-secret-never-log":
+                        raise HTTPError(request.full_url, 401, "unauthorized", {}, io.BytesIO(b"{}"))
+                    return Response(200, b"{}")
+                if path.endswith(".svg"):
+                    return Response(200, b"<svg></svg>")
+                if path.endswith("/health"):
+                    return Response(200, b'{"status":"ok"}')
+                if path.endswith("/readiness"):
+                    return Response(200, b'{"ready":true}')
+                return Response(200, b"{}")
+
+        with patch.object(self.deployment, "config", return_value=self.deployment.model), \
+             patch.object(deploy.urllib.request, "build_opener", return_value=Opener()):
+            deploy.Deployment.smoke(self.deployment, "http://fixture", readiness=True)
+
+        self.assertEqual(
+            [token for path, token in requests if path == "/api/v1/account/overview"],
+            [None, "fixture-secret-never-log"],
+        )
+        self.assertNotIn("fixture-secret-never-log", self.output.getvalue())
 
     def test_backup_is_validated_private_and_has_checksum_manifest(self):
         result = self.deployment.backup()

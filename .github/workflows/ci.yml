@@ -62,6 +62,7 @@ jobs:
           curl --fail --silent http://127.0.0.1:8080/assets/reports/marked.js | grep 'Marked' >/dev/null
           curl --fail --silent http://127.0.0.1:8080/assets/reports/purify.min.js | grep 'DOMPurify' >/dev/null
           python infra/realtime-smoke.py --base-url http://127.0.0.1:8080
+          ./infra/openperpdesk.sh smoke http://127.0.0.1:8080
           docker compose exec -T api python -c \
             'from app.state_store import StateStore; StateStore().set_control_flag("ci_roundtrip", True)'
           ./infra/openperpdesk.sh backup
