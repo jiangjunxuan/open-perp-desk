@@ -40,12 +40,18 @@ async def control_events(
 
 
 async def private_events(store, account, account_client, authorized, rate_scope=lambda: None) -> AsyncIterator[str]:
+    def account_state() -> tuple[bool, bool, bool]:
+        connected = bool(account.connected)
+        authenticated = bool(account.authenticated)
+        ready = bool(getattr(account, "account_ready", connected and authenticated))
+        return connected, authenticated, ready
+
     revision = None
     previous = {}
     heartbeat_at = float("-inf")
     while authorized():
         scope, market_scope = account_client.account_scope, rate_scope()
-        stream_state = (account.connected, account.authenticated, account.account_ready)
+        stream_state = account_state()
         current_revision = (store.revision, scope, market_scope, stream_state)
         if revision is not None and revision[3] != stream_state:
             # Browsers clear live account values on disconnect. Re-send the
@@ -87,7 +93,7 @@ async def private_events(store, account, account_client, authorized, rate_scope=
                 }
             payloads.update(await asyncio.to_thread(read_state))
             if (scope != account_client.account_scope or market_scope != rate_scope()
-                    or stream_state != (account.connected, account.authenticated, account.account_ready)):
+                    or stream_state != account_state()):
                 continue
             revision = current_revision
         if not authorized():
@@ -96,7 +102,7 @@ async def private_events(store, account, account_client, authorized, rate_scope=
             if not authorized():
                 yield event_frame("locked", {})
                 return
-            if stream_state != (account.connected, account.authenticated, account.account_ready):
+            if stream_state != account_state():
                 revision = None
                 previous = {}
                 break

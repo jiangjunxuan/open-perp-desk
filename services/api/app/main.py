@@ -86,6 +86,16 @@ account_reconciler = AccountReconciler(
     state_store,
     notifier=execution_engine.notify_event,
 )
+
+
+def _account_stream_ready() -> bool:
+    return bool(
+        getattr(
+            account_stream,
+            "account_ready",
+            account_stream.connected and account_stream.authenticated,
+        )
+    )
 automation_worker = AutomationWorker(
     market_client,
     account_client,
@@ -212,7 +222,7 @@ def health_metrics() -> dict[str, object]:
             "configured": account_stream.configured,
             "connected": account_stream.connected,
             "authenticated": account_stream.authenticated,
-            "account_ready": account_stream.account_ready,
+            "account_ready": _account_stream_ready(),
             "last_message_at": account_stream.last_message_at,
             "last_error": account_stream.last_error,
         },
@@ -279,7 +289,7 @@ def system_status() -> dict[str, object]:
             "configured": account_stream.configured,
             "connected": account_stream.connected,
             "authenticated": account_stream.authenticated,
-            "account_ready": account_stream.account_ready,
+            "account_ready": _account_stream_ready(),
             "last_message_at": account_stream.last_message_at,
             "last_error": account_stream.last_error,
         },
