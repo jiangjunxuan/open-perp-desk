@@ -385,6 +385,10 @@ CI 基线 `b58edbc` 已在 2026-09-13 实际构建镜像、验证图标、在自
 
 ## 7. 最小上线检查
 
+正式进入真实资金环境前，必须完成并留存
+[`docs/LIVE_APPROVAL_CHECKLIST.md`](LIVE_APPROVAL_CHECKLIST.md)；
+本节只是部署存活检查，不是实盘批准。
+
 - [ ] 域名 HTTPS 可访问
 - [ ] `./infra/openperpdesk.sh preflight` 通过
 - [ ] `/api/v1/health` 返回 `status=ok`

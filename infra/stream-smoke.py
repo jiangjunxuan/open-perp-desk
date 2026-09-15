@@ -14,6 +14,10 @@ from app.okx_market_stream import OkxMarketStream
 async def main() -> None:
     symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
     stream = OkxMarketStream(symbols)
+    destination = ROOT / "outputs" / "public-stream-verification.json"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # A failed probe must not leave a previous successful report that looks current.
+    destination.unlink(missing_ok=True)
     try:
         await stream.start()
         async with asyncio.timeout(30):
@@ -48,8 +52,6 @@ async def main() -> None:
         }
         if not all(row["ticker_instrument_matches"] and row["candle_fields"] >= 6 for row in result["received"]):
             raise RuntimeError("Market evidence is incomplete")
-        destination = ROOT / "outputs" / "public-stream-verification.json"
-        destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
         print(json.dumps(result, ensure_ascii=False, indent=2))
     finally:
