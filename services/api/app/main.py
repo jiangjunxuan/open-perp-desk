@@ -6,7 +6,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Path as RoutePath, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Path as RoutePath, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse
@@ -40,6 +40,7 @@ from .state_store import BillImportBusy, ExposureSnapshotChanged, OrderSnapshotC
 from .safety_control import SafetyController
 from .strategy_engine import StrategyEngine
 from .trading_signal import TradeSignal
+from . import tradingview
 from .realtime import control_events, private_events
 
 
@@ -274,6 +275,7 @@ def system_status() -> dict[str, object]:
             "account_readonly_configured": account_client.configured,
             "account_stream_configured": account_stream.configured,
             "tradingagents_configured": tradingagents.configured,
+            "tradingview": tradingview.status(),
         },
         "market_stream": {
             "connected": market_stream.connected,
@@ -1242,6 +1244,91 @@ class SignalExecutionRequest(BaseModel):
     current_notional: float = Field(default=0.0, ge=0.0)
     size: float = Field(default=1.0, gt=0.0)
     dry_run: bool = False
+
+
+@app.post("/api/v1/integrations/tradingview/webhook", status_code=202)
+async def tradingview_webhook(
+    request: Request,
+    x_tradingview_token: str | None = Header(default=None),
+) -> dict[str, object]:
+    """Receive a TradingView alert without exposing the private admin API."""
+    if not tradingview.enabled():
+        raise HTTPException(status_code=404, detail="tradingview_integration_disabled")
+    if not tradingview.configured():
+        raise HTTPException(status_code=503, detail="tradingview_secret_not_configured")
+    body = await request.body()
+    try:
+        payload = tradingview.parse_body(body)
+    except tradingview.TradingViewWebhookError as exc:
+        state_store.add_audit(
+            "tradingview_webhook_rejected",
+            "TradingView webhook payload was rejected",
+            severity="warning",
+            payload={"code": exc.code},
+        )
+        raise HTTPException(status_code=422, detail=exc.code) from exc
+    if not tradingview.verify_secret(payload, x_tradingview_token):
+        state_store.add_audit(
+            "tradingview_webhook_unauthorized",
+            "TradingView webhook secret did not match",
+            severity="warning",
+        )
+        raise HTTPException(status_code=401, detail="invalid_tradingview_secret")
+    try:
+        signal, size, side, alert_id = tradingview.to_signal(payload, body=body)
+    except tradingview.TradingViewWebhookError as exc:
+        state_store.add_audit(
+            "tradingview_signal_rejected",
+            "TradingView alert could not become a structured signal",
+            severity="warning",
+            payload={"code": exc.code},
+        )
+        raise HTTPException(status_code=422, detail=exc.code) from exc
+    context = tradingview.numeric_context()
+    dry_run = tradingview.execution_dry_run(payload)
+    try:
+        result = await execution_engine.submit_signal(
+            signal,
+            account_equity=context["account_equity"],
+            daily_pnl_pct=context["daily_pnl_pct"],
+            current_notional=context["current_notional"],
+            size=size,
+            dry_run=dry_run,
+            side_override=side,
+            idempotency_key=f"tradingview:{alert_id}",
+            market_data_fresh=market_stream.fresh,
+        )
+    except OkxTradeError as exc:
+        state_store.add_audit(
+            "tradingview_execution_error",
+            "TradingView signal execution returned an exchange error",
+            severity="error",
+            payload={"alert_id": alert_id, "inst_id": signal.inst_id, "error": type(exc).__name__},
+        )
+        raise HTTPException(status_code=502, detail="tradingview_execution_error") from exc
+    state_store.add_audit(
+        "tradingview_signal_processed",
+        "TradingView alert passed through the structured execution boundary",
+        severity="info" if result.get("accepted") else "warning",
+        payload={
+            "alert_id": alert_id,
+            "inst_id": signal.inst_id,
+            "action": signal.action,
+            "dry_run": dry_run,
+            "accepted": bool(result.get("accepted")),
+            "idempotent": bool(result.get("idempotent")),
+            "reasons": result.get("reasons", []),
+        },
+    )
+    return {
+        "accepted": bool(result.get("accepted")),
+        "idempotent": bool(result.get("idempotent")),
+        "dry_run": dry_run,
+        "alert_id": alert_id,
+        "inst_id": signal.inst_id,
+        "action": signal.action,
+        "result": result,
+    }
 
 
 @app.post("/api/v1/execution/signals")

@@ -66,6 +66,7 @@
 - [x] Web 完整研究报告、分页历史筛选、运行时自检与只读研究隔离
 - [ ] TradingAgents 真实模型服务与外部数据工具的端到端研究验收
 - [x] 回测和历史重放
+- [x] TradingView Webhook 信号桥接、合约白名单、过期校验和幂等执行（默认关闭，见 `docs/TRADINGVIEW.md`）
 - [x] 策略配置页面和完整启停联动
 - [x] Web Worker 运行时启停和 Dry Run 安全控制
 - [x] Worker 周期互斥、账户快照失败停机、合约步长与非有限数值边界测试

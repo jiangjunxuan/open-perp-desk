@@ -1893,6 +1893,18 @@ function applyStatus(status) {
   setState("#state-proxy", status.integrations?.outbound_proxy_configured ? "已配置" : "未配置", status.integrations?.outbound_proxy_configured ? "good" : "neutral");
   setState("#state-pushplus", status.integrations?.pushplus_configured ? "已配置" : "未配置", status.integrations?.pushplus_configured ? "good" : "neutral");
   setState("#state-ai", status.integrations?.tradingagents_configured ? "已配置" : "未启用", status.integrations?.tradingagents_configured ? "good" : "neutral");
+  const tradingView = status.integrations?.tradingview || {};
+  setState(
+    "#state-tradingview",
+    !tradingView.enabled
+      ? "未启用"
+      : !tradingView.configured
+        ? "待配置"
+        : tradingView.dry_run ? "模拟信号" : "已启用",
+    !tradingView.enabled || !tradingView.configured
+      ? "neutral"
+      : tradingView.dry_run ? "warning" : "good",
+  );
   const algoStream = status.algo_stream || {};
   const algoStreamReady = algoStream.connected && algoStream.authenticated;
   setState(

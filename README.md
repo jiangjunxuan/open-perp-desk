@@ -145,6 +145,7 @@ K 线画布非空、关注合约切换、暂停刷新、账单原币种金额及
 并断言没有向测试交易所发送任何变更请求。截图、报告与日志保存在 `work/ci-ui-artifacts/`，
 不会覆盖 `outputs/` 中真实公共行情的验收截图。它不代替真实 OKX 模拟盘联调。
 图表标记的范围与使用方式见 [`docs/CHART_ANNOTATIONS.md`](docs/CHART_ANNOTATIONS.md)。
+TradingView Alert 接入、JSON 格式和默认安全边界见 [`docs/TRADINGVIEW.md`](docs/TRADINGVIEW.md)。
 
 控制台使用本地图标资源，不依赖外部图标 CDN。同版本资源可通过
 `node infra/vendor-icons.mjs` 重新获取。
@@ -176,7 +177,7 @@ REST/WebSocket/PushPlus 测试服务。不会读取现有交易凭据或连接�
 
 本次工作树验证结果：
 
-- API 单元和集成测试：745 个全部通过（提交 `c652565` 的 GitHub CI）。
+- API 单元和集成测试：751 个全部通过（包含 TradingView Webhook 桥接测试）。
 - Demo 交易闭环：9 个场景全部通过，覆盖幂等发单、成交、原生保护、
   Worker、急停、进程崩溃恢复和禁止重复发单。
 - TradingAgents：真实图和结构化协议通过本地模型夹具，11 次调用均带
