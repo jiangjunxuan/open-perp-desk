@@ -7,6 +7,8 @@ from typing import Any
 
 import httpx
 
+from .http_transport import proxy_cleanup_trace
+
 
 class OkxMarketError(RuntimeError):
     """Raised when an OKX public market request cannot be completed."""
@@ -52,11 +54,14 @@ class OkxMarketClient:
                 timeout=httpx.Timeout(10.0, connect=5.0),
                 headers=headers,
             ) as client:
-                response = await client.get(f"{self.base_url}{path}", params=params)
+                response = await client.get(
+                    f"{self.base_url}{path}", params=params,
+                    extensions={"trace": proxy_cleanup_trace()},
+                )
                 response.raise_for_status()
                 payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
-            raise OkxMarketError(f"OKX market request failed: {exc}") from exc
+            raise OkxMarketError(f"OKX market request failed: {type(exc).__name__}") from None
 
         if payload.get("code") != "0":
             raise OkxMarketError(payload.get("msg") or "OKX returned an unknown error")

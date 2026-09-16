@@ -14,15 +14,18 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from unittest.mock import patch
 
+import httpx
+from httpcore._backends.auto import AutoBackend
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
-from app.okx_account import OkxAccountClient
+from app.okx_account import OkxAccountClient, OkxAccountError
 from app.okx_account_stream import OkxAccountStream
 from app.okx_algo_stream import OkxAlgoOrderStream
+from app.okx_market import OkxMarketClient, OkxMarketError
 from app.okx_market_stream import OkxMarketStream
-from app.okx_trade import OkxTradeClient, OrderRequest
+from app.okx_trade import OkxTradeClient, OkxTradeError, OrderRequest
 from app.okx_websocket import socket_messages, websocket_tls
 from app.pushplus import PushPlusClient
 
@@ -474,16 +477,86 @@ class ProxyTransportTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_proxy_authentication_failure_fails_closed(self):
         for kind in ("http", "socks5"):
-            async with local_proxy(kind, set()) as (url, requests):
-                env = LocalExchange.environment(9, url.replace("fixture-password", "wrong"))
-                with patch.dict(os.environ, env, clear=True):
-                    stream = OkxMarketStream(["BTC-USDT-SWAP"])
-                try:
-                    await stream.start()
-                    await wait_for(lambda: stream.last_error and stream.candles_last_error)
-                    self.assertFalse(stream.connected or stream.candles_connected or stream.fresh)
-                    self.assertEqual(requests, [])
-                    self.assertNotIn("wrong", json.dumps(stream.snapshot()))
-                    self.assertNotIn("fixture-user", json.dumps(stream.snapshot()))
-                finally:
-                    await stream.stop()
+            with self.subTest(proxy=kind):
+                exchange = LocalExchange()
+                direct_requests = []
+
+                async def rest(reader, writer):
+                    try:
+                        raw = await reader.readuntil(b"\r\n\r\n")
+                        direct_requests.append(raw.split(b"\r\n", 1)[0])
+                        payload = b'{"code":"0","data":[{"instId":"BTC-USDT-SWAP","last":"100"}]}'
+                        writer.write(
+                            f"HTTP/1.1 200 OK\r\nContent-Length: {len(payload)}\r\n"
+                            "Connection: close\r\n\r\n".encode() + payload
+                        )
+                        await writer.drain()
+                    finally:
+                        writer.close()
+                        await writer.wait_closed()
+
+                rest_server = await asyncio.start_server(rest, "127.0.0.1", 0)
+                async with rest_server, serve(exchange.handler, "127.0.0.1", 0) as ws_server:
+                    rest_port = rest_server.sockets[0].getsockname()[1]
+                    ws_port = ws_server.sockets[0].getsockname()[1]
+                    base = f"http://127.0.0.1:{rest_port}"
+                    async with httpx.AsyncClient(trust_env=False) as direct:
+                        self.assertEqual((await direct.get(base)).status_code, 200)
+                    direct_requests.clear()
+                    async with local_proxy(kind, {rest_port, ws_port}) as (url, requests):
+                        env = {
+                            **exchange.environment(ws_port, url.replace("fixture-password", "wrong")),
+                            "OKX_REST_BASE_URL": base,
+                            "EXECUTION_ENABLED": "true", "TRADING_MODE": "demo",
+                            "LIVE_TRADING_ENABLED": "false",
+                        }
+                        with patch.dict(os.environ, env, clear=True):
+                            stream = OkxMarketStream(["BTC-USDT-SWAP"])
+                            account, algo = OkxAccountStream(), OkxAlgoOrderStream()
+                            market_rest = OkxMarketClient()
+                            account_rest, trade = OkxAccountClient(), OkxTradeClient()
+                        opened = []
+                        original_connect = AutoBackend.connect_tcp
+
+                        async def track_connect(backend, *args, **kwargs):
+                            connection = await original_connect(backend, *args, **kwargs)
+                            opened.append((connection, connection.get_extra_info("socket")))
+                            return connection
+
+                        tracker = patch.object(AutoBackend, "connect_tcp", track_connect)
+                        tracker.start()
+                        try:
+                            await asyncio.gather(stream.start(), account.start(), algo.start())
+                            operations = (
+                                (lambda: market_rest.ticker("BTC-USDT-SWAP"), OkxMarketError),
+                                (account_rest.balance, OkxAccountError),
+                                (lambda: trade.place_order(OrderRequest(
+                                    inst_id="BTC-USDT-SWAP", side="buy", sz=1,
+                                    stop_loss=95, take_profit=110,
+                                )), OkxTradeError),
+                            )
+                            for operation, error_type in operations:
+                                with self.assertRaises(error_type) as raised:
+                                    await operation()
+                                self.assertNotIn("fixture-user", str(raised.exception))
+                                self.assertNotIn("wrong", str(raised.exception))
+                            await wait_for(lambda: all((
+                                stream.last_error, stream.candles_last_error,
+                                account.last_error, algo.last_error,
+                            )))
+                            self.assertFalse(any((
+                                stream.connected, stream.candles_connected, stream.fresh,
+                                account.authenticated, algo.authenticated,
+                            )))
+                            self.assertEqual(requests, [])
+                            self.assertEqual(direct_requests, [])
+                            self.assertEqual(exchange.connection_count, {})
+                            self.assertEqual(len(opened), 3)
+                            self.assertTrue(all(sock.fileno() == -1 for _, sock in opened))
+                            for client in (stream, account, algo):
+                                self.assertNotIn("wrong", json.dumps(client.snapshot()))
+                                self.assertNotIn("fixture-user", json.dumps(client.snapshot()))
+                        finally:
+                            tracker.stop()
+                            await asyncio.gather(*(connection.aclose() for connection, _ in opened))
+                            await asyncio.gather(stream.stop(), account.stop(), algo.stop())

@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from .historical_ledger import DAY_MS, day_ms
+from .http_transport import proxy_cleanup_trace
 
 
 MAX_DOWNLOAD_BYTES = 32 * 1024 * 1024
@@ -146,7 +147,7 @@ class BillArchiveDownloader:
                 ) as client:
                     async with client.stream(
                         "GET", target, headers={"Host": host, "Accept-Encoding": "identity"},
-                        extensions={"sni_hostname": host},
+                        extensions={"sni_hostname": host, "trace": proxy_cleanup_trace()},
                     ) as response:
                         if response.status_code != 200 or response.headers.get("content-encoding", "identity") != "identity":
                             raise BillArchiveError("archive_download_rejected")

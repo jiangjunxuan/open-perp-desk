@@ -152,6 +152,12 @@ PUSHPLUS_PROXY_URL=http://user:password@proxy.example.com:8080
 代理凭据只写入服务器 `.env`，并确保 `chmod 600 .env`。系统状态接口只返回
 是否配置代理，不返回代理地址。
 
+代理认证失败不会回退为直连，行情 REST 传输异常只返回异常类型，不返回代理配置。
+SOCKS5 握手失败时会主动清理尚未交给 HTTP 连接管理的套接字；相关处理使用
+固定版本 `httpcore` 的请求级 trace 扩展。升级 HTTP 依赖时，必须重跑
+`test_http_transport`、`test_market_transport_safety` 和 `test_okx_stream_transport`，
+确认连接释放、错误脱敏、取消和禁止直连行为不变。
+
 公共报价使用 `OKX_WS_PUBLIC_URL`（默认 `/ws/v5/public`），公共 1 分钟 K 线
 使用 `OKX_WS_CANDLES_URL`（默认 `/ws/v5/business`），两者独立连接和记录新鲜度。
 `OKX_WS_BUSINESS_URL` 则用于需要登录的止盈止损订单流，留空时按 Demo/实盘

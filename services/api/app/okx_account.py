@@ -11,6 +11,8 @@ from urllib.parse import urlencode
 
 import httpx
 
+from .http_transport import proxy_cleanup_trace
+
 
 class OkxAccountError(RuntimeError):
     """Raised when a signed OKX account request cannot be completed."""
@@ -151,6 +153,7 @@ class OkxAccountClient:
             ) as client:
                 response = await client.request(
                     method, f"{self.base_url}{path}", params=params, content=body or None,
+                    extensions={"trace": proxy_cleanup_trace()},
                 )
                 response.raise_for_status()
                 payload = response.json()

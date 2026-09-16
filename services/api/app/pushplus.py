@@ -5,6 +5,8 @@ from typing import Any
 
 import httpx
 
+from .http_transport import proxy_cleanup_trace
+
 
 class PushPlusError(RuntimeError):
     """Safe failure metadata; upstream messages and URLs never leave this client."""
@@ -55,7 +57,10 @@ class PushPlusClient:
                 transport=self.transport,
                 timeout=httpx.Timeout(10.0, connect=5.0),
             ) as client:
-                async with client.stream("POST", self.base_url, json=payload) as response:
+                async with client.stream(
+                    "POST", self.base_url, json=payload,
+                    extensions={"trace": proxy_cleanup_trace()},
+                ) as response:
                     response.raise_for_status()
                     body = bytearray()
                     async for chunk in response.aiter_bytes(8192):

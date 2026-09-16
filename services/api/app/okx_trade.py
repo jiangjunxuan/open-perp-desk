@@ -11,6 +11,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .live_safety import LiveSafetyGate
+from .http_transport import proxy_cleanup_trace
 from .position_protection import attached_algo_client_id
 
 
@@ -194,7 +195,10 @@ class OkxTradeClient:
                 timeout=httpx.Timeout(10.0, connect=5.0),
                 headers=self._headers(timestamp, path, body),
             ) as client:
-                response = await client.post(f"{self.base_url}{path}", content=body)
+                response = await client.post(
+                    f"{self.base_url}{path}", content=body,
+                    extensions={"trace": proxy_cleanup_trace()},
+                )
                 response.raise_for_status()
                 payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
