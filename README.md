@@ -164,6 +164,16 @@ TradingView Alert 接入、JSON 格式和默认安全边界见 [`docs/TRADINGVIE
 HTTP/SOCKS5 测试代理，覆盖 REST 签名、四路 WebSocket、止盈止损参数、
 PushPlus 传输和重连。它不替代真实 OKX Demo 或微信送达验收。
 
+配置 `OKX_PROXY_URL` 后，可以用下面的只读命令同时验收 OKX REST、报价和多周期
+K 线是否经出站代理连通：
+
+```bash
+.venv/bin/python infra/proxy-smoke.py --timeout 45
+```
+
+结果写入权限为 `600` 的 `outputs/proxy-verification.json`，报告只包含代理协议、
+连接状态和记录数量，不包含代理地址、用户名或密码；该命令不会登录私有账户或发单。
+
 完整交易闭环本地联调：
 
 ```bash

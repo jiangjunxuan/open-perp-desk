@@ -162,6 +162,16 @@ SOCKS5 握手失败时会主动清理尚未交给 HTTP 连接管理的套接字�
 使用 `OKX_WS_CANDLES_URL`（默认 `/ws/v5/business`），两者独立连接和记录新鲜度。
 `OKX_WS_BUSINESS_URL` 则用于需要登录的止盈止损订单流，留空时按 Demo/实盘
 选择地址，不要将它与公共 K 线端点混淆。所有连接共用 `OKX_PROXY_URL`。
+
+部署后可先运行只读代理验收：
+
+```bash
+python infra/proxy-smoke.py --timeout 45
+```
+
+它会同时验证 OKX REST、公共报价和 `1m`、`15m`、`1H`、`4H` K 线；
+只输出脱敏连接证据，不读取私有账户，不执行交易。
+
 WebSocket 非本机端点必须使用 `wss://` 并校验证书；`ws://` 仅允许
 回环目标与本机测试代理。
 
