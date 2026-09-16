@@ -84,7 +84,9 @@ async function evaluate(expression) {
 
 try {
   let target;
-  for (let attempt = 0; attempt < 120; attempt++) {
+  // Shared CI runners can take longer to initialize headless Chrome while
+  // installing fonts. Keep the browser acceptance bounded, but allow 30s.
+  for (let attempt = 0; attempt < 300; attempt++) {
     if (spawnError) throw spawnError;
     if (chrome.exitCode !== null) {
       throw new Error(`Chrome exited before CDP startup (${chrome.exitCode}): ${chromeStderr.join("").slice(-3000)}`);
