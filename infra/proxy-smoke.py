@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import json
+import math
 import os
 import stat
 import sys
@@ -52,28 +53,51 @@ async def rest_probe(client: OkxMarketClient, symbol: str) -> dict:
     }
 
 
+def websocket_records(stream: OkxMarketStream) -> dict | None:
+    snapshots = {bar: stream.browser_snapshot(bar) for bar in stream.candle_bars}
+    if not snapshots or not stream.fresh or not stream.candles_fresh:
+        return None
+    quotes = next(iter(snapshots.values()))["tickers"]
+    records = {}
+    for symbol in stream.symbols:
+        quote = quotes.get(symbol)
+        candles = {bar: snapshot["candles"].get(symbol) for bar, snapshot in snapshots.items()}
+        if not quote or not quote["fresh"] or any(
+            not candle or not candle["fresh"] for candle in candles.values()
+        ):
+            return None
+        if quote["data"].get("instId") != symbol:
+            raise RuntimeError("ticker_instrument_mismatch")
+        price = float(quote["data"].get("last", "0"))
+        if not math.isfinite(price) or price <= 0:
+            raise RuntimeError("ticker_payload_invalid")
+        for bar, candle in candles.items():
+            row = candle["data"]
+            if candle["inst_id"] != symbol or candle["channel"] != f"candle{bar}":
+                raise RuntimeError("candle_subscription_mismatch")
+            if not isinstance(row, list) or len(row) < 6:
+                raise RuntimeError("candle_payload_invalid")
+            values = [float(value) for value in row[:6]]
+            if any(not math.isfinite(value) for value in values) or any(
+                value <= 0 for value in values[:5]
+            ) or values[5] < 0:
+                raise RuntimeError("candle_payload_invalid")
+        records[symbol] = {"quote": quote, "candles": candles}
+    return records
+
+
 async def websocket_probe(stream: OkxMarketStream, timeout: float) -> dict:
-    await stream.start()
     try:
+        await stream.start()
         async with asyncio.timeout(timeout):
-            while not (
-                stream.fresh
-                and stream.candles_fresh
-                and all(
-                    symbol in stream.tickers and symbol in stream.candles
-                    for symbol in stream.symbols
-                )
-            ):
+            while (before := websocket_records(stream)) is None:
                 await asyncio.sleep(0.1)
-        before = {
-            symbol: stream.tickers[symbol]["received_at"]
-            for symbol in stream.symbols
-        }
         await asyncio.sleep(2)
-        if not stream.fresh or not stream.candles_fresh:
+        after = websocket_records(stream)
+        if after is None:
             raise RuntimeError("websocket_stream_stale")
         if any(
-            stream.tickers[symbol]["received_at"] == before[symbol]
+            after[symbol]["quote"]["received_at"] == before[symbol]["quote"]["received_at"]
             for symbol in stream.symbols
         ):
             raise RuntimeError("ticker_stream_not_advancing")
@@ -85,6 +109,14 @@ async def websocket_probe(stream: OkxMarketStream, timeout: float) -> dict:
             "symbols": stream.symbols,
             "candle_bars": list(stream.candle_bars),
             "quotes_advanced": True,
+            "received": [
+                {
+                    "instrument": symbol,
+                    "quote_fresh": record["quote"]["fresh"],
+                    "fresh_candle_bars": list(record["candles"]),
+                }
+                for symbol, record in after.items()
+            ],
         }
     finally:
         await stream.stop()
