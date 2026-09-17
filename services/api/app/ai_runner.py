@@ -147,6 +147,11 @@ def _market_context_prompt(context: dict[str, Any]) -> str:
 def run_request(request: dict[str, Any]) -> dict[str, Any]:
     source = Path(request["source_path"]).resolve()
     _install_data_guards(int(request.get("data_timeout_seconds", 8)))
+    # The runner is launched as an isolated script, so make its sibling bridge
+    # importable without inheriting the parent API process environment.
+    sys.path.insert(0, str(Path(__file__).parent))
+    from tradingagents_okx_bridge import install_okx_bridge
+
     sys.path.insert(0, str(source))
     from tradingagents.default_config import DEFAULT_CONFIG
     from tradingagents.graph.trading_graph import TradingAgentsGraph
@@ -154,6 +159,8 @@ def run_request(request: dict[str, Any]) -> dict[str, Any]:
     config = copy.deepcopy(DEFAULT_CONFIG)
     config.update(request["config"])
     config["checkpoint_enabled"] = False
+    context = request.get("market_context") or {}
+    install_okx_bridge(context, config)
     for key in ("results_dir", "data_cache_dir"):
         Path(config[key]).mkdir(parents=True, exist_ok=True, mode=0o700)
     Path(config["memory_log_path"]).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -171,7 +178,6 @@ def run_request(request: dict[str, Any]) -> dict[str, Any]:
         }
     inst_id = request["inst_id"]
     ticker = _tradingagents_ticker(inst_id)
-    context = request.get("market_context") or {}
     evidence = _market_context_prompt(context)
     resolver = graph.resolve_instrument_context
 

@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -11,6 +12,7 @@ import httpx
 
 from app.ai_analysis import AIAnalysisError, TradingAgentsAdapter
 from app import main as api_main
+from app import tradingagents_okx_bridge
 
 
 class TradingAgentsConfigTests(unittest.TestCase):
@@ -340,6 +342,55 @@ class AIMarketContextTests(unittest.TestCase):
         self.assertEqual(context["candle_count"], 1)
         self.assertEqual(context["errors"], ["funding_rate"])
         self.assertEqual(context["open_interest"]["oi"], "12")
+
+
+class OkxBridgeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.previous_context = tradingagents_okx_bridge._CONTEXT
+        base = datetime(2026, 9, 17, tzinfo=timezone.utc)
+        rows = []
+        for index in range(220):
+            timestamp = int((base + timedelta(minutes=15 * index)).timestamp() * 1000)
+            close = 100 + index / 10
+            rows.append([
+                str(timestamp), str(close), str(close + 1), str(close - 1),
+                str(close + 0.5), "10", "0", "0", "1",
+            ])
+        tradingagents_okx_bridge._CONTEXT = {
+            "inst_id": "BTC-USDT-SWAP",
+            "bar": "15m",
+            "captured_at": "2026-09-17T00:00:00+00:00",
+            "candles": list(reversed(rows)),
+            "funding_rate": {"fundingRate": "0.001"},
+            "open_interest": {"oi": "12"},
+        }
+
+    def tearDown(self) -> None:
+        tradingagents_okx_bridge._CONTEXT = self.previous_context
+
+    def test_okx_rows_feed_csv_indicators_and_verified_snapshot(self) -> None:
+        csv_text = tradingagents_okx_bridge._stock_data(
+            "BTC-USD", "2026-09-17", "2026-09-17"
+        )
+        self.assertIn("# OKX perpetual data for BTC-USDT-SWAP", csv_text)
+        self.assertLess(csv_text.index("2026-09-17T00:00:00+00:00"), csv_text.index("2026-09-17T00:15:00+00:00"))
+
+        indicator_text = tradingagents_okx_bridge._indicators(
+            "BTC-USD", "rsi", "2026-09-17", 5
+        )
+        self.assertIn("OKX rsi values", indicator_text)
+        self.assertIn("100", indicator_text)
+
+        snapshot = tradingagents_okx_bridge._verified_snapshot("BTC-USD", "2026-09-17")
+        self.assertIn("Verified OKX market snapshot", snapshot)
+        self.assertIn("close_200_sma", snapshot)
+        self.assertIn("Funding rate: 0.001", snapshot)
+
+    def test_okx_bridge_rejects_a_different_instrument(self) -> None:
+        result = tradingagents_okx_bridge._stock_data(
+            "ETH-USD", "2026-09-17", "2026-09-17"
+        )
+        self.assertIn("DATA_UNAVAILABLE", result)
 
 
 if __name__ == "__main__":
