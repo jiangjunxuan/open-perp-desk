@@ -236,6 +236,12 @@ SHA-256 清单；`restore` 先保存旧库，再强制以禁用执行、停用 W
 API 容器的连接配置做只读 REST/私有 WebSocket 验收，输出受保护的连接与记录数量报告。
 此检查不下单，也不等同于真实 Demo 的成交与保护闭环验收。
 
+生产可在 `.env` 中设置
+`OPENPERPDESK_COMPOSE_OVERLAY=docker-compose.release.yml`、
+`OPENPERPDESK_API_IMAGE` 和 `OPENPERPDESK_WEB_IMAGE` 固定已验收的 release
+镜像。部署脚本会自动跳过 `--build`，后续 `up`、`restart`、备份和恢复沿用同一
+镜像选择；开发环境不设置覆盖文件时仍使用源码构建。
+
 ## 开源协议
 
 MIT，详见 `LICENSE`。

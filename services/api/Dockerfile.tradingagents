@@ -15,9 +15,19 @@ COPY services/api/tradingagents-constraints.txt /tmp/tradingagents-constraints.t
 RUN pip install --no-cache-dir --index-url "$API_PIP_INDEX_URL" -r /tmp/openperpdesk-requirements.txt \
     && apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
-    && git clone --depth 1 "${TRADINGAGENTS_REPOSITORY}" /opt/tradingagents \
-    && git -C /opt/tradingagents fetch --depth 1 origin "${TRADINGAGENTS_REF}" \
-    && git -C /opt/tradingagents checkout --detach "${TRADINGAGENTS_REF}" \
+    && mkdir -p /opt/tradingagents \
+    && git -C /opt/tradingagents init \
+    && git -C /opt/tradingagents remote add origin "${TRADINGAGENTS_REPOSITORY}" \
+    && fetched=0 \
+    && for attempt in 1 2 3 4 5; do \
+         if git -c protocol.version=2 -C /opt/tradingagents fetch --depth 1 --no-tags origin "${TRADINGAGENTS_REF}"; then \
+           fetched=1; \
+           break; \
+         fi; \
+         if [ "$attempt" -lt 5 ]; then sleep "$((attempt * 5))"; fi; \
+       done \
+    && test "$fetched" = 1 \
+    && git -C /opt/tradingagents checkout --detach FETCH_HEAD \
     && pip install --no-cache-dir --index-url "$API_PIP_INDEX_URL" -c /tmp/tradingagents-constraints.txt /opt/tradingagents \
     && apt-get purge -y --auto-remove git \
     && rm -rf /var/lib/apt/lists/* /root/.cache

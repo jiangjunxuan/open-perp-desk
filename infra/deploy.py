@@ -30,6 +30,25 @@ class DeploymentError(RuntimeError):
     pass
 
 
+def env_file_value(path: Path, name: str) -> str:
+    """Read one non-secret selector without evaluating the environment file."""
+    if not path.is_file():
+        return ""
+    prefix = f"{name}="
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or not line.startswith(prefix):
+                continue
+            value = line[len(prefix):].strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            return value
+    except (OSError, UnicodeError):
+        return ""
+    return ""
+
+
 def effective_environment(config: dict) -> dict:
     environment = config.get("services", {}).get("api", {}).get("environment")
     if not isinstance(environment, dict):
@@ -70,6 +89,9 @@ def validate_config(config: dict, *, recovery: bool = False) -> dict:
             failures.append("Non-dry-run automation requires enabled Demo execution")
     if booleans["TRADINGAGENTS_ENABLED"] and not environment.get("TRADINGAGENTS_PATH", "").strip():
         failures.append("TradingAgents requires TRADINGAGENTS_PATH")
+    prebuilt = environment.get("OPENPERPDESK_USE_PREBUILT_IMAGES", "false").strip().lower()
+    if prebuilt not in {"true", "false"}:
+        failures.append("OPENPERPDESK_USE_PREBUILT_IMAGES must be true or false")
     for name, default in {
         "TRADINGVIEW_ENABLED": "false",
         "TRADINGVIEW_EXECUTION_ENABLED": "false",
@@ -171,7 +193,22 @@ class Deployment:
         self.root = root
         self.env_file = Path(os.getenv("OPENPERPDESK_ENV_FILE", root / ".env")).absolute()
         self.backup_dir = Path(os.getenv("OPENPERPDESK_BACKUP_DIR", root / "backups")).absolute()
-        self.command = ["docker", "compose", "--env-file", str(self.env_file)]
+        overlay = os.getenv("OPENPERPDESK_COMPOSE_OVERLAY", "").strip()
+        if not overlay:
+            overlay = env_file_value(self.env_file, "OPENPERPDESK_COMPOSE_OVERLAY").strip()
+        self.overlay_file = None
+        if overlay:
+            candidate = Path(overlay)
+            self.overlay_file = candidate if candidate.is_absolute() else self.root / candidate
+            self.overlay_file = self.overlay_file.absolute()
+            if not self.overlay_file.is_relative_to(self.root):
+                raise DeploymentError("Compose overlay must be inside the project directory.")
+        self.command = [
+            "docker", "compose", "--env-file", str(self.env_file),
+            "-f", str(self.root / "docker-compose.yml"),
+        ]
+        if self.overlay_file:
+            self.command.extend(["-f", str(self.overlay_file)])
 
     def require_environment_file(self) -> None:
         if not self.env_file.is_file():
@@ -201,9 +238,16 @@ class Deployment:
 
     def preflight(self, *, recovery: bool = False) -> dict:
         environment = validate_config(self.config(), recovery=recovery)
+        if environment.get("OPENPERPDESK_USE_PREBUILT_IMAGES", "false").lower() == "true":
+            if self.overlay_file is None:
+                raise DeploymentError("Prebuilt image mode requires OPENPERPDESK_COMPOSE_OVERLAY.")
+            if not self.overlay_file.is_file():
+                raise DeploymentError("Configured Compose overlay does not exist.")
         print(f"Preflight passed: mode={environment['TRADING_MODE'].lower()}, "
               f"execution={environment['EXECUTION_ENABLED'].lower()}, "
-              f"auto_dry_run={environment['AUTO_TRADING_DRY_RUN'].lower()}; secrets redacted.")
+              f"auto_dry_run={environment['AUTO_TRADING_DRY_RUN'].lower()}, "
+              f"prebuilt_images={environment.get('OPENPERPDESK_USE_PREBUILT_IMAGES', 'false').lower()}; "
+              "secrets redacted.")
         return environment
 
     @contextmanager
@@ -446,8 +490,12 @@ def main() -> None:
             elif args.command == "down":
                 deployment.compose("down", stdout=None)
             else:
-                deployment.preflight()
-                deployment.compose("up", "-d", "--build", "--wait", "--wait-timeout", "90", stdout=None, timeout=None)
+                environment = deployment.preflight()
+                arguments = ["up", "-d"]
+                if environment.get("OPENPERPDESK_USE_PREBUILT_IMAGES", "false").lower() != "true":
+                    arguments.append("--build")
+                arguments.extend(["--wait", "--wait-timeout", "90"])
+                deployment.compose(*arguments, stdout=None, timeout=None)
                 deployment.compose("exec", "-T", "web", "nginx", "-s", "reload")
 
 

@@ -242,6 +242,37 @@ class DeploymentConfigTests(unittest.TestCase):
             with self.subTest(binding=binding), self.assertRaises(deploy.DeploymentError):
                 deploy.binding_origin(binding)
 
+    def test_prebuilt_mode_requires_a_compose_overlay(self):
+        model = configuration()
+        environment = model["services"]["api"]["environment"]
+        environment["OPENPERPDESK_USE_PREBUILT_IMAGES"] = "true"
+        deploy.validate_config(model)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".env").write_text(
+                "OPENPERPDESK_COMPOSE_OVERLAY=missing.yml\n",
+                encoding="utf-8",
+            )
+            (root / ".env").chmod(0o600)
+            deployment = deploy.Deployment(root)
+            deployment.model = model
+            deployment.config = lambda: model
+            with self.assertRaisesRegex(deploy.DeploymentError, "does not exist"):
+                deployment.preflight()
+
+    def test_env_file_selector_is_not_shell_evaluated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text(
+                "OPENPERPDESK_COMPOSE_OVERLAY='docker-compose.release.yml'\n"
+                "RUN_THIS=$(touch /tmp/openperpdesk-should-not-exist)\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                deploy.env_file_value(path, "OPENPERPDESK_COMPOSE_OVERLAY"),
+                "docker-compose.release.yml",
+            )
+
 
 class DeploymentCommandTests(unittest.TestCase):
     def setUp(self):
@@ -260,6 +291,29 @@ class DeploymentCommandTests(unittest.TestCase):
             self.deployment.preflight()
         self.assertEqual(self.deployment.calls, [("config", "--format", "json")])
         self.assertNotIn("fixture-secret", self.output.getvalue())
+
+    def test_prebuilt_preflight_reports_mode_without_building(self):
+        environment = self.deployment.model["services"]["api"]["environment"]
+        environment["OPENPERPDESK_USE_PREBUILT_IMAGES"] = "true"
+        overlay = self.root / "release.yml"
+        overlay.write_text("services: {}\n", encoding="utf-8")
+        self.deployment.overlay_file = overlay
+        result = self.deployment.preflight()
+        self.assertEqual(result["OPENPERPDESK_USE_PREBUILT_IMAGES"], "true")
+        self.assertIn("prebuilt_images=true", self.output.getvalue())
+
+    def test_prebuilt_restart_does_not_request_a_build(self):
+        environment = self.deployment.model["services"]["api"]["environment"]
+        environment["OPENPERPDESK_USE_PREBUILT_IMAGES"] = "true"
+        overlay = self.root / "release.yml"
+        overlay.write_text("services: {}\n", encoding="utf-8")
+        self.deployment.overlay_file = overlay
+        with patch.object(deploy.sys, "argv", ["deploy", "restart"]), \
+             patch.object(deploy, "Deployment", return_value=self.deployment):
+            deploy.main()
+        up_calls = [call for call in self.deployment.calls if call and call[0] == "up"]
+        self.assertEqual(len(up_calls), 1)
+        self.assertNotIn("--build", up_calls[0])
 
     def test_preflight_enforces_environment_file_permissions(self):
         self.deployment.env_file.chmod(0o644)

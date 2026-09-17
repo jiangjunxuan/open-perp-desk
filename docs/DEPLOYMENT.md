@@ -70,6 +70,23 @@ Live 模式必须保持 `OKX_DEMO=false`；需要执行时才额外要求
 401，以及使用已配置管理员令牌后能够通过鉴权；账户凭据未配置时允许接口返回
 明确的只读空态。
 
+### 预构建 release 镜像
+
+生产发布可以把已经构建并验收的镜像固定在受保护的 Compose 覆盖文件中，
+避免后续执行普通 `up` 或 `restart` 时重新构建源码或回退到旧标签：
+
+```dotenv
+OPENPERPDESK_COMPOSE_OVERLAY=docker-compose.release.yml
+OPENPERPDESK_API_IMAGE=openperpdesk-api:release-<commit>
+OPENPERPDESK_WEB_IMAGE=openperpdesk-web:release-<commit>
+```
+
+将这三项写入服务器 `.env` 后，部署脚本会自动加载覆盖文件，预检会显示
+`prebuilt_images=true`，并跳过 `--build`。覆盖文件必须位于项目目录内，
+且两个镜像必须已存在；预检或 Compose 解析失败时不会重启服务。源代码开发
+环境保持 `OPENPERPDESK_COMPOSE_OVERLAY` 为空、使用默认 `latest` 镜像和
+`up --build`。
+
 `api` 和 `web` 都带有 Compose healthcheck；API 的优雅停止时间为 30 秒，
 Web 为 15 秒，便于升级时让 WebSocket 和正在处理的请求自然结束。
 Uvicorn 在 20 秒后终止仍未结束的连接，避免空闲 SSE 阻止容器退出；
@@ -227,6 +244,11 @@ TradingAgents 是可选分析依赖，不应阻塞结构化策略和风控链。
    docker compose -f docker-compose.yml \
      -f docker-compose.tradingagents.yml build api
    ```
+
+   `services/api/Dockerfile.tradingagents` 使用固定提交初始化 Git 工作树，
+   对网络 fetch 最多重试五次，并在成功后才安装源码；因此一次临时 GitHub
+   网络错误不会留下半成品构建。生产仍应固定已测试的 commit，并保留旧镜像
+   作为回滚目标。
 
 2. 将已安装并经过兼容性测试的 TradingAgents 源码挂载到 API 容器的
    `TRADINGAGENTS_PATH`。
