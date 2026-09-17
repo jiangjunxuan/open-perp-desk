@@ -70,6 +70,10 @@ class TradingAgentsAdapter:
         self.last_error: str | None = None
         self._tasks: set[asyncio.Task] = set()
         self._configuration_error = False
+        self.run_mode = os.getenv("TRADINGAGENTS_RUN_MODE", "full").strip().lower() or "full"
+        if self.run_mode not in {"fast", "full"}:
+            self._configuration_error = True
+            self.run_mode = "full"
         self.config: dict[str, Any] = {"output_language": "Chinese", "checkpoint_enabled": False}
         for name, key in CONFIG_ENV.items():
             value = os.getenv(name, "").strip()
@@ -136,6 +140,7 @@ class TradingAgentsAdapter:
             "enabled": self.enabled, "configured": self.configured,
             "runtime_state": self.runtime_state, "busy": bool(self._tasks),
             "last_error": self.configuration_error or self.last_error,
+            "run_mode": self.run_mode,
             "timeout_seconds": self.timeout_seconds,
             "data_timeout_seconds": self.data_timeout_seconds,
             "execution_authorized": False,
@@ -172,6 +177,7 @@ class TradingAgentsAdapter:
         try:
             payload = json.dumps({
                 **request, "source_path": str(Path(self.path).absolute()), "config": self.config,
+                "run_mode": self.run_mode,
                 "parent_pid": os.getpid(), "timeout_seconds": self.timeout_seconds,
                 "data_timeout_seconds": self.data_timeout_seconds,
             }, ensure_ascii=True, allow_nan=False).encode()
@@ -291,4 +297,5 @@ class TradingAgentsAdapter:
             self.runtime_state = "failed"
             raise AIAnalysisError("invalid_result")
         data.update(source="TradingAgents", bias="research", signal={}, execution_authorized=False)
+        data.setdefault("mode", self.run_mode)
         return data

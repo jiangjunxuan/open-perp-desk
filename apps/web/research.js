@@ -21,11 +21,14 @@ const runtimeErrors = {
   source_missing: "TradingAgents 源码未配置",
   runtime_missing: "独立 Python 运行环境不可用",
   invalid_config: "运行参数配置无效",
+  provider_configuration: "模型服务配置未完成",
   timeout: "研究超时",
   busy: "已有研究任务正在运行",
-  runner_failed: "研究进程未完成",
-  invalid_output: "研究结果格式无效",
-  output_too_large: "研究结果超出大小限制",
+  runtime_failed: "研究进程未完成",
+  invalid_result: "研究结果格式无效",
+  output_limit: "研究结果超出大小限制",
+  request_limit: "研究请求内容过大",
+  storage_unavailable: "研究存储不可用",
 };
 
 function researchRunMessage(message, tone = "neutral") {
@@ -77,11 +80,12 @@ function renderResearchStatus(payload) {
   const label = checking ? "自检中" : busy ? "研究运行中"
     : !runtime.configured ? "未就绪"
       : ({ ready: "运行时就绪", failed: "运行失败", canceled: "已取消" })[runtime.runtime_state] || "待自检";
+  const modeLabel = runtime.run_mode === "fast" ? "快速 OKX 研究" : "完整辩论研究";
   setState("#ai-runtime-state", label, !runtime.configured || runtime.runtime_state === "failed"
     ? "warning" : runtime.runtime_state === "ready" ? "good" : "neutral");
   setText("#ai-runtime-note", runtime.last_error
     ? runtimeErrors[runtime.last_error] || `运行状态：${runtime.last_error}`
-    : `研究与交易隔离 · 时限 ${runtime.timeout_seconds || "--"} 秒 · 自检不验证模型连通性`);
+    : `${modeLabel} · 研究与交易隔离 · 时限 ${runtime.timeout_seconds || "--"} 秒 · 自检不验证模型连通性`);
   updateResearchAvailability();
 }
 

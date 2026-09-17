@@ -2,7 +2,9 @@
 
 import copy
 import json
+import math
 import os
+import re
 import signal
 import sys
 import threading
@@ -144,22 +146,215 @@ def _market_context_prompt(context: dict[str, Any]) -> str:
     )
 
 
+def _llm_kwargs(config: dict[str, Any]) -> dict[str, Any]:
+    """Mirror the upstream provider knobs without constructing the full graph."""
+    provider = str(config.get("llm_provider") or "").lower()
+    kwargs: dict[str, Any] = {}
+    if provider == "google" and config.get("google_thinking_level"):
+        kwargs["thinking_level"] = config["google_thinking_level"]
+    elif provider == "openai" and config.get("openai_reasoning_effort"):
+        kwargs["reasoning_effort"] = config["openai_reasoning_effort"]
+    elif provider == "anthropic" and config.get("anthropic_effort"):
+        kwargs["effort"] = config["anthropic_effort"]
+
+    if config.get("temperature") not in (None, ""):
+        kwargs["temperature"] = float(config["temperature"])
+    if config.get("llm_max_retries") not in (None, ""):
+        kwargs["max_retries"] = max(0, int(config["llm_max_retries"]))
+    if config.get("max_tokens") not in (None, ""):
+        kwargs["max_output_tokens" if provider == "google" else "max_tokens"] = int(
+            config["max_tokens"]
+        )
+    return kwargs
+
+
+def _response_text(response: Any) -> str:
+    """Normalize LangChain content blocks to a bounded plain-text response."""
+    content = getattr(response, "content", response)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                value = block.get("text") or block.get("content")
+                if value is not None:
+                    parts.append(str(value))
+            else:
+                value = getattr(block, "text", None) or getattr(block, "content", None)
+                if value is not None:
+                    parts.append(str(value))
+        return "".join(parts)
+    return str(content or "")
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    """Accept strict JSON plus the fenced/object forms models commonly emit."""
+    candidate = text.strip()
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", candidate, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        candidate = fenced.group(1)
+    else:
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start >= 0 and end > start:
+            candidate = candidate[start:end + 1]
+    try:
+        value = json.loads(candidate)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _text(value: Any, maximum: int = 4000) -> str:
+    if isinstance(value, str):
+        return value.strip()[:maximum]
+    if value is None:
+        return ""
+    return str(value).strip()[:maximum]
+
+
+def _text_list(value: Any, maximum_items: int = 8) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        return [_text(item, 1000) for item in value if _text(item, 1000)][:maximum_items]
+    item = _text(value, 1000)
+    return [item] if item else []
+
+
+def _normalize_fast_result(raw_text: str) -> dict[str, Any]:
+    parsed = _extract_json_object(raw_text)
+    aliases = {
+        "buy": "Buy", "long": "Buy", "bullish": "Buy", "买入": "Buy", "偏多": "Buy",
+        "sell": "Sell", "short": "Sell", "bearish": "Sell", "卖出": "Sell", "偏空": "Sell",
+        "hold": "Hold", "neutral": "Hold", "观望": "Hold", "中性": "Hold",
+    }
+    decision = aliases.get(str(parsed.get("decision", "")).strip().lower(), "Hold")
+    try:
+        confidence = float(parsed.get("confidence", 0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = confidence if math.isfinite(confidence) else 0.0
+    confidence = max(0.0, min(1.0, confidence))
+    summary = _text(parsed.get("summary"))
+    if not summary:
+        summary = _text(raw_text, 4000) or "模型未返回可用研究摘要。"
+    limitations = _text_list(parsed.get("limitations"))
+    if not parsed:
+        limitations.insert(0, "模型未按约定 JSON 格式返回，方向已降级为观望。")
+    return {
+        "decision": decision,
+        "confidence": confidence,
+        "summary": summary,
+        "trend": _text(parsed.get("trend")),
+        "evidence": _text_list(parsed.get("evidence")),
+        "risks": _text_list(parsed.get("risks")),
+        "invalidations": _text_list(parsed.get("invalidations")),
+        "time_horizon": _text(parsed.get("time_horizon"), 200),
+        "limitations": limitations,
+        "raw_response": _text(raw_text, 12000),
+    }
+
+
+def _fast_market_evidence(context: dict[str, Any]) -> str:
+    evidence = {
+        key: context.get(key) for key in (
+            "inst_id", "bar", "candle_count", "captured_at", "stream",
+            "ticker", "funding_rate", "open_interest", "errors",
+        )
+    }
+    candles = context.get("candles")
+    evidence["recent_candles"] = candles[-60:] if isinstance(candles, list) else []
+    return json.dumps(_json_safe(evidence), ensure_ascii=True)
+
+
+def _run_fast_research(request: dict[str, Any], config: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    """Run one bounded OKX-evidence call instead of the multi-agent debate graph."""
+    source = Path(request["source_path"]).resolve()
+    sys.path.insert(0, str(source))
+    from tradingagents.llm_clients import create_llm_client
+
+    model = str(config.get("quick_think_llm") or config.get("deep_think_llm") or "").strip()
+    if not model:
+        raise ValueError("quick_think_llm is not configured")
+    client = create_llm_client(
+        provider=str(config.get("llm_provider") or ""),
+        model=model,
+        base_url=config.get("backend_url"),
+        **_llm_kwargs(config),
+    )
+    prompt = (
+        "You are the fast research analyst for an OKX perpetual-contract dashboard.\n"
+        "Use only the supplied OKX snapshot. Do not browse, call tools, infer missing prices, "
+        "or claim news/sentiment that is not present. This is research only: it cannot place "
+        "orders, set leverage, or authorize execution.\n\n"
+        "Return ONLY one JSON object with these keys: decision (Buy, Sell, or Hold), "
+        "confidence (0 to 1), summary, trend, evidence (array), risks (array), "
+        "invalidations (array), time_horizon, limitations (array). Prefer Hold when data is "
+        "stale, incomplete, contradictory, or insufficient. Write values in the requested "
+        f"language: {config.get('output_language', 'Chinese')}.\n\n"
+        "OKX snapshot:\n" + _fast_market_evidence(context)
+    )
+    response = client.get_llm().invoke(prompt)
+    normalized = _normalize_fast_result(_response_text(response))
+    decision = normalized["decision"]
+    summary = normalized["summary"]
+    limitations = normalized["limitations"] or [
+        "研究结果仅供参考，不构成委托或投资建议。",
+        "新闻、社交和宏观数据未在本次 OKX 快速研究中接入。",
+    ]
+    state = {
+        "market_report": summary,
+        "sentiment_report": "快速模式未接入社交情绪数据，不能据此推断市场情绪。",
+        "news_report": "快速模式未接入新闻、宏观或基本面数据。",
+        "investment_plan": {
+            "decision": decision,
+            "confidence": normalized["confidence"],
+            "trend": normalized["trend"],
+            "evidence": normalized["evidence"],
+            "risks": normalized["risks"],
+            "invalidations": normalized["invalidations"],
+            "time_horizon": normalized["time_horizon"],
+        },
+        "trader_investment_plan": (
+            "快速研究结果不可执行；请使用结构化策略、风控和人工闸门完成任何后续操作。"
+        ),
+        "final_trade_decision": f"研究结论（不可执行）：{decision}\n\n{summary}",
+        "fast_research": normalized,
+        "limitations": limitations,
+    }
+    return {
+        "inst_id": request["inst_id"],
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "fast",
+        "market_context": _json_safe(context),
+        "decision": decision,
+        "state": _json_safe(state),
+    }
+
+
 def run_request(request: dict[str, Any]) -> dict[str, Any]:
     source = Path(request["source_path"]).resolve()
     _install_data_guards(int(request.get("data_timeout_seconds", 8)))
     # The runner is launched as an isolated script, so make its sibling bridge
     # importable without inheriting the parent API process environment.
     sys.path.insert(0, str(Path(__file__).parent))
-    from tradingagents_okx_bridge import install_okx_bridge
-
     sys.path.insert(0, str(source))
     from tradingagents.default_config import DEFAULT_CONFIG
-    from tradingagents.graph.trading_graph import TradingAgentsGraph
 
     config = copy.deepcopy(DEFAULT_CONFIG)
     config.update(request["config"])
     config["checkpoint_enabled"] = False
     context = request.get("market_context") or {}
+    run_mode = str(request.get("run_mode") or "full").strip().lower()
+    if run_mode not in {"fast", "full"}:
+        raise ValueError("unsupported TradingAgents run mode")
+    if run_mode == "fast" and request["action"] == "analyze":
+        return _run_fast_research(request, config, context)
+    from tradingagents_okx_bridge import install_okx_bridge
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+
     install_okx_bridge(context, config)
     for key in ("results_dir", "data_cache_dir"):
         Path(config[key]).mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -173,6 +368,7 @@ def run_request(request: dict[str, Any]) -> dict[str, Any]:
             "provider": config["llm_provider"],
             "deep_model": config["deep_think_llm"],
             "quick_model": config["quick_think_llm"],
+            "run_mode": run_mode,
             "provider_connection_verified": False,
             "execution_authorized": False,
         }

@@ -80,6 +80,20 @@ class TradingAgentsConfigTests(unittest.TestCase):
             self.assertFalse(result["execution_authorized"])
             self.assertEqual(adapter.runtime_state, "ready")
 
+    def test_adapter_rejects_unknown_run_mode(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TRADINGAGENTS_ENABLED": "true",
+                "TRADINGAGENTS_PATH": str(Path(__file__).parent / "fixtures/ai"),
+                "TRADINGAGENTS_RUN_MODE": "debate-lite",
+            },
+            clear=True,
+        ):
+            adapter = TradingAgentsAdapter()
+        self.assertEqual(adapter.configuration_error, "invalid_config")
+        self.assertEqual(adapter.run_mode, "full")
+
 
 class AIProcessTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
@@ -127,6 +141,30 @@ class AIProcessTests(unittest.IsolatedAsyncioTestCase):
         result = await adapter.check_ready()
         self.assertFalse(result["provider_connection_verified"])
         self.assertEqual(adapter.runtime_state, "ready")
+        self.assertFalse((Path(adapter.config["results_dir"]) / "pid").exists())
+
+    async def test_fast_mode_uses_one_okx_evidence_call_without_graph_execution(self) -> None:
+        adapter = self.adapter(
+            TRADINGAGENTS_RUN_MODE="fast",
+            TRADINGAGENTS_LLM_PROVIDER="openai_compatible",
+            TRADINGAGENTS_QUICK_THINK_LLM="fixture-fast",
+            TRADINGAGENTS_DEEP_THINK_LLM="fixture-deep",
+        )
+        result = await adapter.analyze("BTC-USDT-SWAP", {
+            "inst_id": "BTC-USDT-SWAP",
+            "bar": "15m",
+            "candle_count": 2,
+            "captured_at": "fixture-time",
+            "candles": [
+                ["1", "99", "101", "98", "100", "12"],
+                ["2", "100", "102", "99", "101", "14"],
+            ],
+        })
+        self.assertEqual(result["mode"], "fast")
+        self.assertEqual(result["decision"], "Hold")
+        self.assertEqual(result["state"]["fast_research"]["summary"], "fixture summary")
+        self.assertEqual(result["signal"], {})
+        self.assertFalse(result["execution_authorized"])
         self.assertFalse((Path(adapter.config["results_dir"]) / "pid").exists())
 
     async def test_timeout_terminates_term_ignoring_child_and_releases_lock(self) -> None:

@@ -236,6 +236,8 @@ TradingAgents 是可选分析依赖，不应阻塞结构化策略和风控链。
 ```dotenv
 TRADINGAGENTS_ENABLED=true
 TRADINGAGENTS_PATH=/opt/tradingagents
+# `fast` performs one bounded OKX-evidence call; `full` runs the upstream debate graph.
+TRADINGAGENTS_RUN_MODE=fast
 TRADINGAGENTS_OUTPUT_LANGUAGE=Chinese
 TRADINGAGENTS_LLM_PROVIDER=openai_compatible
 TRADINGAGENTS_DEEP_THINK_LLM=<tested-model>
@@ -280,7 +282,13 @@ Python；只挂载源码不能替代安装依赖。默认仍使用 API 所在解
 
 内置 Nginx 为 AI 研究路径单独设置 1860 秒读取超时。宝塔或其他外层反向
 代理也需要为此路径设置足够的超时，否则代理可能先断开，但服务端研究仍会
-在上述硬期限内结束。该接口当前是同步请求，不是可恢复的后台作业队列。
+在上述硬期限内结束。`fast` 模式通常只执行一次模型调用，适合网页交互；
+`full` 模式仍是同步请求，不是可恢复的后台作业队列。
+
+`TRADINGAGENTS_RUN_MODE=fast` 使用 TradingAgents 的模型客户端，但只把已采集的
+OKX 永续快照交给一次模型调用，返回结构化研究摘要、风险和失效条件。它不会调用
+上游新闻/社交数据，也不会生成执行信号。需要完整多代理辩论时设置为 `full`，并
+接受更长的运行时间和更高的模型消耗。
 
 研究进程只接收白名单中的模型/公共数据提供方环境变量和基础 TLS 配置，
 不继承 OKX 凭据、管理员令牌、PushPlus token、实盘解锁短语或代理认证。
