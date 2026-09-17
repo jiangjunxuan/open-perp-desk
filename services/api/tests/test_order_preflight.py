@@ -436,6 +436,24 @@ class OrderPreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("exchange_preflight_data_unavailable", (await self.submit())["reasons"])
         self.assertEqual(self.trade.orders, [])
 
+    async def test_transient_snapshot_failure_retries_complete_read(self):
+        original_positions = self.account.positions
+        attempts = 0
+
+        async def transient_failure():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OkxAccountError("transient snapshot transport failure")
+            return await original_positions()
+
+        self.account.positions = transient_failure
+        result = await self.submit()
+
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(len(self.trade.orders), 1)
+
     async def test_midnight_during_leverage_setup_requires_new_accounting(self):
         async def cross_midnight(*args):
             clock_patch = patch("app.execution_engine.datetime")

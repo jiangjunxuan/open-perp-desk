@@ -174,16 +174,29 @@ class OrderPreflight:
             raise PreflightError("private_account_not_configured")
         captured_at = datetime.now(timezone.utc)
         generation, local_orders = self.store.execution_snapshot()
-        try:
-            balance, positions, pending, bills, config, instruments, ticker, algos = await asyncio.gather(
-                self.account.balance(), self.account.positions(),
-                self.account.pending_orders(), self.account.bills_today(as_of=captured_at),
-                self.account.config(), self.market.instruments(),
-                self.market.ticker(signal.inst_id),
-                self.account.active_algo_orders(),
-            )
-        except Exception as exc:
-            raise PreflightError("exchange_preflight_data_unavailable") from exc
+        snapshot = None
+        for attempt in range(2):
+            try:
+                snapshot = await asyncio.gather(
+                    self.account.balance(), self.account.positions(),
+                    self.account.pending_orders(), self.account.bills_today(as_of=captured_at),
+                    self.account.config(), self.market.instruments(),
+                    self.market.ticker(signal.inst_id),
+                    self.account.active_algo_orders(),
+                )
+                break
+            except Exception as exc:
+                if attempt:
+                    raise PreflightError("exchange_preflight_data_unavailable") from exc
+                # A complete read-only snapshot may encounter a transient
+                # connection reset. Retry the whole snapshot; never mix a
+                # partial first attempt with a later response.
+                await asyncio.sleep(0.05)
+        if snapshot is None:
+            raise PreflightError("exchange_preflight_data_unavailable")
+        (
+            balance, positions, pending, bills, config, instruments, ticker, algos
+        ) = snapshot
         if not balance or not config:
             raise PreflightError("account_snapshot_empty")
         equity = number(balance[0].get("totalEq"), "account_equity", positive=True)
