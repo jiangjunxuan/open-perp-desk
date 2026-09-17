@@ -94,6 +94,13 @@ class TradingAgentsAdapter:
             self.config[key] = value
         self.timeout_seconds = self.config.pop("_timeout")
         self.output_limit = self.config.pop("_output_limit")
+        try:
+            self.data_timeout_seconds = int(os.getenv("TRADINGAGENTS_DATA_TIMEOUT_SECONDS", "8"))
+            if not 1 <= self.data_timeout_seconds <= 60:
+                raise ValueError()
+        except ValueError:
+            self._configuration_error = True
+            self.data_timeout_seconds = 8
         for name, key, relative in (
             ("TRADINGAGENTS_RESULTS_DIR", "results_dir", "results"),
             ("TRADINGAGENTS_CACHE_DIR", "data_cache_dir", "cache"),
@@ -129,7 +136,9 @@ class TradingAgentsAdapter:
             "enabled": self.enabled, "configured": self.configured,
             "runtime_state": self.runtime_state, "busy": bool(self._tasks),
             "last_error": self.configuration_error or self.last_error,
-            "timeout_seconds": self.timeout_seconds, "execution_authorized": False,
+            "timeout_seconds": self.timeout_seconds,
+            "data_timeout_seconds": self.data_timeout_seconds,
+            "execution_authorized": False,
         }
 
     async def close(self) -> None:
@@ -164,6 +173,7 @@ class TradingAgentsAdapter:
             payload = json.dumps({
                 **request, "source_path": str(Path(self.path).absolute()), "config": self.config,
                 "parent_pid": os.getpid(), "timeout_seconds": self.timeout_seconds,
+                "data_timeout_seconds": self.data_timeout_seconds,
             }, ensure_ascii=True, allow_nan=False).encode()
         except (TypeError, ValueError):
             raise AIAnalysisError("invalid_result") from None

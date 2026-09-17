@@ -13,6 +13,65 @@ from pathlib import Path
 from typing import Any
 
 
+def _install_data_guards(timeout_seconds: int) -> None:
+    """Bound yfinance transport calls inside the disposable research process.
+
+    TradingAgents uses yfinance for identity, price history, and news. Its
+    public API defaults to a 30-second request timeout and may retry several
+    endpoints, which can make a crypto research run spend minutes waiting on a
+    vendor that is unavailable from the server. Keep the upstream package
+    untouched and cap only this child process; callers still receive the
+    upstream error text and can continue with the other evidence sources.
+    """
+    try:
+        import yfinance as yf
+        from yfinance.data import YfData
+    except ImportError:
+        return
+
+    cap = max(1.0, float(timeout_seconds))
+    original = getattr(YfData, "_openperpdesk_original_make_request", None)
+    if original is None:
+        original = YfData._make_request
+
+        def bounded_make_request(
+            self,
+            url,
+            request_method,
+            body=None,
+            params=None,
+            timeout=30,
+            data=None,
+        ):
+            try:
+                requested = float(timeout)
+            except (TypeError, ValueError):
+                requested = cap
+            if requested <= 0:
+                requested = cap
+            bounded = min(requested, getattr(YfData, "_openperpdesk_data_timeout", cap))
+            return original(
+                self,
+                url,
+                request_method,
+                body=body,
+                params=params,
+                timeout=bounded,
+                data=data,
+            )
+
+        YfData._openperpdesk_original_make_request = original
+        YfData._make_request = bounded_make_request
+
+    YfData._openperpdesk_data_timeout = cap
+    # The adapter already bounds the whole child process. Avoid yfinance's
+    # independent retry budget multiplying the per-request wait.
+    try:
+        yf.config.network.retries = 0
+    except (AttributeError, TypeError):
+        pass
+
+
 def _tradingagents_ticker(inst_id: str) -> str:
     return f"{inst_id.split('-', 1)[0].upper()}-USD"
 
@@ -51,6 +110,7 @@ def _market_context_prompt(context: dict[str, Any]) -> str:
 
 def run_request(request: dict[str, Any]) -> dict[str, Any]:
     source = Path(request["source_path"]).resolve()
+    _install_data_guards(int(request.get("data_timeout_seconds", 8)))
     sys.path.insert(0, str(source))
     from tradingagents.default_config import DEFAULT_CONFIG
     from tradingagents.graph.trading_graph import TradingAgentsGraph

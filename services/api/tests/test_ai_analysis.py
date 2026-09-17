@@ -30,6 +30,7 @@ class TradingAgentsConfigTests(unittest.TestCase):
                     "TRADINGAGENTS_CACHE_DIR": f"{directory}/cache",
                     "TRADINGAGENTS_MEMORY_LOG_PATH": f"{directory}/memory.md",
                     "TRADINGAGENTS_OUTPUT_LANGUAGE": "Chinese",
+                    "TRADINGAGENTS_DATA_TIMEOUT_SECONDS": "12",
                     "OKX_SECRET_KEY": "must-not-reach-child",
                     "ADMIN_API_TOKEN": "must-not-reach-child",
                     "LIVE_UNLOCK_PHRASE": "must-not-reach-child",
@@ -47,6 +48,7 @@ class TradingAgentsConfigTests(unittest.TestCase):
                 }))
             captured = result["state"]
             config = captured["config"]
+            self.assertEqual(adapter.data_timeout_seconds, 12)
             self.assertEqual(config["llm_provider"], "openai_compatible")
             self.assertEqual(config["deep_think_llm"], "deep-model")
             self.assertEqual(config["quick_think_llm"], "quick-model")
@@ -110,6 +112,7 @@ class AIProcessTests(unittest.IsolatedAsyncioTestCase):
             ({"TRADINGAGENTS_PYTHON": "/missing/python"}, "runtime_missing"),
             ({"TRADINGAGENTS_TIMEOUT_SECONDS": "nan"}, "invalid_config"),
             ({"TRADINGAGENTS_MAX_TOKENS": "0"}, "invalid_config"),
+            ({"TRADINGAGENTS_DATA_TIMEOUT_SECONDS": "0"}, "invalid_config"),
         ):
             adapter = self.adapter(**env)
             with self.assertRaises(AIAnalysisError) as raised:
