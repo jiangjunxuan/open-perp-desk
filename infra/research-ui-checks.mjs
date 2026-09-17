@@ -5,7 +5,10 @@ async function exerciseResearch() {
     token: state.token, analysis: state.analysis, symbol: state.symbol, bar: state.bar,
     status: state.status, draftRevision: state.draftRevision,
   };
-  const runtime = { configured: true, enabled: true, runtime_state: "ready", busy: false, timeout_seconds: 300 };
+  const runtime = {
+    configured: true, enabled: true, runtime_state: "ready", busy: false,
+    run_mode: "fast", timeout_seconds: 300,
+  };
   const calls = [];
   const sample = {
     id: 41, inst_id: "BTC-USDT-SWAP", source: "TradingAgents", bias: "research",
@@ -92,6 +95,7 @@ async function exerciseResearch() {
     checks.historyMetadataLoaded = $("#history-list button")?.textContent.includes(sample.inst_id)
       && researchState.historyRows[0].report === undefined;
     checks.runtimeReady = $("#ai-runtime-state").textContent === "运行时就绪" && !$("#check-ai-runtime").disabled;
+    checks.fastModeVisible = $("#ai-runtime-note").textContent.includes("快速 OKX 研究");
     await checkResearchRuntime();
     checks.selfCheckHonest = $("#research-run-status").textContent.includes("模型服务连通性尚未验证");
     renderAnalysis({ source: "structured-technical", signal: { action: "hold", inst_id: sample.inst_id } });
