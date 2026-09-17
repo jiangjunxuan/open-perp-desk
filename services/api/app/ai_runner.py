@@ -30,6 +30,16 @@ def _install_data_guards(timeout_seconds: int) -> None:
         return
 
     cap = max(1.0, float(timeout_seconds))
+
+    def cap_timeout(value: Any) -> float:
+        try:
+            requested = float(value)
+        except (TypeError, ValueError):
+            requested = cap
+        if requested <= 0:
+            requested = cap
+        return min(requested, getattr(YfData, "_openperpdesk_data_timeout", cap))
+
     original = getattr(YfData, "_openperpdesk_original_make_request", None)
     if original is None:
         original = YfData._make_request
@@ -43,25 +53,51 @@ def _install_data_guards(timeout_seconds: int) -> None:
             timeout=30,
             data=None,
         ):
-            try:
-                requested = float(timeout)
-            except (TypeError, ValueError):
-                requested = cap
-            if requested <= 0:
-                requested = cap
-            bounded = min(requested, getattr(YfData, "_openperpdesk_data_timeout", cap))
             return original(
                 self,
                 url,
                 request_method,
                 body=body,
                 params=params,
-                timeout=bounded,
+                timeout=cap_timeout(timeout),
                 data=data,
             )
 
         YfData._openperpdesk_original_make_request = original
         YfData._make_request = bounded_make_request
+
+    def wrap_timeout_method(name: str, timeout_position: int = 0) -> None:
+        """Cap yfinance helpers that call the session directly."""
+        original_method = getattr(YfData, name, None)
+        marker = f"_openperpdesk_original{name}"
+        if original_method is None or getattr(YfData, marker, None) is not None:
+            return
+
+        def bounded_method(self, *args, **kwargs):
+            positional = list(args)
+            if "timeout" in kwargs:
+                kwargs["timeout"] = cap_timeout(kwargs["timeout"])
+            elif len(positional) > timeout_position:
+                positional[timeout_position] = cap_timeout(positional[timeout_position])
+            else:
+                kwargs["timeout"] = cap
+            return original_method(self, *positional, **kwargs)
+
+        setattr(YfData, marker, original_method)
+        setattr(YfData, name, bounded_method)
+
+    # Cookie and crumb negotiation otherwise keeps its own 30-second default,
+    # bypassing _make_request when Yahoo is unreachable.
+    for method_name in (
+        "_get_cookie_and_crumb",
+        "_get_cookie_and_crumb_basic",
+        "_get_cookie_basic",
+        "_get_cookie_csrf",
+        "_get_crumb_basic",
+        "_get_crumb_csrf",
+    ):
+        wrap_timeout_method(method_name)
+    wrap_timeout_method("_accept_consent_form", timeout_position=1)
 
     YfData._openperpdesk_data_timeout = cap
     # The adapter already bounds the whole child process. Avoid yfinance's
