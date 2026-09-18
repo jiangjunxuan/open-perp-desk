@@ -22,6 +22,7 @@ const runtimeErrors = {
   runtime_missing: "独立 Python 运行环境不可用",
   invalid_config: "运行参数配置无效",
   provider_configuration: "模型服务配置未完成",
+  provider_unavailable: "模型服务暂时不可用，系统会在下次运行时重试",
   timeout: "研究超时",
   busy: "已有研究任务正在运行",
   runtime_failed: "研究进程未完成",

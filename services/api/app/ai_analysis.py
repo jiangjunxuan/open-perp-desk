@@ -17,6 +17,7 @@ ERRORS = {
     "invalid_config": (503, "TradingAgents configuration is invalid."),
     "dependencies_missing": (503, "TradingAgents dependencies are not installed in its Python runtime."),
     "provider_configuration": (503, "TradingAgents provider or model configuration is not ready."),
+    "provider_unavailable": (503, "TradingAgents model provider is temporarily unavailable. Retry later."),
     "busy": (409, "Another TradingAgents operation is running. Try again after it finishes."),
     "timeout": (504, "TradingAgents exceeded its time limit and was stopped."),
     "output_limit": (502, "TradingAgents output exceeded the configured size limit."),

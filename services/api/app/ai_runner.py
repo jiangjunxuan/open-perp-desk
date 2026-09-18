@@ -12,7 +12,65 @@ import time
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+
+_TRANSIENT_PROVIDER_STATUS_CODES = {408, 409, 425, 429}
+
+
+def _status_code_from_exception(error: BaseException) -> int | None:
+    """Find a provider HTTP status without serializing the provider error."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        for owner in (current, getattr(current, "response", None)):
+            if owner is None:
+                continue
+            for name in ("status_code", "status"):
+                value = getattr(owner, name, None)
+                try:
+                    code = int(value)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if 100 <= code <= 599:
+                    return code
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _is_transient_provider_error(error: BaseException) -> bool:
+    status = _status_code_from_exception(error)
+    return status in _TRANSIENT_PROVIDER_STATUS_CODES or (status is not None and 500 <= status <= 599)
+
+
+def _transient_retry_count(config: dict[str, Any]) -> int:
+    try:
+        value = int(config.get("llm_max_retries", 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return max(0, min(value, 3))
+
+
+def _run_with_transient_retries(
+    operation: Callable[[], Any], config: dict[str, Any], deadline: float,
+    *, sleep: Callable[[float], None] = time.sleep,
+) -> Any:
+    """Retry only provider throttling/5xx failures within the process deadline."""
+    retries = _transient_retry_count(config)
+    attempt = 0
+    while True:
+        try:
+            return operation()
+        except Exception as error:
+            if not _is_transient_provider_error(error) or attempt >= retries:
+                raise
+            attempt += 1
+            delay = min(float(2 ** (attempt - 1)), 8.0)
+            remaining = deadline - time.monotonic()
+            if remaining <= delay:
+                raise
+            sleep(min(delay, max(0.0, remaining - 0.05)))
 
 
 def _install_data_guards(timeout_seconds: int) -> None:
@@ -269,7 +327,10 @@ def _fast_market_evidence(context: dict[str, Any]) -> str:
     return json.dumps(_json_safe(evidence), ensure_ascii=True)
 
 
-def _run_fast_research(request: dict[str, Any], config: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+def _run_fast_research(
+    request: dict[str, Any], config: dict[str, Any], context: dict[str, Any],
+    deadline: float,
+) -> dict[str, Any]:
     """Run one bounded OKX-evidence call instead of the multi-agent debate graph."""
     source = Path(request["source_path"]).resolve()
     sys.path.insert(0, str(source))
@@ -296,7 +357,10 @@ def _run_fast_research(request: dict[str, Any], config: dict[str, Any], context:
         f"language: {config.get('output_language', 'Chinese')}.\n\n"
         "OKX snapshot:\n" + _fast_market_evidence(context)
     )
-    response = client.get_llm().invoke(prompt)
+    llm = client.get_llm()
+    response = _run_with_transient_retries(
+        lambda: llm.invoke(prompt), config, deadline,
+    )
     normalized = _normalize_fast_result(_response_text(response))
     decision = normalized["decision"]
     summary = normalized["summary"]
@@ -350,8 +414,9 @@ def run_request(request: dict[str, Any]) -> dict[str, Any]:
     run_mode = str(request.get("run_mode") or "full").strip().lower()
     if run_mode not in {"fast", "full"}:
         raise ValueError("unsupported TradingAgents run mode")
+    deadline = time.monotonic() + max(1.0, float(request.get("timeout_seconds", 300)))
     if run_mode == "fast" and request["action"] == "analyze":
-        return _run_fast_research(request, config, context)
+        return _run_fast_research(request, config, context, deadline)
     from tradingagents_okx_bridge import install_okx_bridge
     from tradingagents.graph.trading_graph import TradingAgentsGraph
 
@@ -359,10 +424,10 @@ def run_request(request: dict[str, Any]) -> dict[str, Any]:
     for key in ("results_dir", "data_cache_dir"):
         Path(config[key]).mkdir(parents=True, exist_ok=True, mode=0o700)
     Path(config["memory_log_path"]).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    graph = TradingAgentsGraph(
-        selected_analysts=("market", "social", "news"), debug=False, config=config,
-    )
     if request["action"] == "probe":
+        graph = TradingAgentsGraph(
+            selected_analysts=("market", "social", "news"), debug=False, config=config,
+        )
         return {
             "runtime_state": "ready",
             "provider": config["llm_provider"],
@@ -375,15 +440,24 @@ def run_request(request: dict[str, Any]) -> dict[str, Any]:
     inst_id = request["inst_id"]
     ticker = _tradingagents_ticker(inst_id)
     evidence = _market_context_prompt(context)
-    resolver = graph.resolve_instrument_context
 
-    def resolve_with_okx_context(symbol: str, asset_type: str = "stock") -> str:
-        return f"{resolver(symbol, asset_type)}{evidence}"
+    def propagate_once() -> tuple[Any, Any]:
+        # Build a fresh graph after a transient provider error so a partially
+        # advanced LangGraph state is never reused for a retry.
+        graph = TradingAgentsGraph(
+            selected_analysts=("market", "social", "news"), debug=False, config=config,
+        )
+        resolver = graph.resolve_instrument_context
 
-    graph.resolve_instrument_context = resolve_with_okx_context
-    state, decision = graph.propagate(
-        ticker, datetime.now(timezone.utc).date().isoformat(), asset_type="crypto",
-    )
+        def resolve_with_okx_context(symbol: str, asset_type: str = "stock") -> str:
+            return f"{resolver(symbol, asset_type)}{evidence}"
+
+        graph.resolve_instrument_context = resolve_with_okx_context
+        return graph.propagate(
+            ticker, datetime.now(timezone.utc).date().isoformat(), asset_type="crypto",
+        )
+
+    state, decision = _run_with_transient_retries(propagate_once, config, deadline)
     return {
         "inst_id": inst_id,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -410,9 +484,12 @@ def main() -> None:
         result = {"ok": False, "code": "dependencies_missing"}
     except (ValueError, KeyError, TypeError):
         result = {"ok": False, "code": "provider_configuration"}
-    except Exception:
+    except Exception as error:
         # Provider exceptions may contain credentials, URLs or full request bodies.
-        result = {"ok": False, "code": "runtime_failed"}
+        result = {
+            "ok": False,
+            "code": "provider_unavailable" if _is_transient_provider_error(error) else "runtime_failed",
+        }
     sys.stdout.write(json.dumps(result, ensure_ascii=True, allow_nan=False))
 
 
