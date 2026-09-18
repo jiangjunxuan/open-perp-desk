@@ -193,11 +193,16 @@ SOCKS5 握手失败时会主动清理尚未交给 HTTP 连接管理的套接字�
 真实模型服务的只读验收使用容器内入口：
 
 ```bash
-./infra/openperpdesk.sh ai-live-smoke --timeout 240
+./infra/openperpdesk.sh ai-live-smoke --run-mode fast --timeout 240
+# 需要完整上游多智能体辩论时：
+./infra/openperpdesk.sh ai-live-smoke --run-mode full --timeout 1800
 ```
 
 该命令只读取公共 OKX 行情并执行 TradingAgents 研究，不读取私有账户、不提交订单，
 报告只包含模型连接、公共证据数量、结果字段和 `execution_authorized=false`。
+`fast` 使用一次有界模型调用，适合网页交互；`full` 运行完整研究图，耗时和模型消耗
+更高，必须单独验收，不能将 `fast` 的成功视为 `full` 已通过。失败时不会保留旧的
+成功报告。
 
 它会同时验证 OKX REST、公共报价和 `1m`、`15m`、`1H`、`4H` K 线；
 只输出脱敏连接证据，不读取私有账户，不执行交易。

@@ -432,7 +432,7 @@ class Deployment:
 
     def ai_live_smoke(
         self, *, timeout: float = 240, inst_id: str = "BTC-USDT-SWAP",
-        bar: str = "15m", limit: int = 100,
+        bar: str = "15m", limit: int = 100, run_mode: str | None = None,
     ) -> dict:
         if not 30 <= timeout <= 1800:
             raise DeploymentError("AI live smoke timeout must be between 30 and 1800 seconds.")
@@ -440,15 +440,22 @@ class Deployment:
             raise DeploymentError("AI live smoke instrument must be an OKX perpetual instrument.")
         if not re.fullmatch(r"[0-9]+[mHhDWMw]", bar) or not 30 <= limit <= 300:
             raise DeploymentError("AI live smoke candle parameters are invalid.")
+        if run_mode is not None and run_mode not in {"fast", "full"}:
+            raise DeploymentError("AI live smoke run mode must be fast or full.")
         output = self.root / "outputs/ai-verification.json"
         output.unlink(missing_ok=True)
         self.require_environment_file()
         started = datetime.now(timezone.utc)
         with (self.root / "infra/ai-live-smoke.py").open("rb") as program:
-            result = self.compose(
-                "exec", "-T", "api", "python", "-",
+            probe_args = [
                 "--timeout", str(timeout), "--inst-id", inst_id,
                 "--bar", bar, "--limit", str(limit), "--output", "-",
+            ]
+            if run_mode is not None:
+                probe_args.extend(["--run-mode", run_mode])
+            result = self.compose(
+                "exec", "-T", "api", "python", "-",
+                *probe_args,
                 stdin=program, timeout=timeout + 15,
             )
         try:
@@ -465,6 +472,8 @@ class Deployment:
                 raise ValueError("invalid scope")
             if report["instrument"] != inst_id or report["bar"] != bar:
                 raise ValueError("instrument or bar mismatch")
+            if run_mode is not None and report.get("mode") != run_mode:
+                raise ValueError("run mode mismatch")
             if report["provider_connection_verified"] is not True:
                 raise ValueError("model provider was not verified")
             if report["execution_authorized"] is not False or report["private_account_verified"] is not False or report["trading_performed"] is not False:
@@ -612,6 +621,7 @@ def main() -> None:
     ai_live_smoke.add_argument("--inst-id", default="BTC-USDT-SWAP")
     ai_live_smoke.add_argument("--bar", default="15m")
     ai_live_smoke.add_argument("--limit", type=int, default=100)
+    ai_live_smoke.add_argument("--run-mode", choices=("fast", "full"), default=None)
     commands.add_parser("restore").add_argument("source", type=Path)
     commands.add_parser("logs").add_argument("service", nargs="?")
     args = parser.parse_args()
@@ -633,7 +643,7 @@ def main() -> None:
             elif args.command == "ai-live-smoke":
                 deployment.ai_live_smoke(
                     timeout=args.timeout, inst_id=args.inst_id,
-                    bar=args.bar, limit=args.limit,
+                    bar=args.bar, limit=args.limit, run_mode=args.run_mode,
                 )
             elif args.command == "backup":
                 deployment.backup()

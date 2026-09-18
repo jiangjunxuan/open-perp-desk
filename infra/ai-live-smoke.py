@@ -71,10 +71,23 @@ async def public_context(client: OkxMarketClient, inst_id: str, bar: str, limit:
     }
 
 
-async def run_probe(*, timeout: float, inst_id: str, bar: str, limit: int) -> dict:
+async def run_probe(
+    *, timeout: float, inst_id: str, bar: str, limit: int,
+    run_mode: str | None = None,
+) -> dict:
     started = time.monotonic()
+    previous_run_mode = os.environ.get("TRADINGAGENTS_RUN_MODE")
+    if run_mode is not None:
+        os.environ["TRADINGAGENTS_RUN_MODE"] = run_mode
+    try:
+        adapter = TradingAgentsAdapter()
+    finally:
+        if run_mode is not None:
+            if previous_run_mode is None:
+                os.environ.pop("TRADINGAGENTS_RUN_MODE", None)
+            else:
+                os.environ["TRADINGAGENTS_RUN_MODE"] = previous_run_mode
     client = OkxMarketClient()
-    adapter = TradingAgentsAdapter()
     if not adapter.configured:
         raise RuntimeError(adapter.configuration_error or "tradingagents_not_configured")
     async with asyncio.timeout(timeout):
@@ -125,6 +138,7 @@ def main() -> int:
     parser.add_argument("--inst-id", default="BTC-USDT-SWAP")
     parser.add_argument("--bar", default="15m")
     parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--run-mode", choices=("fast", "full"), default=None)
     parser.add_argument("--output", type=Path, default=ROOT / "outputs/ai-verification.json")
     args = parser.parse_args()
     if not 30 <= args.timeout <= 1800:
@@ -141,6 +155,7 @@ def main() -> int:
     try:
         result = asyncio.run(run_probe(
             timeout=args.timeout, inst_id=args.inst_id, bar=args.bar, limit=args.limit,
+            run_mode=args.run_mode,
         ))
         if destination is not None:
             write_private_json(destination, result)

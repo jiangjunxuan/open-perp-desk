@@ -471,6 +471,23 @@ class DeploymentCommandTests(unittest.TestCase):
         self.assertEqual(json.loads(destination.read_text()), result)
         self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
 
+    def test_ai_live_smoke_can_pin_run_mode(self):
+        result = self.deployment.ai_live_smoke(timeout=60, run_mode="fast")
+        self.assertEqual(self.deployment.calls, [
+            ("exec", "-T", "api", "python", "-", "--timeout", "60",
+             "--inst-id", "BTC-USDT-SWAP", "--bar", "15m", "--limit", "100",
+             "--output", "-", "--run-mode", "fast"),
+        ])
+        self.assertEqual(result["mode"], "fast")
+
+    def test_ai_live_smoke_rejects_invalid_or_mismatched_run_mode(self):
+        with self.assertRaises(deploy.DeploymentError):
+            self.deployment.ai_live_smoke(timeout=60, run_mode="bogus")
+        self.deployment.probe_changes = {"mode": "full"}
+        with self.assertRaises(deploy.DeploymentError):
+            self.deployment.ai_live_smoke(timeout=60, run_mode="fast")
+        self.assertFalse((self.root / "outputs/ai-verification.json").exists())
+
     def test_ai_live_smoke_rejects_provider_or_execution_claims(self):
         for changes in (
             {"provider_connection_verified": False},

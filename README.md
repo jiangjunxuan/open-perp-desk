@@ -186,11 +186,15 @@ K 线是否经出站代理连通：
 服务器上还可以用容器内的真实模型做一次只读 TradingAgents 验收：
 
 ```bash
-./infra/openperpdesk.sh ai-live-smoke --timeout 240
+./infra/openperpdesk.sh ai-live-smoke --run-mode fast --timeout 240
+# 需要完整上游多智能体辩论时：
+./infra/openperpdesk.sh ai-live-smoke --run-mode full --timeout 1800
 ```
 
 它读取 OKX 公共快照并调用配置的模型服务，报告只保存模型连接、证据数量和
 不可执行标志，不保存模型正文、凭据或账户数据；失败时不会留下旧的成功报告。
+`fast` 是单次有界模型调用，适合网页交互；`full` 会运行完整研究图，耗时和模型
+消耗更高，必须单独验收，不能因为 `fast` 成功就视为 `full` 已通过。
 
 完整交易闭环本地联调：
 
