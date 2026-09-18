@@ -77,8 +77,12 @@ async def run_probe(
 ) -> dict:
     started = time.monotonic()
     previous_run_mode = os.environ.get("TRADINGAGENTS_RUN_MODE")
+    previous_timeout = os.environ.get("TRADINGAGENTS_TIMEOUT_SECONDS")
     if run_mode is not None:
         os.environ["TRADINGAGENTS_RUN_MODE"] = run_mode
+    # Keep the adapter's internal deadline aligned with the smoke deadline.
+    # Otherwise a long `full` run can fail at the shorter server default.
+    os.environ["TRADINGAGENTS_TIMEOUT_SECONDS"] = str(math.ceil(timeout))
     try:
         adapter = TradingAgentsAdapter()
     finally:
@@ -87,6 +91,10 @@ async def run_probe(
                 os.environ.pop("TRADINGAGENTS_RUN_MODE", None)
             else:
                 os.environ["TRADINGAGENTS_RUN_MODE"] = previous_run_mode
+        if previous_timeout is None:
+            os.environ.pop("TRADINGAGENTS_TIMEOUT_SECONDS", None)
+        else:
+            os.environ["TRADINGAGENTS_TIMEOUT_SECONDS"] = previous_timeout
     client = OkxMarketClient()
     if not adapter.configured:
         raise RuntimeError(adapter.configuration_error or "tradingagents_not_configured")
