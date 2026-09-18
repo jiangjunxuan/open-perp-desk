@@ -18,6 +18,9 @@ const state = {
   chartUndo: [],
   chartDrag: null,
   chartEditor: null,
+  chartRemoteLoaded: false,
+  chartRemoteStatus: "local",
+  chartRemoteRequest: 0,
   marketHistoryNeedsSync: false,
   controlFeedState: "connecting",
   controlSnapshotFresh: false,
@@ -53,6 +56,8 @@ const state = {
 
 const $ = (selector) => document.querySelector(selector);
 const busyButtons = new WeakMap();
+let chartAnnotationSyncTimer = 0;
+let chartAnnotationSyncQueue = Promise.resolve();
 const terminalOrderStatuses = new Set(["filled", "canceled", "cancelled", "failed", "rejected", "effective", "triggered", "expired", "order_failed", "mmp_canceled"]);
 let pendingViewFocus = 0;
 const views = {
@@ -503,33 +508,203 @@ function chartStorageKey() {
   return `openperpdesk.chart-annotations.${state.symbol}.${state.bar}`;
 }
 
+function chartAnnotationId(value = "") {
+  const candidate = String(value || "");
+  if (/^[A-Za-z0-9_-]{1,64}$/.test(candidate)) return candidate;
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `a-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function normalizeChartAnnotation(item) {
+  if (!item || !["horizontal", "trend", "text"].includes(item.type)) return null;
+  const id = chartAnnotationId(item.id);
+  const point = value => {
+    const time = Number(value?.time);
+    const price = Number(value?.price);
+    return Number.isSafeInteger(time) && time > 0 && time <= 8640000000000000
+      && Number.isFinite(price) && price > 0
+      ? { time, price } : null;
+  };
+  if (item.type === "horizontal") {
+    const price = Number(item.price);
+    return Number.isFinite(price) && price > 0
+      ? { id, type: "horizontal", price } : null;
+  }
+  if (item.type === "trend") {
+    const start = point(item.start);
+    const end = point(item.end);
+    return start && end ? { id, type: "trend", start, end } : null;
+  }
+  const anchor = point(item);
+  const text = typeof item.text === "string" ? item.text.trim() : "";
+  return anchor && text && text.length <= 80
+    ? { id, type: "text", ...anchor, text } : null;
+}
+
+function normalizedChartAnnotations(rows) {
+  const seen = new Set();
+  return (Array.isArray(rows) ? rows : [])
+    .map(normalizeChartAnnotation)
+    .filter(item => {
+      if (!item || seen.has(item.id)) return false;
+      seen.add(item.id);
+      return true;
+    })
+    .slice(0, 200);
+}
+
+function chartAnnotationServerPayload(rows) {
+  return normalizedChartAnnotations(rows);
+}
+
+function updateChartAnnotationStatus() {
+  const label = !state.token ? "本机保存"
+    : state.chartRemoteStatus === "syncing" ? "云端同步中"
+      : state.chartRemoteStatus === "error" ? "云端同步失败"
+        : state.chartRemoteLoaded ? "云端已同步" : "云端连接中";
+  const tone = state.chartRemoteStatus === "error" ? "warning"
+    : state.chartRemoteLoaded && state.chartRemoteStatus !== "syncing" ? "good" : "neutral";
+  setState("#chart-annotation-sync", label, tone);
+}
+
+function resetChartRemoteState() {
+  clearTimeout(chartAnnotationSyncTimer);
+  state.chartRemoteRequest += 1;
+  state.chartRemoteLoaded = false;
+  state.chartRemoteStatus = "local";
+  updateChartAnnotationStatus();
+}
+
+function writeChartAnnotationsLocal() {
+  try {
+    localStorage.setItem(chartStorageKey(), JSON.stringify(state.chartAnnotations));
+  } catch {
+    setMessage("标记已保留在当前页面；浏览器存储不可用，刷新后可能丢失。", "error");
+  }
+}
+
+function applyRemoteChartAnnotations(rows) {
+  const selectedId = state.chartAnnotations[state.chartSelection]?.id;
+  const selected = (Array.isArray(rows) ? rows : [])
+    .filter(item => (!item.inst_id || item.inst_id === state.symbol)
+      && (!item.bar || item.bar === state.bar));
+  state.chartAnnotations = normalizedChartAnnotations(selected);
+  state.chartSelection = selectedId
+    ? state.chartAnnotations.findIndex(item => item.id === selectedId)
+    : -1;
+  writeChartAnnotationsLocal();
+  state.chartRemoteStatus = "cloud";
+  updateChartAnnotationStatus();
+  updateChartAnnotationControls();
+  renderChart(state.lastCandles);
+}
+
 function loadChartAnnotations() {
   state.chartDraft = null;
   state.chartSelection = -1;
   state.chartUndo = [];
+  clearTimeout(chartAnnotationSyncTimer);
+  state.chartRemoteRequest += 1;
+  state.chartRemoteLoaded = false;
+  state.chartRemoteStatus = state.token ? "connecting" : "local";
   try {
     const value = JSON.parse(localStorage.getItem(chartStorageKey()) || "[]");
-    const point = item => item && Number.isFinite(item.time) && item.time > 0
-      && item.time <= 8640000000000000 && Number.isFinite(item.price) && item.price > 0;
-    state.chartAnnotations = Array.isArray(value) ? value.slice(0, 200).filter(item =>
-      item && (
-        item.type === "horizontal" && Number.isFinite(item.price) && item.price > 0
-        || item.type === "trend" && point(item.start) && point(item.end)
-        || item.type === "text" && point(item) && typeof item.text === "string" && item.text.length <= 80
-      )) : [];
+    state.chartAnnotations = normalizedChartAnnotations(value);
   } catch {
     state.chartAnnotations = [];
   }
+  updateChartAnnotationStatus();
   updateChartAnnotationControls();
 }
 
 function saveChartAnnotations() {
-  try {
-    localStorage.setItem(chartStorageKey(), JSON.stringify(state.chartAnnotations));
-  } catch {
-    setMessage("标记保留在当前页面；浏览器存储不可用，刷新后可能丢失。", "error");
-  }
+  writeChartAnnotationsLocal();
   updateChartAnnotationControls();
+  if (state.token && state.chartRemoteLoaded) scheduleChartAnnotationSync();
+}
+
+function annotationQuery(symbol = state.symbol, bar = state.bar) {
+  return `/api/v1/market/annotations?inst_id=${encodeURIComponent(symbol)}&bar=${encodeURIComponent(bar)}`;
+}
+
+async function persistChartAnnotations(
+  snapshot,
+  symbol = state.symbol,
+  bar = state.bar,
+  token = state.token,
+) {
+  if (!token || token !== state.token) return null;
+  if (symbol === state.symbol && bar === state.bar) {
+    state.chartRemoteStatus = "syncing";
+    updateChartAnnotationStatus();
+  }
+  try {
+    const result = await api(annotationQuery(symbol, bar), {
+      method: "PUT",
+      body: JSON.stringify({ annotations: chartAnnotationServerPayload(snapshot) }),
+    });
+    if (token !== state.token || symbol !== state.symbol || bar !== state.bar) return result;
+    applyRemoteChartAnnotations(result.data);
+    return result.data;
+  } catch (error) {
+    if (token === state.token && symbol === state.symbol && bar === state.bar) {
+      state.chartRemoteStatus = "error";
+      updateChartAnnotationStatus();
+      setMessage(`图表标记云端同步失败，已保留本机标记：${error.message}`, "error");
+    }
+    return null;
+  }
+}
+
+function scheduleChartAnnotationSync() {
+  clearTimeout(chartAnnotationSyncTimer);
+  chartAnnotationSyncTimer = setTimeout(() => {
+    const snapshot = structuredClone(state.chartAnnotations);
+    const token = state.token;
+    const symbol = state.symbol;
+    const bar = state.bar;
+    chartAnnotationSyncQueue = chartAnnotationSyncQueue
+      .catch(() => null)
+      .then(() => persistChartAnnotations(snapshot, symbol, bar, token));
+  }, 120);
+}
+
+async function loadRemoteChartAnnotations({ migrate = false } = {}) {
+  if (!state.token) return false;
+  const token = state.token;
+  const symbol = state.symbol;
+  const bar = state.bar;
+  const request = ++state.chartRemoteRequest;
+  state.chartRemoteLoaded = false;
+  state.chartRemoteStatus = "connecting";
+  updateChartAnnotationStatus();
+  try {
+    const result = await api(annotationQuery(symbol, bar));
+    if (token !== state.token || request !== state.chartRemoteRequest
+        || symbol !== state.symbol || bar !== state.bar) return false;
+    const remote = normalizedChartAnnotations(result.data);
+    if (!remote.length && migrate && state.chartAnnotations.length) {
+      state.chartRemoteLoaded = true;
+      state.chartRemoteStatus = "syncing";
+      updateChartAnnotationStatus();
+      await persistChartAnnotations(structuredClone(state.chartAnnotations), symbol, bar, token);
+      return true;
+    }
+    applyRemoteChartAnnotations(remote);
+    state.chartRemoteLoaded = true;
+    state.chartRemoteStatus = "cloud";
+    updateChartAnnotationStatus();
+    return true;
+  } catch (error) {
+    if (token === state.token && request === state.chartRemoteRequest
+        && symbol === state.symbol && bar === state.bar) {
+      state.chartRemoteLoaded = false;
+      state.chartRemoteStatus = "error";
+      updateChartAnnotationStatus();
+      setMessage(`图表标记云端读取失败，继续使用本机标记：${error.message}`, "error");
+    }
+    return false;
+  }
 }
 
 function rememberChartAnnotations() {
@@ -2271,6 +2446,7 @@ function connectControlFeed() {
 function lockPrivateAccess() {
   privateFeed?.close();
   privateFeed = null;
+  resetChartRemoteState();
   state.privateFeedState = "locked";
   state.privateAccountReady = false;
   state.token = "";
@@ -2288,6 +2464,8 @@ function lockPrivateAccess() {
   renderPerformance({});
   renderAccountBills({ configured: false });
   renderTradingViewAlerts(null);
+  loadChartAnnotations();
+  renderChart(state.lastCandles);
   setText("#metric-equity", "--");
   setText("#metric-equity-note", "管理员访问已锁定");
   setText("#positions-tag", "需要令牌");
@@ -2350,7 +2528,7 @@ function applyPrivateEvent(event, payload) {
     lockPrivateAccess();
     return;
   }
-  if (["account", "positions", "orders", "fills", "bills"].includes(event)
+  if (["account", "positions", "orders", "fills", "bills", "chart_annotations"].includes(event)
       && (state.privateFeedState !== "open" || event !== "account" && !state.privateAccountReady)) return;
   state.privateUpdates += 1;
   if (event === "positions") {
@@ -2368,6 +2546,11 @@ function applyPrivateEvent(event, payload) {
     state.activityRequest += 1;
     renderActivity(payload.data);
   } else if (event === "tradingview_alerts") renderTradingViewAlerts(payload.data);
+  else if (event === "chart_annotations") {
+    state.chartRemoteLoaded = true;
+    state.chartRemoteStatus = "cloud";
+    applyRemoteChartAnnotations(payload.data);
+  }
   else if (event === "bills") renderAccountBills(payload);
   else if (event === "account") {
     const connected = payload.connected === true && payload.authenticated === true;
@@ -2815,6 +2998,7 @@ function reloadSelectedMarket() {
   if (state.token && $("#history-contract").value) loadResearchHistory({ reset: true });
   state.chartCursorTime = null;
   loadChartAnnotations();
+  if (state.token) loadRemoteChartAnnotations();
   renderChart([]);
   renderWatchlist({});
   renderMarketOverview({});
@@ -3187,6 +3371,7 @@ $("#auth-form").addEventListener("submit", async (event) => {
     ]);
     updatePrivateActionAvailability();
     if (state.token && privateLoaded && strategiesLoaded) {
+      await loadRemoteChartAnnotations({ migrate: true });
       setMessage("已解锁私有数据（令牌只保存在当前页面内存）", "good");
       $("#preview-signal").disabled = !state.analysis?.signal;
       $("#admin-token").value = "";

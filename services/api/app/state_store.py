@@ -315,6 +315,18 @@ class StateStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_tradingview_queue
                     ON tradingview_alerts(status, created_at);
+                CREATE TABLE IF NOT EXISTS chart_annotations (
+                    account_scope TEXT NOT NULL,
+                    annotation_id TEXT NOT NULL,
+                    inst_id TEXT NOT NULL,
+                    bar TEXT NOT NULL,
+                    annotation_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (account_scope, annotation_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_chart_annotations_scope
+                    ON chart_annotations(account_scope, inst_id, bar, updated_at);
                 CREATE TABLE IF NOT EXISTS position_lot_snapshots (
                     account_scope TEXT NOT NULL,
                     position_key TEXT NOT NULL,
@@ -1490,6 +1502,118 @@ class StateStore:
                 (max(1, min(limit, 500)),),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def list_chart_annotations(
+        self,
+        account_scope: str,
+        inst_id: str | None = None,
+        bar: str | None = None,
+        *,
+        limit: int = 2000,
+    ) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT annotation_id, inst_id, bar, annotation_json
+                   FROM chart_annotations
+                   WHERE account_scope = ?
+                     AND (? IS NULL OR inst_id = ?)
+                     AND (? IS NULL OR bar = ?)
+                   ORDER BY updated_at, annotation_id
+                   LIMIT ?""",
+                (
+                    account_scope,
+                    inst_id,
+                    inst_id,
+                    bar,
+                    bar,
+                    max(1, min(limit, 2000)),
+                ),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["annotation_json"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            result.append({
+                "id": row["annotation_id"],
+                "inst_id": row["inst_id"],
+                "bar": row["bar"],
+                **payload,
+            })
+        return result
+
+    def replace_chart_annotations(
+        self,
+        account_scope: str,
+        inst_id: str,
+        bar: str,
+        annotations: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        ids = [str(annotation["id"]) for annotation in annotations]
+        if len(ids) != len(set(ids)):
+            raise ValueError("chart_annotation_id_duplicate")
+        now = _utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for annotation_id in ids:
+                existing = connection.execute(
+                    """SELECT inst_id, bar FROM chart_annotations
+                       WHERE account_scope = ? AND annotation_id = ?""",
+                    (account_scope, annotation_id),
+                ).fetchone()
+                if existing and (
+                    existing["inst_id"] != inst_id or existing["bar"] != bar
+                ):
+                    raise ValueError("chart_annotation_id_conflict")
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                connection.execute(
+                    f"""DELETE FROM chart_annotations
+                        WHERE account_scope = ? AND inst_id = ? AND bar = ?
+                          AND annotation_id NOT IN ({placeholders})""",
+                    (account_scope, inst_id, bar, *ids),
+                )
+            else:
+                connection.execute(
+                    """DELETE FROM chart_annotations
+                       WHERE account_scope = ? AND inst_id = ? AND bar = ?""",
+                    (account_scope, inst_id, bar),
+                )
+            for annotation in annotations:
+                annotation_id = str(annotation["id"])
+                payload = {
+                    key: value for key, value in annotation.items() if key != "id"
+                }
+                encoded = json.dumps(
+                    payload,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                connection.execute(
+                    """INSERT INTO chart_annotations
+                       (account_scope, annotation_id, inst_id, bar, annotation_json,
+                        created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(account_scope, annotation_id) DO UPDATE SET
+                           inst_id = excluded.inst_id,
+                           bar = excluded.bar,
+                           annotation_json = excluded.annotation_json,
+                           updated_at = excluded.updated_at""",
+                    (
+                        account_scope,
+                        annotation_id,
+                        inst_id,
+                        bar,
+                        encoded,
+                        now,
+                        now,
+                    ),
+                )
+        return self.list_chart_annotations(account_scope, inst_id, bar)
 
     def save_bill_snapshot(
         self,

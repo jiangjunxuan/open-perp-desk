@@ -390,6 +390,91 @@ async def market_events(
     )
 
 
+class ChartAnnotationPoint(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    time: int = Field(gt=0, le=8640000000000000)
+    price: float = Field(gt=0)
+
+
+class ChartAnnotationEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    type: Literal["horizontal", "trend", "text"]
+    time: int | None = Field(default=None, gt=0, le=8640000000000000)
+    price: float | None = Field(default=None, gt=0)
+    start: ChartAnnotationPoint | None = None
+    end: ChartAnnotationPoint | None = None
+    text: str | None = Field(default=None, max_length=80)
+
+
+class ChartAnnotationBatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    annotations: list[ChartAnnotationEntry] = Field(default_factory=list, max_length=200)
+
+
+def _normalized_chart_annotation(item: ChartAnnotationEntry) -> dict[str, object]:
+    data = item.model_dump(exclude={"id"}, exclude_none=True, mode="json")
+    kind = data.get("type")
+    expected: dict[str, set[str]] = {
+        "horizontal": {"type", "price"},
+        "trend": {"type", "start", "end"},
+        "text": {"type", "time", "price", "text"},
+    }
+    if kind not in expected or set(data) != expected[kind]:
+        raise HTTPException(status_code=422, detail="invalid_chart_annotation_shape")
+    if kind == "text":
+        text = str(data["text"]).strip()
+        if not text:
+            raise HTTPException(status_code=422, detail="chart_annotation_text_required")
+        data["text"] = text
+    return {"id": item.id, **data}
+
+
+@app.get("/api/v1/market/annotations")
+def market_annotations(
+    inst_id: str = Query(
+        default="BTC-USDT-SWAP",
+        min_length=9,
+        max_length=40,
+        pattern=r"^[A-Z0-9]+-[A-Z0-9]+-SWAP$",
+    ),
+    bar: Literal["1m", "15m", "1H", "4H"] = "15m",
+    _: None = Depends(require_admin_token),
+) -> dict[str, object]:
+    return {
+        "data": state_store.list_chart_annotations(
+            account_client.account_scope,
+            inst_id,
+            bar,
+        )
+    }
+
+
+@app.put("/api/v1/market/annotations")
+def replace_market_annotations(
+    request: ChartAnnotationBatchRequest,
+    inst_id: str = Query(
+        default="BTC-USDT-SWAP",
+        min_length=9,
+        max_length=40,
+        pattern=r"^[A-Z0-9]+-[A-Z0-9]+-SWAP$",
+    ),
+    bar: Literal["1m", "15m", "1H", "4H"] = "15m",
+    _: None = Depends(require_admin_token),
+) -> dict[str, object]:
+    annotations = [_normalized_chart_annotation(item) for item in request.annotations]
+    try:
+        saved = state_store.replace_chart_annotations(
+            account_client.account_scope,
+            inst_id,
+            bar,
+            annotations,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"data": saved}
+
+
 @app.get("/api/v1/system/events")
 async def system_events() -> StreamingResponse:
     return StreamingResponse(

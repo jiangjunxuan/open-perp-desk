@@ -51,6 +51,65 @@ class RealtimeUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.revision, before)
         self.assertTrue(self.store.get_control_flag("test"))
 
+    def test_chart_annotations_are_account_and_market_scoped(self):
+        first = {
+            "id": "horizontal-1",
+            "type": "horizontal",
+            "price": 100,
+        }
+        second = {
+            "id": "note-1",
+            "type": "text",
+            "time": 1_700_000_000_000,
+            "price": 101,
+            "text": "支撑",
+        }
+        self.store.replace_chart_annotations("account-a", "BTC-USDT-SWAP", "15m", [first])
+        self.store.replace_chart_annotations("account-a", "ETH-USDT-SWAP", "15m", [second])
+        self.assertEqual(
+            self.store.list_chart_annotations("account-a", "BTC-USDT-SWAP", "15m"),
+            [{**first, "inst_id": "BTC-USDT-SWAP", "bar": "15m"}],
+        )
+        self.assertEqual(
+            self.store.list_chart_annotations("account-a", "ETH-USDT-SWAP", "15m"),
+            [{**second, "inst_id": "ETH-USDT-SWAP", "bar": "15m"}],
+        )
+        self.assertEqual(self.store.list_chart_annotations("account-b"), [])
+
+        self.store.replace_chart_annotations("account-a", "BTC-USDT-SWAP", "15m", [])
+        self.assertEqual(
+            self.store.list_chart_annotations("account-a", "BTC-USDT-SWAP", "15m"),
+            [],
+        )
+
+    async def test_private_stream_pushes_chart_annotation_changes(self):
+        account = SimpleNamespace(
+            configured=True, connected=True, authenticated=True, account_ready=True,
+            balance=[{"totalEq": "1000"}], last_message_at="now",
+        )
+        client = SimpleNamespace(configured=True, account_scope="fixture")
+        events = private_events(self.store, account, client, lambda: True)
+        self.addAsyncCleanup(close_events, events)
+
+        async def next_annotation():
+            async with asyncio.timeout(2):
+                while True:
+                    frame = await anext(events)
+                    if frame.startswith("event: chart_annotations\n"):
+                        return json.loads(frame.split("data: ", 1)[1])
+
+        self.assertEqual((await next_annotation())["data"], [])
+        annotation = {
+            "id": "trend-1",
+            "type": "trend",
+            "start": {"time": 1_700_000_000_000, "price": 100},
+            "end": {"time": 1_700_000_900_000, "price": 110},
+        }
+        self.store.replace_chart_annotations("fixture", "BTC-USDT-SWAP", "15m", [annotation])
+        payload = await next_annotation()
+        self.assertEqual(payload["data"][0]["id"], "trend-1")
+        self.assertNotIn("account_scope", payload["data"][0])
+
     async def test_selected_candles_and_symbol_freshness_are_independent(self):
         stream = OkxMarketStream([SYMBOL, "ETH-USDT-SWAP"])
         stream.connected = stream.candles_connected = True
