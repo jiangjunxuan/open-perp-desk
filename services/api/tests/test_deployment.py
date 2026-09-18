@@ -78,6 +78,26 @@ def proxy_report():
     }
 
 
+def ai_live_report():
+    return {
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "scope": "tradingagents_real_model_read_only",
+        "instrument": "BTC-USDT-SWAP", "bar": "15m", "mode": "fast",
+        "provider": "openai_compatible",
+        "market_evidence": {
+            "ticker_received": True, "candles_received": 100,
+            "funding_rate_received": True, "open_interest_received": True, "errors": [],
+        },
+        "analysis": {
+            "decision_type": "str", "decision_nonempty": True,
+            "state_keys": ["fast_research", "final_trade_decision"],
+        },
+        "provider_connection_verified": True,
+        "execution_authorized": False, "private_account_verified": False,
+        "trading_performed": False, "elapsed_seconds": 4.0,
+    }
+
+
 class FakeDeployment(deploy.Deployment):
     """Command contract fixture, not evidence of a running Docker engine."""
 
@@ -101,6 +121,7 @@ class FakeDeployment(deploy.Deployment):
         (root / "infra").mkdir()
         shutil.copyfile(ROOT / "infra/okx-private-smoke.py", root / "infra/okx-private-smoke.py")
         shutil.copyfile(ROOT / "infra/proxy-smoke.py", root / "infra/proxy-smoke.py")
+        shutil.copyfile(ROOT / "infra/ai-live-smoke.py", root / "infra/ai-live-smoke.py")
 
     def compose(self, *args, **kwargs):
         self.calls.append(args)
@@ -118,7 +139,12 @@ class FakeDeployment(deploy.Deployment):
         elif "--output" in args:
             self.probe_program = kwargs["stdin"].read()
             self.probe_timeout = kwargs["timeout"]
-            report = proxy_report() if b"okx_public_read_only_through_outbound_proxy" in self.probe_program else private_report()
+            if b"okx_public_read_only_through_outbound_proxy" in self.probe_program:
+                report = proxy_report()
+            elif b"tradingagents_real_model_read_only" in self.probe_program:
+                report = ai_live_report()
+            else:
+                report = private_report()
             output = json.dumps({**report, **self.probe_changes}).encode()
         elif args[-1] == "info":
             output = json.dumps({"format": 1, "database": self.model["services"]["api"]["environment"]["STATE_DB_PATH"]}).encode()
@@ -431,6 +457,34 @@ class DeploymentCommandTests(unittest.TestCase):
                 destination.write_text('{"old":true}')
                 with self.assertRaises(deploy.DeploymentError):
                     self.deployment.proxy_smoke()
+                self.assertFalse(destination.exists())
+
+    def test_ai_live_smoke_uses_running_container_and_requires_real_model_evidence(self):
+        result = self.deployment.ai_live_smoke(timeout=60)
+        self.assertEqual(self.deployment.calls, [
+            ("exec", "-T", "api", "python", "-", "--timeout", "60",
+             "--inst-id", "BTC-USDT-SWAP", "--bar", "15m", "--limit", "100", "--output", "-"),
+        ])
+        self.assertEqual(self.deployment.probe_timeout, 75)
+        self.assertIn(b"tradingagents_real_model_read_only", self.deployment.probe_program)
+        destination = self.root / "outputs/ai-verification.json"
+        self.assertEqual(json.loads(destination.read_text()), result)
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+
+    def test_ai_live_smoke_rejects_provider_or_execution_claims(self):
+        for changes in (
+            {"provider_connection_verified": False},
+            {"execution_authorized": True},
+            {"analysis": {"decision_nonempty": False}},
+            {"checked_at": "2000-01-01T00:00:00+00:00"},
+        ):
+            with self.subTest(changes=changes):
+                self.deployment.probe_changes = changes
+                destination = self.root / "outputs/ai-verification.json"
+                destination.parent.mkdir(exist_ok=True)
+                destination.write_text('{"old":true}')
+                with self.assertRaises(deploy.DeploymentError):
+                    self.deployment.ai_live_smoke(timeout=60)
                 self.assertFalse(destination.exists())
 
     def test_private_smoke_rejects_stale_unsafe_and_secret_bearing_reports(self):

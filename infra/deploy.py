@@ -430,6 +430,66 @@ class Deployment:
         print(json.dumps(report, ensure_ascii=True, indent=2))
         return report
 
+    def ai_live_smoke(
+        self, *, timeout: float = 240, inst_id: str = "BTC-USDT-SWAP",
+        bar: str = "15m", limit: int = 100,
+    ) -> dict:
+        if not 30 <= timeout <= 1800:
+            raise DeploymentError("AI live smoke timeout must be between 30 and 1800 seconds.")
+        if not re.fullmatch(r"[A-Z0-9]{2,20}-(?:USDT|USDC|USD)-SWAP", inst_id):
+            raise DeploymentError("AI live smoke instrument must be an OKX perpetual instrument.")
+        if not re.fullmatch(r"[0-9]+[mHhDWMw]", bar) or not 30 <= limit <= 300:
+            raise DeploymentError("AI live smoke candle parameters are invalid.")
+        output = self.root / "outputs/ai-verification.json"
+        output.unlink(missing_ok=True)
+        self.require_environment_file()
+        started = datetime.now(timezone.utc)
+        with (self.root / "infra/ai-live-smoke.py").open("rb") as program:
+            result = self.compose(
+                "exec", "-T", "api", "python", "-",
+                "--timeout", str(timeout), "--inst-id", inst_id,
+                "--bar", bar, "--limit", str(limit), "--output", "-",
+                stdin=program, timeout=timeout + 15,
+            )
+        try:
+            report = json.loads(result.stdout)
+            fields = {
+                "checked_at", "scope", "instrument", "bar", "mode", "provider",
+                "market_evidence", "analysis", "provider_connection_verified",
+                "execution_authorized", "private_account_verified", "trading_performed",
+                "elapsed_seconds",
+            }
+            if not isinstance(report, dict) or set(report) != fields:
+                raise ValueError("unexpected report fields")
+            if report["scope"] != "tradingagents_real_model_read_only":
+                raise ValueError("invalid scope")
+            if report["instrument"] != inst_id or report["bar"] != bar:
+                raise ValueError("instrument or bar mismatch")
+            if report["provider_connection_verified"] is not True:
+                raise ValueError("model provider was not verified")
+            if report["execution_authorized"] is not False or report["private_account_verified"] is not False or report["trading_performed"] is not False:
+                raise ValueError("unsafe AI report")
+            checked = datetime.fromisoformat(report["checked_at"])
+            if checked.tzinfo is None or not started <= checked <= datetime.now(timezone.utc):
+                raise ValueError("stale report")
+            elapsed = report["elapsed_seconds"]
+            if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)) or not math.isfinite(elapsed) or elapsed < 0:
+                raise ValueError("invalid elapsed time")
+            evidence = report["market_evidence"]
+            if not isinstance(evidence, dict) or evidence.get("ticker_received") is not True or evidence.get("funding_rate_received") is not True or evidence.get("open_interest_received") is not True:
+                raise ValueError("incomplete market evidence")
+            if type(evidence.get("candles_received")) is not int or evidence["candles_received"] < 30 or evidence.get("errors") != []:
+                raise ValueError("incomplete candle evidence")
+            analysis = report["analysis"]
+            if not isinstance(analysis, dict) or analysis.get("decision_nonempty") is not True or not isinstance(analysis.get("state_keys"), list) or not analysis["state_keys"]:
+                raise ValueError("empty AI result")
+        except (ValueError, TypeError, KeyError) as error:
+            raise DeploymentError("AI live smoke returned invalid or incomplete evidence; no report was published.") from error
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_json(output, report)
+        print(json.dumps(report, ensure_ascii=True, indent=2))
+        return report
+
     def api_containers(self) -> list[dict]:
         raw = self.compose("ps", "--all", "--format", "json", "api").stdout
         try:
@@ -547,6 +607,11 @@ def main() -> None:
     proxy_smoke = commands.add_parser("proxy-smoke")
     proxy_smoke.add_argument("--timeout", type=float, default=45)
     proxy_smoke.add_argument("--symbols", default="BTC-USDT-SWAP,ETH-USDT-SWAP")
+    ai_live_smoke = commands.add_parser("ai-live-smoke")
+    ai_live_smoke.add_argument("--timeout", type=float, default=240)
+    ai_live_smoke.add_argument("--inst-id", default="BTC-USDT-SWAP")
+    ai_live_smoke.add_argument("--bar", default="15m")
+    ai_live_smoke.add_argument("--limit", type=int, default=100)
     commands.add_parser("restore").add_argument("source", type=Path)
     commands.add_parser("logs").add_argument("service", nargs="?")
     args = parser.parse_args()
@@ -565,6 +630,11 @@ def main() -> None:
                 deployment.private_smoke(timeout=args.timeout, allow_live=args.allow_live)
             elif args.command == "proxy-smoke":
                 deployment.proxy_smoke(timeout=args.timeout, symbols=args.symbols)
+            elif args.command == "ai-live-smoke":
+                deployment.ai_live_smoke(
+                    timeout=args.timeout, inst_id=args.inst_id,
+                    bar=args.bar, limit=args.limit,
+                )
             elif args.command == "backup":
                 deployment.backup()
             elif args.command == "restore":

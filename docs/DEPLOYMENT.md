@@ -190,6 +190,15 @@ SOCKS5 握手失败时会主动清理尚未交给 HTTP 连接管理的套接字�
 本地开发环境也可以直接使用已安装项目依赖的虚拟环境运行
 `python infra/proxy-smoke.py --timeout 45`。
 
+真实模型服务的只读验收使用容器内入口：
+
+```bash
+./infra/openperpdesk.sh ai-live-smoke --timeout 240
+```
+
+该命令只读取公共 OKX 行情并执行 TradingAgents 研究，不读取私有账户、不提交订单，
+报告只包含模型连接、公共证据数量、结果字段和 `execution_authorized=false`。
+
 它会同时验证 OKX REST、公共报价和 `1m`、`15m`、`1H`、`4H` K 线；
 只输出脱敏连接证据，不读取私有账户，不执行交易。
 

@@ -183,6 +183,15 @@ K 线是否经出站代理连通：
 ./infra/openperpdesk.sh proxy-smoke --timeout 45
 ```
 
+服务器上还可以用容器内的真实模型做一次只读 TradingAgents 验收：
+
+```bash
+./infra/openperpdesk.sh ai-live-smoke --timeout 240
+```
+
+它读取 OKX 公共快照并调用配置的模型服务，报告只保存模型连接、证据数量和
+不可执行标志，不保存模型正文、凭据或账户数据；失败时不会留下旧的成功报告。
+
 完整交易闭环本地联调：
 
 ```bash
