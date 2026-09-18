@@ -12,9 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from dotenv import dotenv_values
-
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path.cwd() if __file__ in {"<stdin>", "-"} else Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "services/api"))
 
 from app.okx_market import OkxMarketClient
@@ -151,27 +149,62 @@ def load_environment() -> None:
     path = Path(os.getenv("OPENPERPDESK_ENV_FILE", ROOT / ".env"))
     if not path.is_file():
         return
-    for name, value in dotenv_values(path, interpolate=False).items():
-        if value is not None:
-            os.environ.setdefault(name, value)
+    for name, value in read_env_file(path).items():
+        os.environ.setdefault(name, value)
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    """Read the small, non-interpolating .env subset used by deployment probes."""
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        name = name.strip()
+        if not name or not name.replace("_", "a").isalnum() or name[0].isdigit():
+            continue
+        value = value.strip()
+        if value.startswith(("'", '"')) and len(value) >= 2 and value[-1] == value[0]:
+            quote = value[0]
+            value = value[1:-1]
+            if quote == '"':
+                value = (
+                    value.replace("\\n", "\n")
+                    .replace("\\r", "\r")
+                    .replace("\\t", "\t")
+                    .replace('\\"', '"')
+                    .replace("\\\\", "\\")
+                )
+        else:
+            value = value.split(" #", 1)[0].rstrip()
+        values[name] = value
+    return values
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timeout", type=float, default=45)
     parser.add_argument("--symbols", default="BTC-USDT-SWAP,ETH-USDT-SWAP")
+    parser.add_argument("--output", type=Path, default=ROOT / "outputs" / "proxy-verification.json")
     args = parser.parse_args()
     if not 5 <= args.timeout <= 300:
         parser.error("--timeout must be between 5 and 300 seconds")
     symbols = [item.strip().upper() for item in args.symbols.split(",") if item.strip()]
     if not symbols or any(not item.endswith("-SWAP") for item in symbols):
         parser.error("--symbols must contain OKX perpetual instruments")
-    destination = ROOT / "outputs" / "proxy-verification.json"
-    destination.unlink(missing_ok=True)
+    destination = None if args.output == Path("-") else args.output
+    if destination is not None:
+        destination.unlink(missing_ok=True)
     try:
         load_environment()
         result = asyncio.run(run(args.timeout, symbols))
-        write_private_json(destination, result)
+        if destination is not None:
+            write_private_json(destination, result)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except (OSError, RuntimeError, TimeoutError, ValueError) as error:

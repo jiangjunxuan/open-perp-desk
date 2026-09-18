@@ -51,6 +51,33 @@ def private_report():
     }
 
 
+def proxy_report():
+    symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
+    bars = ["1m", "15m", "1H", "4H"]
+    return {
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "scope": "okx_public_read_only_through_outbound_proxy",
+        "proxy_configured": True,
+        "proxy_scheme": "socks5h",
+        "rest": [
+            {"instrument": symbol, "ticker_instrument_matches": True, "candles_received": 10}
+            for symbol in symbols
+        ],
+        "websocket": {
+            "quotes_connected": True, "quotes_fresh": True,
+            "candles_connected": True, "candles_fresh": True,
+            "symbols": symbols, "candle_bars": bars, "quotes_advanced": True,
+            "received": [
+                {"instrument": symbol, "quote_fresh": True, "fresh_candle_bars": bars}
+                for symbol in symbols
+            ],
+        },
+        "private_account_verified": False,
+        "trading_performed": False,
+        "elapsed_seconds": 2.0,
+    }
+
+
 class FakeDeployment(deploy.Deployment):
     """Command contract fixture, not evidence of a running Docker engine."""
 
@@ -73,6 +100,7 @@ class FakeDeployment(deploy.Deployment):
         shutil.copyfile(ROOT / "services/api/app/database_maintenance.py", helper)
         (root / "infra").mkdir()
         shutil.copyfile(ROOT / "infra/okx-private-smoke.py", root / "infra/okx-private-smoke.py")
+        shutil.copyfile(ROOT / "infra/proxy-smoke.py", root / "infra/proxy-smoke.py")
 
     def compose(self, *args, **kwargs):
         self.calls.append(args)
@@ -90,7 +118,8 @@ class FakeDeployment(deploy.Deployment):
         elif "--output" in args:
             self.probe_program = kwargs["stdin"].read()
             self.probe_timeout = kwargs["timeout"]
-            output = json.dumps({**private_report(), **self.probe_changes}).encode()
+            report = proxy_report() if b"okx_public_read_only_through_outbound_proxy" in self.probe_program else private_report()
+            output = json.dumps({**report, **self.probe_changes}).encode()
         elif args[-1] == "info":
             output = json.dumps({"format": 1, "database": self.model["services"]["api"]["environment"]["STATE_DB_PATH"]}).encode()
         elif "restore" in args:
@@ -376,6 +405,33 @@ class DeploymentCommandTests(unittest.TestCase):
         destination = self.root / "outputs/okx-private-verification.json"
         self.assertEqual(json.loads(destination.read_text()), result)
         self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+
+    def test_proxy_smoke_uses_running_container_environment_and_public_report(self):
+        result = self.deployment.proxy_smoke(timeout=20)
+        self.assertEqual(self.deployment.calls, [
+            ("exec", "-T", "api", "python", "-", "--timeout", "20", "--symbols",
+             "BTC-USDT-SWAP,ETH-USDT-SWAP", "--output", "-"),
+        ])
+        self.assertEqual(self.deployment.probe_timeout, 35)
+        self.assertIn(b"okx_public_read_only_through_outbound_proxy", self.deployment.probe_program)
+        destination = self.root / "outputs/proxy-verification.json"
+        self.assertEqual(json.loads(destination.read_text()), result)
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+
+    def test_proxy_smoke_rejects_unsafe_or_incomplete_evidence(self):
+        for changes in (
+            {"proxy_configured": False}, {"trading_performed": True},
+            {"websocket": {"quotes_connected": False}},
+            {"checked_at": "2000-01-01T00:00:00+00:00"},
+        ):
+            with self.subTest(changes=changes):
+                self.deployment.probe_changes = changes
+                destination = self.root / "outputs/proxy-verification.json"
+                destination.parent.mkdir(exist_ok=True)
+                destination.write_text('{"old":true}')
+                with self.assertRaises(deploy.DeploymentError):
+                    self.deployment.proxy_smoke()
+                self.assertFalse(destination.exists())
 
     def test_private_smoke_rejects_stale_unsafe_and_secret_bearing_reports(self):
         destination = self.root / "outputs/okx-private-verification.json"

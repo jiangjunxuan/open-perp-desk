@@ -112,3 +112,46 @@ class ProxyWebsocketProbeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "fixture_start_failed"):
             await probe.websocket_probe(self.stream, .1)
         self.stream.stop.assert_awaited_once()
+
+
+class ProxyEnvironmentTests(unittest.TestCase):
+    def test_read_env_file_supports_quotes_export_and_comments_without_interpolation(self):
+        with self.subTest("values"):
+            from tempfile import TemporaryDirectory
+
+            with TemporaryDirectory() as directory:
+                path = Path(directory) / ".env"
+                path.write_text(
+                    """
+                    # Keep this URL literal; it must not expand shell variables.
+                    export OKX_PROXY_URL='socks5h://user:pa#ss@proxy.example:1080'
+                    PUSHPLUS_PROXY_URL="http://proxy.example:8080"
+                    LITERAL=$HOME # trailing comment
+                    EMPTY=
+                    ignored-without-equals
+                    """,
+                    encoding="utf-8",
+                )
+                self.assertEqual(probe.read_env_file(path), {
+                    "OKX_PROXY_URL": "socks5h://user:pa#ss@proxy.example:1080",
+                    "PUSHPLUS_PROXY_URL": "http://proxy.example:8080",
+                    "LITERAL": "$HOME",
+                    "EMPTY": "",
+                })
+
+    def test_load_environment_does_not_override_process_environment(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory, patch.dict(
+            probe.os.environ,
+            {"OPENPERPDESK_ENV_FILE": str(Path(directory) / ".env"),
+             "OKX_PROXY_URL": "process-value"},
+            clear=False,
+        ):
+            Path(directory, ".env").write_text(
+                "OKX_PROXY_URL=file-value\nPUSHPLUS_PROXY_URL=file-push\n",
+                encoding="utf-8",
+            )
+            probe.load_environment()
+            self.assertEqual(probe.os.environ["OKX_PROXY_URL"], "process-value")
+            self.assertEqual(probe.os.environ["PUSHPLUS_PROXY_URL"], "file-push")

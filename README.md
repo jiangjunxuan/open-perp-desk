@@ -164,7 +164,7 @@ TradingView Alert 接入、JSON 格式和默认安全边界见 [`docs/TRADINGVIE
 HTTP/SOCKS5 测试代理，覆盖 REST 签名、四路 WebSocket、止盈止损参数、
 PushPlus 传输和重连。它不替代真实 OKX Demo 或微信送达验收。
 
-配置 `OKX_PROXY_URL` 后，可以用下面的只读命令同时验收 OKX REST、报价和多周期
+本地开发配置 `OKX_PROXY_URL` 后，可以用下面的只读命令同时验收 OKX REST、报价和多周期
 K 线是否经出站代理连通：
 
 ```bash
@@ -175,6 +175,13 @@ K 线是否经出站代理连通：
 连接状态和记录数量，不包含代理地址、用户名或密码。WebSocket 验收逐合约检查报价更新，
 并确认 1m、15m、1H、4H 四个周期都有新鲜、有效的 K 线；任意订阅缺失或过期均不通过。
 该命令不会登录私有账户或发单。
+
+目标服务器或宝塔部署使用下面的入口。它会把验收脚本送进运行中的 API 容器，
+不要求宿主机安装 API 依赖，也不会重启服务：
+
+```bash
+./infra/openperpdesk.sh proxy-smoke --timeout 45
+```
 
 完整交易闭环本地联调：
 

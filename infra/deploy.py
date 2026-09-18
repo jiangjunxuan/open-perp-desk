@@ -353,6 +353,83 @@ class Deployment:
         print(json.dumps(report, ensure_ascii=True, indent=2))
         return report
 
+    def proxy_smoke(self, *, timeout: float = 45, symbols: str = "BTC-USDT-SWAP,ETH-USDT-SWAP") -> dict:
+        if not 5 <= timeout <= 300:
+            raise DeploymentError("Proxy smoke timeout must be between 5 and 300 seconds.")
+        requested = [item.strip().upper() for item in symbols.split(",") if item.strip()]
+        if not requested or any(not re.fullmatch(r"[A-Z0-9]+-[A-Z0-9]+-SWAP", item) for item in requested):
+            raise DeploymentError("Proxy smoke symbols must contain OKX perpetual instruments.")
+        output = self.root / "outputs/proxy-verification.json"
+        output.unlink(missing_ok=True)
+        self.require_environment_file()
+        started = datetime.now(timezone.utc)
+        with (self.root / "infra/proxy-smoke.py").open("rb") as program:
+            result = self.compose(
+                "exec", "-T", "api", "python", "-",
+                "--timeout", str(timeout), "--symbols", ",".join(requested), "--output", "-",
+                stdin=program, timeout=timeout + 15,
+            )
+        try:
+            report = json.loads(result.stdout)
+            fields = {
+                "checked_at", "scope", "proxy_configured", "proxy_scheme", "rest",
+                "websocket", "private_account_verified", "trading_performed", "elapsed_seconds",
+            }
+            if not isinstance(report, dict) or set(report) != fields:
+                raise ValueError("unexpected report fields")
+            if report["scope"] != "okx_public_read_only_through_outbound_proxy":
+                raise ValueError("invalid scope")
+            if report["proxy_configured"] is not True or report["proxy_scheme"] not in {"http", "https", "socks5", "socks5h"}:
+                raise ValueError("proxy is not confirmed")
+            if report["private_account_verified"] is not False or report["trading_performed"] is not False:
+                raise ValueError("unsafe probe report")
+            checked = datetime.fromisoformat(report["checked_at"])
+            if checked.tzinfo is None or not started <= checked <= datetime.now(timezone.utc):
+                raise ValueError("stale report")
+            elapsed = report["elapsed_seconds"]
+            if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)) or not math.isfinite(elapsed) or elapsed < 0:
+                raise ValueError("invalid elapsed time")
+
+            rest = report["rest"]
+            if not isinstance(rest, list) or len(rest) != len(requested):
+                raise ValueError("invalid REST evidence")
+            for symbol, row in zip(requested, rest):
+                if not isinstance(row, dict) or set(row) != {"instrument", "ticker_instrument_matches", "candles_received"}:
+                    raise ValueError("invalid REST evidence")
+                if row["instrument"] != symbol or row["ticker_instrument_matches"] is not True:
+                    raise ValueError("REST instrument mismatch")
+                if type(row["candles_received"]) is not int or row["candles_received"] < 2:
+                    raise ValueError("invalid candle count")
+
+            websocket = report["websocket"]
+            websocket_fields = {
+                "quotes_connected", "quotes_fresh", "candles_connected", "candles_fresh",
+                "symbols", "candle_bars", "quotes_advanced", "received",
+            }
+            if not isinstance(websocket, dict) or set(websocket) != websocket_fields:
+                raise ValueError("invalid WebSocket evidence")
+            if any(websocket[name] is not True for name in (
+                "quotes_connected", "quotes_fresh", "candles_connected", "candles_fresh", "quotes_advanced",
+            )):
+                raise ValueError("WebSocket stream is not fresh")
+            bars = ["1m", "15m", "1H", "4H"]
+            if websocket["symbols"] != requested or websocket["candle_bars"] != bars:
+                raise ValueError("WebSocket subscriptions do not match request")
+            received = websocket["received"]
+            if not isinstance(received, list) or len(received) != len(requested):
+                raise ValueError("incomplete WebSocket evidence")
+            for symbol, row in zip(requested, received):
+                if not isinstance(row, dict) or set(row) != {"instrument", "quote_fresh", "fresh_candle_bars"}:
+                    raise ValueError("invalid WebSocket evidence")
+                if row["instrument"] != symbol or row["quote_fresh"] is not True or row["fresh_candle_bars"] != bars:
+                    raise ValueError("stale or incomplete WebSocket evidence")
+        except (ValueError, TypeError, KeyError) as error:
+            raise DeploymentError("Proxy smoke returned invalid or incomplete evidence; no report was published.") from error
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_json(output, report)
+        print(json.dumps(report, ensure_ascii=True, indent=2))
+        return report
+
     def api_containers(self) -> list[dict]:
         raw = self.compose("ps", "--all", "--format", "json", "api").stdout
         try:
@@ -467,6 +544,9 @@ def main() -> None:
     private_smoke = commands.add_parser("private-smoke")
     private_smoke.add_argument("--timeout", type=float, default=45)
     private_smoke.add_argument("--allow-live", action="store_true")
+    proxy_smoke = commands.add_parser("proxy-smoke")
+    proxy_smoke.add_argument("--timeout", type=float, default=45)
+    proxy_smoke.add_argument("--symbols", default="BTC-USDT-SWAP,ETH-USDT-SWAP")
     commands.add_parser("restore").add_argument("source", type=Path)
     commands.add_parser("logs").add_argument("service", nargs="?")
     args = parser.parse_args()
@@ -483,6 +563,8 @@ def main() -> None:
         with deployment.lock():
             if args.command == "private-smoke":
                 deployment.private_smoke(timeout=args.timeout, allow_live=args.allow_live)
+            elif args.command == "proxy-smoke":
+                deployment.proxy_smoke(timeout=args.timeout, symbols=args.symbols)
             elif args.command == "backup":
                 deployment.backup()
             elif args.command == "restore":

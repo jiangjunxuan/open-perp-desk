@@ -180,11 +180,15 @@ SOCKS5 握手失败时会主动清理尚未交给 HTTP 连接管理的套接字�
 `OKX_WS_BUSINESS_URL` 则用于需要登录的止盈止损订单流，留空时按 Demo/实盘
 选择地址，不要将它与公共 K 线端点混淆。所有连接共用 `OKX_PROXY_URL`。
 
-部署后可先运行只读代理验收：
+部署后可先运行只读代理验收。目标服务器应通过部署入口在 API 容器内执行，
+这样宿主机不需要安装 API 的 Python 依赖：
 
 ```bash
-python infra/proxy-smoke.py --timeout 45
+./infra/openperpdesk.sh proxy-smoke --timeout 45
 ```
+
+本地开发环境也可以直接使用已安装项目依赖的虚拟环境运行
+`python infra/proxy-smoke.py --timeout 45`。
 
 它会同时验证 OKX REST、公共报价和 `1m`、`15m`、`1H`、`4H` K 线；
 只输出脱敏连接证据，不读取私有账户，不执行交易。
