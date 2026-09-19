@@ -77,7 +77,7 @@ class OkxAccountTests(unittest.TestCase):
             __import__("asyncio").run(client.pending_orders())
         mocked.assert_awaited_once_with(
             "/api/v5/trade/orders-pending",
-            {"instType": "SWAP"},
+            {"instType": "SWAP", "limit": "100"},
         )
 
     def test_fills_history_uses_swap_endpoint(self) -> None:
@@ -149,7 +149,7 @@ class OkxAccountTests(unittest.TestCase):
             __import__("asyncio").run(client.pending_algo_orders(limit=25))
         mocked.assert_awaited_once_with(
             "/api/v5/trade/orders-algo-pending",
-            {"instType": "SWAP", "limit": "25"},
+            {"instType": "SWAP", "ordType": "conditional,oco", "limit": "25"},
         )
 
     def test_algo_order_history_uses_swap_endpoint(self) -> None:
@@ -169,9 +169,12 @@ class OkxAccountTests(unittest.TestCase):
             new=__import__("unittest").mock.AsyncMock(return_value=[]),
         ) as mocked:
             __import__("asyncio").run(client.algo_orders_history(limit=25))
-        mocked.assert_awaited_once_with(
-            "/api/v5/trade/orders-algo-history",
-            {"instType": "SWAP", "limit": "25"},
+        self.assertEqual(mocked.await_count, 3)
+        self.assertEqual(
+            [call.args for call in mocked.await_args_list],
+            [("/api/v5/trade/orders-algo-history", {
+                "instType": "SWAP", "ordType": "conditional,oco", "state": state, "limit": "25",
+            }) for state in ("effective", "canceled", "order_failed")],
         )
 
 
@@ -293,6 +296,30 @@ class HealthEndpointTests(unittest.TestCase):
         self.assertTrue(payload["state_store_ready"])
         self.assertTrue(payload["algo_stream"]["configured"])
         self.assertFalse(payload["algo_stream"]["connected"])
+
+    def test_public_status_and_readiness_do_not_expose_database_paths(self) -> None:
+        with patch.object(api_main, "market_stream", self.ReadyMarket()):
+            ready = api_main.readiness()
+        status = api_main.system_status()
+        for payload in (ready, status, api_main.health_metrics()):
+            serialized = __import__("json").dumps(payload)
+            self.assertNotIn(str(api_main.state_store.path), serialized)
+        self.assertEqual(status["state_store"], {"ok": True})
+        self.assertEqual(ready["checks"]["state_store"], {"ok": True})
+
+    def test_system_status_exposes_private_account_stream_configuration(self) -> None:
+        class ConfiguredAccountStream:
+            configured = True
+            connected = True
+            authenticated = True
+            last_message_at = "2026-09-12T00:00:00+00:00"
+            last_error = None
+
+        with patch.object(api_main, "account_stream", ConfiguredAccountStream()):
+            payload = api_main.system_status()
+
+        self.assertTrue(payload["account_stream"]["configured"])
+        self.assertTrue(payload["account_stream"]["authenticated"])
 
 
 class ProxyConfigurationTests(unittest.TestCase):

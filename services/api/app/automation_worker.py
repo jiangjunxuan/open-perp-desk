@@ -1,12 +1,17 @@
 import asyncio
+import hashlib
+import json
+import math
 import os
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
-from typing import Any, Callable
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from typing import Any, Awaitable, Callable
 
 from .account_sync import AccountSynchronizer
 from .execution_engine import ExecutionEngine
-from .okx_account import OkxAccountClient
+from .protection_handoff import ProtectionHandoff
+from .protection_adjustment import ProtectionAdjustment
+from .okx_account import OkxAccountClient, OkxAccountError
 from .okx_market import OkxMarketClient
 from .risk_engine import RiskEngine
 from .state_store import StateStore
@@ -38,6 +43,7 @@ class AutomationWorker:
         store: StateStore,
         safety: SafetyController | None = None,
         market_data_fresh: Callable[[], bool] | None = None,
+        notifier: Callable[..., Awaitable[bool]] | None = None,
     ) -> None:
         self.market_client = market_client
         self.account_client = account_client
@@ -48,6 +54,7 @@ class AutomationWorker:
         self.store = store
         self.safety = safety or SafetyController(store)
         self.market_data_fresh = market_data_fresh or (lambda: True)
+        self.notifier = notifier
         self.enabled = os.getenv("AUTO_TRADING_ENABLED", "false").lower() == "true"
         self.dry_run = os.getenv("AUTO_TRADING_DRY_RUN", "true").lower() == "true"
         self.strategy_id = os.getenv(
@@ -67,12 +74,21 @@ class AutomationWorker:
         self.last_error: str | None = None
         self.run_count = 0
         self._task: asyncio.Task[None] | None = None
+        self._cycle_lock = asyncio.Lock()
+        self.protection_handoff = ProtectionHandoff(store, account_sync, execution, account=account_client)
+        self.protection_adjustment = ProtectionAdjustment(self.protection_handoff, market_client)
 
     async def start(self) -> None:
         if self.enabled and self._task is None:
             self._task = asyncio.create_task(
                 self._run(),
                 name="openperpdesk-automation-worker",
+            )
+            await self._notify_event(
+                "worker_started",
+                "OpenPerpDesk Worker 已启动",
+                f"自动 Worker 已启动，模式：{'Dry Run' if self.dry_run else 'Demo 执行'}。",
+                payload={"dry_run": self.dry_run, "symbols": _symbols()},
             )
 
     async def stop(self) -> None:
@@ -81,6 +97,11 @@ class AutomationWorker:
         self._task.cancel()
         await asyncio.gather(self._task, return_exceptions=True)
         self._task = None
+        await self._notify_event(
+            "worker_stopped",
+            "OpenPerpDesk Worker 已停止",
+            "自动 Worker 已停止，不再生成新的策略执行请求。",
+        )
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -97,6 +118,12 @@ class AutomationWorker:
         }
 
     async def run_once(self) -> dict[str, Any]:
+        if self._cycle_lock.locked():
+            return {"ran": False, "reason": "worker_cycle_in_progress"}
+        async with self._cycle_lock:
+            return await self._run_once()
+
+    async def _run_once(self) -> dict[str, Any]:
         if not self.enabled:
             return {"ran": False, "reason": "AUTO_TRADING_ENABLED is false"}
         if not self.safety.execution_allowed:
@@ -123,24 +150,86 @@ class AutomationWorker:
                 # Refresh private state immediately before sizing/risk checks.
                 # The background reconciler remains useful between cycles.
                 rest_result = await self.account_sync.sync_rest()
+                if rest_result.get("errors"):
+                    raise OkxAccountError("Private account snapshot is incomplete")
             except Exception as exc:
                 self.store.add_audit(
                     "worker_account_sync_failed",
-                    "Worker kept the last private state after account refresh failure",
+                    "Worker skipped trading after account refresh failure",
                     severity="warning",
                     payload={"error": type(exc).__name__},
                 )
-        account_equity = await self._account_equity()
+                await self._notify_event(
+                    "worker_account_sync_failed",
+                    "OpenPerpDesk Worker 账户刷新失败",
+                    f"Worker 未能刷新完整账户状态，已停止本轮交易：{type(exc).__name__}。",
+                    payload={"error": type(exc).__name__},
+                    severity="warning",
+                )
+                return {"ran": False, "reason": "account_snapshot_unavailable"}
+        try:
+            account_equity = await self._account_equity()
+        except (OkxAccountError, ValueError, TypeError) as exc:
+            self.store.add_audit(
+                "worker_equity_unavailable",
+                "Worker skipped trading because verified account equity is unavailable",
+                severity="warning",
+                payload={"error": type(exc).__name__},
+            )
+            return {"ran": False, "reason": "account_equity_unavailable"}
         risk_context = self.store.risk_context(account_equity)
         current_notional = risk_context["current_notional"]
         results: list[dict[str, Any]] = []
         for symbol in _symbols():
-            ticker = await self.market_client.ticker(symbol)
-            last_price = float(ticker.get("last") or 0)
-            if last_price > 0:
+            protected = any(
+                position["inst_id"] == symbol and (position["stop_loss"] or position["take_profit"])
+                for position in self.store.list_positions()
+            )
+            if self.account_client.configured:
+                protected = protected or self.protection_handoff.has_work(symbol)
+                protected = protected or self.protection_adjustment.has_work(symbol)
+            if protected:
+                try:
+                    mark_price = await self.market_client.mark_price(symbol)
+                except Exception as exc:
+                    self.store.add_audit(
+                        "worker_protection_price_unavailable",
+                        "Worker skipped this instrument because its mark price is unavailable",
+                        severity="warning",
+                        payload={"inst_id": symbol, "error": type(exc).__name__},
+                    )
+                    await self._notify_event(
+                        "worker_protection_price_unavailable",
+                        "OpenPerpDesk 保护价格暂不可用",
+                        f"{symbol} 未取得有效标记价格，已暂停本轮本地保护判断和策略决策，请核对交易所原生保护单。",
+                        payload={"inst_id": symbol}, severity="warning",
+                    )
+                    results.append({
+                        "inst_id": symbol, "action": "skip_protection_price_unavailable",
+                        "accepted": False, "reasons": ["mark_price_unavailable"],
+                    })
+                    continue
+                if self.account_client.configured:
+                    if self.store.protection_adjustments(self.account_client.account_scope, symbol):
+                        results.append(await self.protection_adjustment.run(
+                            symbol, mark_price, dry_run=self.dry_run, market_data_fresh=self.market_data_fresh(),
+                        ))
+                        continue
+                    handoff_result = await self.protection_handoff.run(
+                        symbol, mark_price, dry_run=self.dry_run, market_data_fresh=self.market_data_fresh(),
+                    )
+                    if handoff_result is not None:
+                        results.append(handoff_result)
+                        continue
+                    adjustment_result = await self.protection_adjustment.run(
+                        symbol, mark_price, dry_run=self.dry_run, market_data_fresh=self.market_data_fresh(),
+                    )
+                    if adjustment_result is not None:
+                        results.append(adjustment_result)
+                        continue
                 exit_event = self.execution.protective_exit(
                     inst_id=symbol,
-                    mark_price=last_price,
+                    mark_price=mark_price,
                 )
                 if exit_event:
                     position = exit_event["position"]
@@ -148,6 +237,22 @@ class AutomationWorker:
                         position["pos_side"] in {"long", "net"}
                         and position["size"] > 0
                     )
+                    close_side = "sell" if is_long else "buy"
+                    if not self.dry_run and self.store.has_active_standard_close(symbol, close_side):
+                        results.append({
+                            "inst_id": symbol, "action": "skip_pending_protective_close",
+                            "accepted": False, "reasons": ["close_order_unconfirmed"],
+                        })
+                        continue
+                    close_key = f"{symbol}:{position['position_key']}:{exit_event['reason']}"
+                    if exit_event.get("protection"):
+                        revision = hashlib.sha256(json.dumps(
+                            exit_event["protection"], sort_keys=True, allow_nan=False,
+                        ).encode()).hexdigest()[:24]
+                        close_key += f":protection:{revision}"
+                    generation = position["lifecycle_generation"]
+                    if generation:
+                        close_key += f":lifecycle:{generation}"
                     close_signal = TradeSignal(
                         inst_id=symbol,
                         action="close",
@@ -163,12 +268,34 @@ class AutomationWorker:
                         current_notional=current_notional,
                         size=abs(float(position["size"])),
                         dry_run=self.dry_run,
-                        side_override="sell" if is_long else "buy",
-                        idempotency_key=(
-                            f"{symbol}:{position['position_key']}:{exit_event['reason']}"
-                        ),
+                        side_override=close_side,
+                        idempotency_key=close_key,
                         market_data_fresh=self.market_data_fresh(),
+                        expected_position_trade_id=position.get("exchange_trade_id"),
+                        expected_protection=exit_event.get("protection"),
                     )
+                    if (
+                        close_result.get("accepted")
+                        and not close_result.get("idempotent")
+                    ):
+                        await self.execution.notify_event(
+                            "protective_exit_preview" if self.dry_run else "protective_exit_triggered",
+                            "OpenPerpDesk 保护性平仓预览" if self.dry_run else "OpenPerpDesk 保护性平仓触发",
+                            (
+                                f"{symbol} {exit_event['reason']} 已触发，"
+                                f"标记价格 {mark_price}。"
+                                + ("仅风控预览，不会向交易所发单。" if self.dry_run else "已提交平仓请求。")
+                            ),
+                            payload={
+                                "inst_id": symbol,
+                                "reason": exit_event["reason"],
+                                "mark_price": mark_price,
+                                "price_source": "mark",
+                                "size": abs(float(position["size"])),
+                                "dry_run": self.dry_run,
+                            },
+                            severity="warning",
+                        )
                     results.append(
                         {
                             "inst_id": symbol,
@@ -177,6 +304,8 @@ class AutomationWorker:
                         }
                     )
                     continue
+            ticker = await self.market_client.ticker(symbol)
+            last_price = float(ticker.get("last") or 0)
             candles = await self.market_client.candles(
                 symbol,
                 self.bar,
@@ -275,16 +404,18 @@ class AutomationWorker:
         }
 
     async def _account_equity(self) -> float:
-        fallback = float(os.getenv("AUTO_TRADING_ACCOUNT_EQUITY", "1000"))
         if not self.account_client.configured:
-            return fallback
-        try:
+            if not self.dry_run:
+                raise OkxAccountError("Private account credentials are required")
+            equity = float(os.getenv("AUTO_TRADING_ACCOUNT_EQUITY", "1000"))
+        else:
             rows = await self.account_client.balance()
-            if rows:
-                return float(rows[0].get("totalEq") or rows[0].get("adjEq") or fallback)
-        except Exception:
-            return fallback
-        return fallback
+            if not rows:
+                raise OkxAccountError("Account balance is empty")
+            equity = float(rows[0].get("totalEq") or rows[0].get("adjEq") or 0)
+        if not math.isfinite(equity) or equity <= 0:
+            raise OkxAccountError("Account equity must be finite and positive")
+        return equity
 
     async def _order_size(
         self,
@@ -295,17 +426,25 @@ class AutomationWorker:
         position_pct: float,
     ) -> float:
         """Convert risk budget to exchange contract size using instrument metadata."""
-        if mark_price <= 0 or account_equity <= 0 or position_pct <= 0:
+        if not all(math.isfinite(value) and value > 0 for value in (
+            mark_price, account_equity, leverage, position_pct,
+        )):
             return 0.0
         instruments_loader = getattr(self.market_client, "instruments", None)
         if instruments_loader is None:
-            return 1.0
+            return 0.0
         rows = await instruments_loader(symbol)
-        instrument = rows[0] if rows else {}
-        ct_val = Decimal(str(instrument.get("ctVal") or "1"))
-        lot_size = Decimal(str(instrument.get("lotSz") or "1"))
-        min_size = Decimal(str(instrument.get("minSz") or lot_size))
-        if ct_val <= 0 or lot_size <= 0 or min_size <= 0:
+        instrument = next((row for row in rows if row.get("instId") == symbol), {})
+        try:
+            ct_val = Decimal(str(instrument.get("ctVal") or "0"))
+            ct_mult = Decimal(str(instrument.get("ctMult") or "1"))
+            lot_size = Decimal(str(instrument.get("lotSz") or "0"))
+            min_size = Decimal(str(instrument.get("minSz") or "0"))
+        except InvalidOperation:
+            return 0.0
+        if not all(value.is_finite() and value > 0 for value in (
+            ct_val, ct_mult, lot_size, min_size,
+        )):
             return 0.0
         target_notional = (
             Decimal(str(account_equity))
@@ -313,8 +452,11 @@ class AutomationWorker:
             / Decimal("100")
             * Decimal(str(leverage))
         )
-        raw_size = target_notional / (Decimal(str(mark_price)) * ct_val)
-        sized = raw_size.quantize(lot_size, rounding=ROUND_DOWN)
+        unit_notional = ct_val * ct_mult
+        if instrument.get("ctType") != "inverse":
+            unit_notional *= Decimal(str(mark_price))
+        raw_size = target_notional / unit_notional
+        sized = (raw_size / lot_size).to_integral_value(rounding=ROUND_DOWN) * lot_size
         if sized < min_size:
             return 0.0
         return float(sized)
@@ -343,4 +485,38 @@ class AutomationWorker:
                     severity="error",
                     payload={"error": type(exc).__name__},
                 )
+                await self._notify_event(
+                    "worker_failed",
+                    "OpenPerpDesk Worker 异常",
+                    f"自动 Worker 周期失败：{type(exc).__name__}。",
+                    payload={"error": type(exc).__name__},
+                    severity="error",
+                )
             await asyncio.sleep(self.interval_seconds)
+
+    async def _notify_event(
+        self,
+        event_type: str,
+        title: str,
+        content: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        severity: str = "info",
+    ) -> None:
+        if self.notifier is None:
+            return
+        try:
+            await self.notifier(
+                event_type,
+                title,
+                content,
+                payload=payload,
+                severity=severity,
+            )
+        except Exception as exc:
+            self.store.add_audit(
+                "notification_dispatch_failed",
+                "Notification dispatcher raised unexpectedly",
+                severity="warning",
+                payload={"event_type": event_type, "error": type(exc).__name__},
+            )

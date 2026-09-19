@@ -1,0 +1,15 @@
+**
+!Dockerfile
+!nginx.conf
+!index.html
+!styles.css
+!app.js
+!research.js
+!theme.js
+!account-history.js
+!protection-review.js
+!live.js
+!assets/
+!assets/**
+**/._*
+**/.DS_Store
