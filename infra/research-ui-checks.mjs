@@ -80,6 +80,7 @@ async function exerciseResearch() {
     state.draftRevision = original.draftRevision;
     updatePrivateActionAvailability();
     delete window.reportAttack;
+    delete window.__showFastResearchFixture;
     delete window.__restoreResearchFixture;
   };
   window.__restoreResearchFixture = restore;
@@ -125,17 +126,36 @@ async function exerciseResearch() {
     };
     fastSample.report.state.news_report = "快速模式未接入新闻、宏观或基本面数据。";
     fastSample.report.state.trader_investment_plan = "快速研究结果不可执行；请使用结构化策略、风控和人工闸门完成任何后续操作。";
+    window.__showFastResearchFixture = () => {
+      api = normalApi;
+      state.symbol = sample.inst_id;
+      state.bar = "15m";
+      displayResearch(fastSample);
+      $("#research-history").open = true;
+      renderResearchEvidence();
+    };
     displayResearch(fastSample);
-    $("#report-section").value = "2";
-    renderResearchSection();
-    checks.fastSentimentActionable = $("#report-section-body .report-capability-heading strong").textContent === "市场情绪数据未采集"
-      && Boolean($("#report-section-body [data-research-mode='full']"));
+    const fastLabels = [...$("#report-section").options].map(option => option.textContent);
+    checks.fastScopeClear = fastLabels.length === 5
+      && !fastLabels.includes("市场情绪") && !fastLabels.includes("新闻分析")
+      && !$("#report-mode-notice").hidden
+      && $("#report-mode-title").textContent === "本次结论只使用 OKX 公共行情"
+      && $("#report-mode-context").textContent.includes(`${sample.inst_id} · 15m`)
+      && !$("#run-full-research").disabled;
+    let upgradeOptions;
+    api = async (url, options) => {
+      if (url === "/api/v1/analysis/ai") {
+        upgradeOptions = options;
+        return { data: { ...sample.report, ...metadata(sample), mode: "full" } };
+      }
+      return normalApi(url, options);
+    };
+    await runFullResearchFromReport();
+    checks.fullResearchRunsDirectly = JSON.parse(upgradeOptions.body).run_mode === "full"
+      && researchState.record.report.mode === "full" && $("#report-mode-notice").hidden;
+    api = normalApi;
+    displayResearch(fastSample);
     $("#report-section").value = "3";
-    renderResearchSection();
-    checks.fastNewsActionable = Boolean($("#report-section-body .report-capability [data-research-mode='full']"));
-    $("#report-section-body [data-research-mode='full']").click();
-    checks.fullModeSelectable = $("#ai-mode-full").checked && researchState.modeTouched;
-    $("#report-section").value = "5";
     renderResearchSection();
     checks.fastPlanStructured = $("#report-section-body .report-plan-heading strong").textContent === "观望"
       && $("#report-section-body .report-plan-summary").textContent.includes("等待有效突破")

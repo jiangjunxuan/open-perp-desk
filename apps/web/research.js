@@ -71,6 +71,11 @@ function updateResearchAvailability() {
   $("#history-next").disabled = !unlocked || !researchState.nextCursor
     || $("#research-history").getAttribute("aria-busy") === "true";
   $("#download-research").disabled = !unlocked || !researchState.record;
+  const fullResearch = $("#run-full-research");
+  if (fullResearch) {
+    fullResearch.disabled = !unlocked || !runtime?.configured || runtime.busy
+      || researchState.checkBusy || researchState.runBusy || $("#ai-mode-full").disabled;
+  }
   if (!unlocked && (researchState.loaded || researchState.record)) resetResearchAccess();
 }
 
@@ -228,6 +233,7 @@ function showResearchEmpty(title = "暂无研究报告", note = "当前合约尚
   setText("#research-title", "研究报告");
   setText("#report-meta", "暂无报告");
   $("#download-research").disabled = true;
+  $("#report-mode-notice").hidden = true;
   $("#report-section-body").replaceChildren();
   $("#open-research-report").hidden = true;
   $("#report-reader").removeAttribute("aria-busy");
@@ -235,6 +241,16 @@ function showResearchEmpty(title = "暂无研究报告", note = "当前合约尚
 
 function reportValuePresent(value) {
   return value != null && value !== "" && (typeof value !== "object" || Object.keys(value).length > 0);
+}
+
+function isFastResearch(record = researchState.record) {
+  const report = record?.report || {};
+  return report.mode === "fast" || Boolean(report.state?.fast_research);
+}
+
+function fastEvidenceMissing(fields, key, value) {
+  if (fields.evidence_scope?.[key]?.status === "not_collected") return true;
+  return typeof value === "string" && value.startsWith("快速模式未接入");
 }
 
 function researchSections(record) {
@@ -247,6 +263,7 @@ function researchSections(record) {
     ].filter(([, , value]) => reportValuePresent(value));
   }
   const fields = report.state || {};
+  const fast = isFastResearch(record);
   return [
     ["decision", "研究结论", report.decision],
     ["market", "市场分析", fields.market_report],
@@ -257,7 +274,8 @@ function researchSections(record) {
     ["final", "风险评议", fields.final_trade_decision],
     ["investment-debate", "研究辩论", fields.investment_debate_state],
     ["risk-debate", "风险辩论", fields.risk_debate_state],
-  ].filter(([, , value]) => reportValuePresent(value));
+  ].filter(([key, , value]) => reportValuePresent(value)
+    && !(fast && ["news", "sentiment"].includes(key) && fastEvidenceMissing(fields, key, value)));
 }
 
 function appendReportList(parent, title, values, emptyText = "未给出") {
@@ -279,43 +297,7 @@ function appendReportList(parent, title, values, emptyText = "未给出") {
 function renderFastCapability(key, value, body) {
   const report = researchState.record?.report || {};
   const fields = report.state || {};
-  const fast = report.mode === "fast" || Boolean(fields.fast_research);
-  if (!fast) return false;
-
-  const scope = fields.evidence_scope || {};
-  const missingByField = scope[key]?.status === "not_collected";
-  const missingByLegacyText = typeof value === "string" && value.startsWith("快速模式未接入");
-  if (["news", "sentiment"].includes(key) && (missingByField || missingByLegacyText)) {
-    const content = key === "news"
-      ? {
-        title: "新闻与宏观数据未采集",
-        detail: "本次快速研究只使用 OKX 公共行情，未将新闻、宏观或基本面纳入判断。完整研究会尝试调用相应数据源，并明确标记缺失来源。",
-      }
-      : {
-        title: "市场情绪数据未采集",
-        detail: "本次快速研究未接入社交和情绪数据，因此不推断情绪方向。完整研究会尝试补充相应证据，并保留来源状态。",
-      };
-    const section = document.createElement("section");
-    section.className = "report-capability";
-    const header = document.createElement("div");
-    header.className = "report-capability-heading";
-    const label = document.createElement("span");
-    label.className = "report-status-tag warning";
-    label.textContent = "本次未采集";
-    const title = document.createElement("strong");
-    title.textContent = content.title;
-    header.append(label, title);
-    const detail = document.createElement("p");
-    detail.textContent = content.detail;
-    const action = document.createElement("button");
-    action.type = "button";
-    action.className = "button secondary";
-    action.dataset.researchMode = "full";
-    action.textContent = "选择完整研究";
-    section.append(header, detail, action);
-    body.append(section);
-    return true;
-  }
+  if (!isFastResearch()) return false;
 
   const handoff = fields.execution_handoff || {};
   const structuredHandoff = handoff.status === "requires_structured_strategy";
@@ -390,6 +372,24 @@ function renderFastCapability(key, value, body) {
     return true;
   }
   return false;
+}
+
+function renderResearchModeNotice() {
+  const notice = $("#report-mode-notice");
+  if (!notice) return;
+  const record = researchState.record;
+  const fast = record?.source === "TradingAgents" && isFastResearch(record);
+  notice.hidden = !fast;
+  if (!fast) return;
+  const reportBar = record.report?.market_context?.bar || "--";
+  const sameContext = record.inst_id === state.symbol && reportBar === state.bar;
+  setText(
+    "#report-mode-context",
+    sameContext
+      ? `完整研究将重新采集 ${state.symbol} · ${state.bar}。`
+      : `当前选择为 ${state.symbol} · ${state.bar}；完整研究将使用当前选择，不沿用旧报告的 ${record.inst_id} · ${reportBar}。`,
+  );
+  updateResearchAvailability();
 }
 
 function renderResearchSection() {
@@ -493,6 +493,7 @@ function renderResearchEvidence() {
   }
   $("#report-warning").hidden = !warnings.length;
   setText("#report-warning", warnings.join("；"));
+  renderResearchModeNotice();
 }
 
 function displayResearch(record, { focus = false } = {}) {
@@ -551,6 +552,13 @@ function acceptCurrentResearch(analysis) {
   loadResearchHistory({ reset: true });
 }
 
+async function runFullResearchFromReport() {
+  const button = $("#run-full-research");
+  if (!button || button.disabled || !setResearchMode("full", { user: true })) return;
+  researchRunMessage(`${state.symbol} · ${state.bar} · 正在启动完整研究...`);
+  await runAiAnalysis();
+}
+
 function initializeResearch() {
   $("#check-ai-runtime").addEventListener("click", checkResearchRuntime);
   $("#refresh-history").addEventListener("click", () => loadResearchHistory({ reset: true }));
@@ -575,13 +583,8 @@ function initializeResearch() {
       researchState.modeTouched = true;
     });
   });
+  $("#run-full-research").addEventListener("click", runFullResearchFromReport);
   $("#report-section-body").addEventListener("click", event => {
-    const mode = event.target.closest("[data-research-mode]")?.dataset.researchMode;
-    if (mode && setResearchMode(mode, { user: true })) {
-      researchRunMessage("已选择完整研究；下次 TradingAgents 研究将采集外部数据。", "good");
-      $("#ai-mode-full").focus({ preventScroll: true });
-      return;
-    }
     if (event.target.closest("[data-run-structured-analysis]")) $("#run-analysis").click();
   });
   $("#download-research").addEventListener("click", () => {

@@ -708,6 +708,17 @@ try {
       clip: { x: 0, y: 0, width: viewport.width, height: viewport.height * 2, scale: 1 },
     });
     await writeFile(path.join(outputDirectory, `openperpdesk-research-${viewport.name}.png`), Buffer.from(screenshot.data, "base64"));
+    checks.fastVisualState = await evaluate(`(() => {
+      window.__showFastResearchFixture();
+      const notice = document.querySelector("#report-mode-notice");
+      notice.scrollIntoView({ block: "center" });
+      return !notice.hidden && document.querySelector("#report-section").options.length === 5
+        && !document.querySelector("#run-full-research").disabled;
+    })()`);
+    if (!checks.fastVisualState) throw new Error(`${viewport.name} fast research visual state failed`);
+    await delay(80);
+    const fastScreenshot = await command("Page.captureScreenshot", { format: "png", fromSurface: true });
+    await writeFile(path.join(outputDirectory, `openperpdesk-research-fast-${viewport.name}.png`), Buffer.from(fastScreenshot.data, "base64"));
     await evaluate('window.__restoreResearchFixture()');
   }
   const contrast = await evaluate(`(() => {

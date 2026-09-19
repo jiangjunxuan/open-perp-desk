@@ -486,6 +486,14 @@
                   <div id="report-content" hidden>
                     <dl id="report-evidence" class="report-evidence"></dl>
                     <p id="report-warning" class="report-warning" hidden></p>
+                    <section id="report-mode-notice" class="report-mode-notice" hidden aria-labelledby="report-mode-title">
+                      <div class="report-mode-copy">
+                        <div class="report-mode-heading"><span class="report-status-tag">快速报告</span><strong id="report-mode-title">本次结论只使用 OKX 公共行情</strong></div>
+                        <p>新闻、宏观和市场情绪未纳入本次判断。完整研究会运行外部数据与多智能体研究链，耗时明显更长。</p>
+                        <span id="report-mode-context" class="report-mode-context"></span>
+                      </div>
+                      <button class="button secondary" id="run-full-research" type="button" disabled><i data-icon="workflow" aria-hidden="true"></i><span>运行完整研究</span></button>
+                    </section>
                     <div class="report-section-control"><label for="report-section">报告章节</label><select id="report-section"></select><span id="report-section-count" class="tag"></span></div>
                     <div id="report-section-body" class="report-prose" tabindex="0" aria-label="报告正文"></div>
                   </div>

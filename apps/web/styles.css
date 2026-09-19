@@ -664,13 +664,15 @@ body[data-view="risk"] .state-list { display: grid; grid-template-columns: minma
 .report-table-wrap table { width: 100%; min-width: 0; font-size: 12px; }
 .report-table-wrap th, .report-table-wrap td { padding: 10px; white-space: normal; }
 .report-truncated { color: var(--warning); font-size: 12px; }
-.report-capability { display: grid; gap: 16px; padding-block: 20px; border-block: 1px solid var(--border-soft); }
-.report-capability-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
-.report-capability-heading strong { color: var(--text); font-size: 15px; }
-.report-capability p { max-width: 66ch; color: var(--muted-strong); }
-.report-capability > .button { width: fit-content; }
+.report-mode-notice { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 16px; padding: 16px 0; border-bottom: 1px solid var(--border-soft); }
+.report-mode-notice[hidden] { display: none; }
+.report-mode-copy { display: grid; gap: 7px; min-width: 0; }
+.report-mode-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.report-mode-heading strong { color: var(--text); font-size: 14px; }
+.report-mode-copy p { margin: 0; max-width: 68ch; color: var(--muted-strong); font-size: 12px; line-height: 1.7; }
+.report-mode-context { color: var(--muted); font: 11px/1.6 var(--mono); overflow-wrap: anywhere; }
+.report-mode-notice > .button { min-height: 44px; }
 .report-status-tag { display: inline-flex; align-items: center; min-height: 26px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 3px; color: var(--muted-strong); font: 11px var(--mono); }
-.report-status-tag.warning { border-color: var(--warning); color: var(--warning); }
 .report-plan { display: grid; gap: 18px; }
 .report-plan-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-bottom: 16px; border-bottom: 1px solid var(--border-soft); }
 .report-plan-heading > div { display: grid; gap: 4px; }
@@ -985,6 +987,8 @@ dialog::backdrop { background: #000a; }
   .history-entry strong { font-size: 11px; }
   .history-entry time { font-size: 10px; }
   .report-evidence { gap: 12px 8px; }
+  .report-mode-notice { grid-template-columns: minmax(0, 1fr); align-items: stretch; }
+  .report-mode-notice > .button { width: 100%; }
   .report-empty { min-height: 200px; padding-inline: 12px; }
   .ledger-tabs { gap: 12px; }
   .ledger-tabs button { font-size: 11px; }
