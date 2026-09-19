@@ -163,9 +163,30 @@ class AIProcessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["mode"], "fast")
         self.assertEqual(result["decision"], "Hold")
         self.assertEqual(result["state"]["fast_research"]["summary"], "fixture summary")
+        self.assertEqual(result["state"]["evidence_scope"]["news"]["status"], "not_collected")
+        self.assertEqual(
+            result["state"]["execution_handoff"]["status"],
+            "requires_structured_strategy",
+        )
         self.assertEqual(result["signal"], {})
         self.assertFalse(result["execution_authorized"])
         self.assertFalse((Path(adapter.config["results_dir"]) / "pid").exists())
+
+    async def test_request_can_select_full_mode_without_changing_deployment_default(self) -> None:
+        adapter = self.adapter(TRADINGAGENTS_RUN_MODE="fast")
+        result = await adapter.analyze("BTC-USDT-SWAP", run_mode="full")
+        self.assertEqual(adapter.run_mode, "fast")
+        self.assertEqual(result["mode"], "full")
+        self.assertEqual(result["state"]["asset_type"], "crypto")
+        self.assertFalse(result["execution_authorized"])
+
+    async def test_child_cannot_change_selected_run_mode(self) -> None:
+        adapter = self.adapter(TRADINGAGENTS_RUN_MODE="fast")
+        with patch.object(adapter, "_invoke", AsyncMock(return_value={
+            "inst_id": "BTC-USDT-SWAP", "state": {}, "decision": "Hold", "mode": "fast",
+        })):
+            result = await adapter.analyze("BTC-USDT-SWAP", run_mode="full")
+        self.assertEqual(result["mode"], "full")
 
     async def test_timeout_terminates_term_ignoring_child_and_releases_lock(self) -> None:
         adapter = self.adapter(TRADINGAGENTS_DEEP_THINK_LLM="sleep", TRADINGAGENTS_TIMEOUT_SECONDS="1")
@@ -331,14 +352,20 @@ class AIEndpointTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_research_is_stored_without_execution_signal(self) -> None:
         adapter = Mock(configuration_error=None)
-        adapter.analyze = AsyncMock(return_value={"decision": "Buy", "state": {}})
+        adapter.analyze = AsyncMock(return_value={"decision": "Buy", "state": {}, "mode": "full"})
         store = Mock()
         store.save_analysis.return_value = {"id": 12, "created_at": "2026-09-13T00:00:00+00:00"}
         with patch.object(api_main, "tradingagents", adapter), patch.object(api_main, "state_store", store), patch.object(api_main, "_ai_market_context", AsyncMock(return_value={})), patch.object(api_main, "execution_engine", Mock()) as engine:
-            result = await api_main.run_ai_analysis(api_main.AnalysisRequest(inst_id="BTC-USDT-SWAP"))
+            result = await api_main.run_ai_analysis(api_main.AnalysisRequest(
+                inst_id="BTC-USDT-SWAP", run_mode="full",
+            ))
         self.assertEqual(store.save_analysis.call_args.args[0]["signal"], {})
         self.assertEqual(engine.mock_calls, [])
         self.assertEqual(result["data"]["id"], 12)
+        adapter.analyze.assert_awaited_once_with(
+            "BTC-USDT-SWAP", market_context={}, run_mode="full",
+        )
+        self.assertEqual(store.add_audit.call_args.kwargs["payload"]["mode"], "full")
 
 
 class AIMarketContextTests(unittest.TestCase):

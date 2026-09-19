@@ -1111,6 +1111,7 @@ class AnalysisRequest(BaseModel):
     inst_id: str = Field(default="BTC-USDT-SWAP", min_length=9, max_length=40)
     bar: str = Field(default="15m", pattern=r"^[0-9]+[mHhDWMw]$")
     limit: int = Field(default=100, ge=20, le=300)
+    run_mode: Literal["fast", "full"] | None = None
     strategy_id: str = Field(
         default="structured-technical",
         min_length=1,
@@ -1271,6 +1272,7 @@ async def run_ai_analysis(
         analysis = await tradingagents.analyze(
             request.inst_id,
             market_context=market_context,
+            run_mode=request.run_mode,
         )
     except AIAnalysisError as exc:
         state_store.add_audit(
@@ -1291,7 +1293,7 @@ async def run_ai_analysis(
     state_store.add_audit(
         "ai_analysis_completed",
         "TradingAgents analysis completed",
-        payload={"inst_id": request.inst_id},
+        payload={"inst_id": request.inst_id, "mode": analysis.get("mode")},
     )
     return {"data": {**analysis, "id": saved["id"], "created_at": saved["created_at"]}}
 

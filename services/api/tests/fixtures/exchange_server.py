@@ -21,6 +21,11 @@ PASSPHRASE = "local-fixture-passphrase"
 PUSH_TOKEN = "local-fixture-push"
 
 
+class FixtureHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 128
+
+
 def milliseconds():
     return str(int(time.time() * 1000))
 
@@ -447,7 +452,7 @@ class ExchangeServer:
             do_GET = handle_request
             do_POST = handle_request
 
-        self.http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.http = FixtureHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.http.serve_forever, daemon=True)
         self.thread.start()
         self.ws = await serve(self.socket_handler, "127.0.0.1", 0)

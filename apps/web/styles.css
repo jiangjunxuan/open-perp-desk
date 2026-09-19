@@ -504,6 +504,14 @@ tbody tr:hover { background: var(--surface); }
 .execution-context strong { color: var(--muted-strong); font-size: 11px; }
 .research-actions { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 16px 0 12px; }
 .research-actions .button { width: 100%; }
+.ai-research-control { display: grid; grid-template-columns: minmax(120px, .8fr) minmax(0, 1.2fr); align-items: stretch; gap: 8px; min-width: 0; }
+.ai-mode-toggle { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); min-width: 0; margin: 0; padding: 3px; border: 1px solid var(--control-border); border-radius: var(--radius-control); background: var(--bg); }
+.ai-mode-toggle label { position: relative; min-width: 0; }
+.ai-mode-toggle input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.ai-mode-toggle span { display: grid; place-items: center; min-height: 36px; padding-inline: 8px; border: 1px solid transparent; border-radius: 3px; color: var(--muted); font-size: 12px; cursor: pointer; }
+.ai-mode-toggle input:checked + span { border-color: var(--border); background: var(--surface-raised); color: var(--text); font-weight: 600; }
+.ai-mode-toggle input:focus-visible + span { outline: 2px solid var(--info); outline-offset: 2px; }
+.ai-mode-toggle input:disabled + span { cursor: not-allowed; opacity: .45; }
 .analysis-body { padding-bottom: 16px; }
 .ticket-lock { display: flex; align-items: center; gap: 8px; color: var(--warning); font-size: 11px; min-height: 44px; border-bottom: 1px solid var(--border-soft); }
 .ticket-lock > [data-icon] { width: 14px; height: 14px; flex-basis: 14px; }
@@ -656,6 +664,31 @@ body[data-view="risk"] .state-list { display: grid; grid-template-columns: minma
 .report-table-wrap table { width: 100%; min-width: 0; font-size: 12px; }
 .report-table-wrap th, .report-table-wrap td { padding: 10px; white-space: normal; }
 .report-truncated { color: var(--warning); font-size: 12px; }
+.report-capability { display: grid; gap: 16px; padding-block: 20px; border-block: 1px solid var(--border-soft); }
+.report-capability-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.report-capability-heading strong { color: var(--text); font-size: 15px; }
+.report-capability p { max-width: 66ch; color: var(--muted-strong); }
+.report-capability > .button { width: fit-content; }
+.report-status-tag { display: inline-flex; align-items: center; min-height: 26px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 3px; color: var(--muted-strong); font: 11px var(--mono); }
+.report-status-tag.warning { border-color: var(--warning); color: var(--warning); }
+.report-plan { display: grid; gap: 18px; }
+.report-plan-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-bottom: 16px; border-bottom: 1px solid var(--border-soft); }
+.report-plan-heading > div { display: grid; gap: 4px; }
+.report-plan-heading > div span { color: var(--muted); font-size: 11px; }
+.report-plan-heading > div strong { color: var(--text); font-size: 20px; }
+.report-plan-summary { margin: 0; max-width: 68ch; color: var(--muted-strong); line-height: 1.8; }
+.report-plan-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 0; }
+.report-plan-grid > div { display: grid; gap: 4px; min-width: 0; }
+.report-plan-grid dt { color: var(--muted); font-size: 11px; }
+.report-plan-grid dd { margin: 0; color: var(--text); overflow-wrap: anywhere; }
+.report-plan-list { padding-top: 14px; border-top: 1px solid var(--border-soft); }
+.report-plan-list h4 { margin: 0 0 8px; color: var(--text); font-size: 12px; }
+.report-plan-list ul { margin: 0; }
+.report-execution-boundary { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-block: 16px; border-block: 1px solid var(--warning); }
+.report-execution-boundary > div { display: grid; gap: 4px; min-width: 0; }
+.report-execution-boundary strong { color: var(--warning); font-size: 12px; }
+.report-execution-boundary span { color: var(--muted-strong); font-size: 12px; overflow-wrap: anywhere; }
+.report-execution-boundary .button { flex: 0 0 auto; width: auto; }
 body[data-view="risk"] .state-row { min-height: 40px; }
 body[data-view="risk"] .live-safety-settings { max-width: 600px; }
 body[data-view="risk"] .safety-summary { max-width: 420px; }
@@ -908,6 +941,9 @@ dialog::backdrop { background: #000a; }
   .state-list, body[data-view="risk"] .state-list { grid-template-columns: minmax(0, 1fr); }
   .state-row { min-height: 42px; }
   .analysis-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .report-plan-grid { grid-template-columns: minmax(0, 1fr); }
+  .report-execution-boundary { align-items: stretch; flex-direction: column; }
+  .report-execution-boundary .button { width: 100%; }
   .performance-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .performance-summary-grid strong { font-size: 18px; }
   .panel-heading, .panel-actions { flex-wrap: wrap; }

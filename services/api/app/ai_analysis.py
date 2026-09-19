@@ -142,6 +142,7 @@ class TradingAgentsAdapter:
             "runtime_state": self.runtime_state, "busy": bool(self._tasks),
             "last_error": self.configuration_error or self.last_error,
             "run_mode": self.run_mode,
+            "available_run_modes": ["fast", "full"],
             "timeout_seconds": self.timeout_seconds,
             "data_timeout_seconds": self.data_timeout_seconds,
             "execution_authorized": False,
@@ -178,7 +179,7 @@ class TradingAgentsAdapter:
         try:
             payload = json.dumps({
                 **request, "source_path": str(Path(self.path).absolute()), "config": self.config,
-                "run_mode": self.run_mode,
+                "run_mode": request.get("run_mode") or self.run_mode,
                 "parent_pid": os.getpid(), "timeout_seconds": self.timeout_seconds,
                 "data_timeout_seconds": self.data_timeout_seconds,
             }, ensure_ascii=True, allow_nan=False).encode()
@@ -287,16 +288,21 @@ class TradingAgentsAdapter:
 
     async def analyze(
         self, inst_id: str, market_context: dict[str, Any] | None = None,
+        run_mode: str | None = None,
     ) -> dict[str, Any]:
         if not re.fullmatch(r"[A-Z0-9]{2,20}-(?:USDT|USDC|USD)-SWAP", inst_id):
             raise AIAnalysisError("invalid_instrument")
+        selected_mode = str(run_mode or self.run_mode).strip().lower()
+        if selected_mode not in {"fast", "full"}:
+            raise AIAnalysisError("invalid_config")
         data = await self._invoke({
-            "action": "analyze", "inst_id": inst_id, "market_context": market_context or {},
+            "action": "analyze", "inst_id": inst_id,
+            "market_context": market_context or {}, "run_mode": selected_mode,
         })
         if data.get("inst_id") != inst_id or not isinstance(data.get("state"), dict) or "decision" not in data:
             self.last_error = "invalid_result"
             self.runtime_state = "failed"
             raise AIAnalysisError("invalid_result")
         data.update(source="TradingAgents", bias="research", signal={}, execution_authorized=False)
-        data.setdefault("mode", self.run_mode)
+        data["mode"] = selected_mode
         return data

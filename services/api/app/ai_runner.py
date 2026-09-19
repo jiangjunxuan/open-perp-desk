@@ -372,6 +372,12 @@ def _run_fast_research(
         "market_report": summary,
         "sentiment_report": "快速模式未接入社交情绪数据，不能据此推断市场情绪。",
         "news_report": "快速模式未接入新闻、宏观或基本面数据。",
+        "evidence_scope": {
+            "market": {"status": "collected", "source": "okx_public_snapshot"},
+            "sentiment": {"status": "not_collected", "reason": "fast_mode"},
+            "news": {"status": "not_collected", "reason": "fast_mode"},
+            "macro": {"status": "not_collected", "reason": "fast_mode"},
+        },
         "investment_plan": {
             "decision": decision,
             "confidence": normalized["confidence"],
@@ -384,6 +390,10 @@ def _run_fast_research(
         "trader_investment_plan": (
             "快速研究结果不可执行；请使用结构化策略、风控和人工闸门完成任何后续操作。"
         ),
+        "execution_handoff": {
+            "status": "requires_structured_strategy",
+            "strategy_id": "structured-technical",
+        },
         "final_trade_decision": f"研究结论（不可执行）：{decision}\n\n{summary}",
         "fast_research": normalized,
         "limitations": limitations,

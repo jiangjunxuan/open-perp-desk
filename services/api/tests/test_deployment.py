@@ -98,6 +98,20 @@ def ai_live_report():
     }
 
 
+def pushplus_response(message_id="0123456789abcdef0123456789abcdef"):
+    return {
+        "accepted": True,
+        "delivery_confirmed": False,
+        "result": {
+            "code": 200,
+            "msg": "request_accepted",
+            "accepted": True,
+            "delivery_confirmed": False,
+            "message_id": message_id,
+        },
+    }
+
+
 class FakeDeployment(deploy.Deployment):
     """Command contract fixture, not evidence of a running Docker engine."""
 
@@ -133,6 +147,8 @@ class FakeDeployment(deploy.Deployment):
                 "ID": "fixture-api", "Service": "api",
                 "State": "running" if self.running else "exited",
             }]).encode()
+        elif args[0] == "port":
+            output = b"0.0.0.0:8099\n"
         elif args[0] == "stop":
             if not self.stays_running:
                 self.running = False
@@ -458,6 +474,153 @@ class DeploymentCommandTests(unittest.TestCase):
                 with self.assertRaises(deploy.DeploymentError):
                     self.deployment.proxy_smoke()
                 self.assertFalse(destination.exists())
+
+    def test_pushplus_smoke_uses_local_binding_once_and_publishes_redacted_report(self):
+        environment = self.deployment.model["services"]["api"]["environment"]
+        environment.update(
+            PUSHPLUS_TOKEN="fixture-pushplus-token-never-log",
+            PUSHPLUS_PROXY_URL="socks5h://proxy-user:proxy-secret@127.0.0.1:1080",
+        )
+        requests = []
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self, limit):
+                self.limit = limit
+                return json.dumps(pushplus_response()).encode()
+
+        class Opener:
+            def open(self, request, timeout):
+                requests.append((request, timeout))
+                return Response()
+
+        with patch.object(deploy.urllib.request, "build_opener", return_value=Opener()):
+            result = self.deployment.pushplus_smoke()
+
+        self.assertEqual(self.deployment.calls, [
+            ("config", "--format", "json"), ("port", "web", "80"),
+        ])
+        self.assertEqual(len(requests), 1)
+        request, timeout = requests[0]
+        self.assertEqual(request.full_url, "http://127.0.0.1:8099/api/v1/notifications/test")
+        self.assertEqual(request.method, "POST")
+        self.assertEqual(timeout, 15)
+        self.assertEqual(request.headers["X-admin-token"], "fixture-secret-never-log")
+        self.assertNotIn("fixture-pushplus-token-never-log", request.data.decode())
+        self.assertEqual(result["scope"], "pushplus_api_acceptance_only")
+        self.assertTrue(result["accepted"] and result["proxy_configured"])
+        self.assertFalse(result["delivery_confirmed"])
+        destination = self.root / "outputs/pushplus-verification.json"
+        self.assertEqual(json.loads(destination.read_text()), result)
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+        for secret in ("fixture-secret-never-log", "fixture-pushplus-token-never-log", "proxy-secret"):
+            self.assertNotIn(secret, self.output.getvalue() + destination.read_text())
+
+    def test_pushplus_smoke_requires_resolved_tokens_without_sending(self):
+        destination = self.root / "outputs/pushplus-verification.json"
+        destination.parent.mkdir()
+        for missing, message in (("PUSHPLUS_TOKEN", "not configured"), ("ADMIN_API_TOKEN", "admin token")):
+            with self.subTest(missing=missing):
+                environment = self.deployment.model["services"]["api"]["environment"]
+                environment.update(
+                    ADMIN_API_TOKEN="fixture-secret-never-log",
+                    PUSHPLUS_TOKEN="fixture-pushplus-token-never-log",
+                )
+                environment[missing] = ""
+                destination.write_text('{"old":true}')
+                with patch.object(deploy.urllib.request, "build_opener") as opener, \
+                     self.assertRaisesRegex(deploy.DeploymentError, message):
+                    self.deployment.pushplus_smoke("http://fixture")
+                opener.assert_not_called()
+                self.assertFalse(destination.exists())
+
+    def test_pushplus_smoke_does_not_retry_http_or_transport_failures(self):
+        environment = self.deployment.model["services"]["api"]["environment"]
+        environment["PUSHPLUS_TOKEN"] = "fixture-pushplus-token-never-log"
+        destination = self.root / "outputs/pushplus-verification.json"
+        destination.parent.mkdir()
+        failures = ((401, "authenticate"), (502, "unknown"), (503, "not configured"))
+        for status, message in failures:
+            with self.subTest(status=status):
+                calls = []
+
+                class Opener:
+                    def open(self, request, timeout):
+                        calls.append((request, timeout))
+                        raise HTTPError(request.full_url, status, "fixture-secret-never-log", {}, io.BytesIO(b"fixture-secret-never-log"))
+
+                destination.write_text('{"old":true}')
+                with patch.object(deploy.urllib.request, "build_opener", return_value=Opener()), \
+                     self.assertRaisesRegex(deploy.DeploymentError, message):
+                    self.deployment.pushplus_smoke("http://fixture")
+                self.assertEqual(len(calls), 1)
+                self.assertFalse(destination.exists())
+        calls = []
+
+        class TransportFailure:
+            def open(self, request, timeout):
+                calls.append((request, timeout))
+                raise deploy.urllib.error.URLError("fixture-secret-never-log")
+
+        with patch.object(deploy.urllib.request, "build_opener", return_value=TransportFailure()), \
+             self.assertRaisesRegex(deploy.DeploymentError, "acceptance may be unknown"):
+            self.deployment.pushplus_smoke("http://fixture")
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("fixture-secret-never-log", self.output.getvalue())
+
+    def test_pushplus_smoke_rejects_unknown_response_without_old_report(self):
+        self.deployment.model["services"]["api"]["environment"]["PUSHPLUS_TOKEN"] = "fixture-token"
+        destination = self.root / "outputs/pushplus-verification.json"
+        destination.parent.mkdir()
+        payloads = [
+            b"not-json",
+            json.dumps({"accepted": True, "delivery_confirmed": False}).encode(),
+            json.dumps({**pushplus_response(), "secret": "fixture-secret-never-log"}).encode(),
+            json.dumps(pushplus_response("not-a-message-id")).encode(),
+            json.dumps({**pushplus_response(), "delivery_confirmed": True}).encode(),
+        ]
+        for payload in payloads:
+            with self.subTest(payload=payload[:40]):
+                calls = []
+
+                class Response:
+                    status = 200
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *_):
+                        return False
+
+                    def read(self, _):
+                        calls.append(True)
+                        return payload
+
+                class Opener:
+                    def open(self, request, timeout):
+                        return Response()
+
+                destination.write_text('{"old":true}')
+                with patch.object(deploy.urllib.request, "build_opener", return_value=Opener()), \
+                     self.assertRaisesRegex(deploy.DeploymentError, "unknown acceptance evidence"):
+                    self.deployment.pushplus_smoke("http://fixture")
+                self.assertEqual(len(calls), 1)
+                self.assertFalse(destination.exists())
+        self.assertNotIn("fixture-secret-never-log", self.output.getvalue())
+
+    def test_pushplus_smoke_cli_routes_optional_origin(self):
+        with patch.object(deploy.sys, "argv", ["deploy", "pushplus-smoke", "http://fixture"]), \
+             patch.object(deploy, "Deployment", return_value=self.deployment), \
+             patch.object(self.deployment, "pushplus_smoke", return_value={}) as smoke:
+            deploy.main()
+        smoke.assert_called_once_with("http://fixture")
 
     def test_ai_live_smoke_uses_running_container_and_requires_real_model_evidence(self):
         result = self.deployment.ai_live_smoke(timeout=60)

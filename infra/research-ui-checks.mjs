@@ -4,10 +4,11 @@ async function exerciseResearch() {
   const original = {
     token: state.token, analysis: state.analysis, symbol: state.symbol, bar: state.bar,
     status: state.status, draftRevision: state.draftRevision,
+    modeTouched: researchState.modeTouched, runMode: selectedResearchMode(),
   };
   const runtime = {
     configured: true, enabled: true, runtime_state: "ready", busy: false,
-    run_mode: "fast", timeout_seconds: 300,
+    run_mode: "fast", available_run_modes: ["fast", "full"], timeout_seconds: 300,
   };
   const calls = [];
   const sample = {
@@ -72,6 +73,8 @@ async function exerciseResearch() {
     setText("#ticket-symbol", original.symbol);
     researchState.runBusy = false;
     researchState.checkBusy = false;
+    researchState.modeTouched = original.modeTouched;
+    $(`#ai-mode-${original.runMode}`).checked = true;
     resetResearchAccess();
     renderAnalysis(original.analysis);
     state.draftRevision = original.draftRevision;
@@ -96,6 +99,7 @@ async function exerciseResearch() {
       && researchState.historyRows[0].report === undefined;
     checks.runtimeReady = $("#ai-runtime-state").textContent === "运行时就绪" && !$("#check-ai-runtime").disabled;
     checks.fastModeVisible = $("#ai-runtime-note").textContent.includes("快速 OKX 研究");
+    checks.modeSelectorReady = $("#ai-mode-fast").checked && !$("#ai-mode-full").disabled;
     await checkResearchRuntime();
     checks.selfCheckHonest = $("#research-run-status").textContent.includes("模型服务连通性尚未验证");
     renderAnalysis({ source: "structured-technical", signal: { action: "hold", inst_id: sample.inst_id } });
@@ -104,6 +108,40 @@ async function exerciseResearch() {
     await selectResearch(sample.id, { focus: false });
     checks.historyReadOnly = state.analysis === signal && state.draftRevision === revision;
     checks.completeSections = $("#report-section").options.length === 7 && researchState.record.id === sample.id;
+    const fastSample = structuredClone(sample);
+    fastSample.report.mode = "fast";
+    fastSample.report.state.fast_research = {
+      decision: "Hold", confidence: 0.64, summary: "价格仍在区间内，等待有效突破。", trend: "区间震荡", time_horizon: "日内",
+      evidence: ["OKX K 线结构"], risks: ["波动放大"], invalidations: ["突破区间"],
+    };
+    fastSample.report.state.evidence_scope = {
+      market: { status: "collected", source: "okx_public_snapshot" },
+      sentiment: { status: "not_collected", reason: "fast_mode" },
+      news: { status: "not_collected", reason: "fast_mode" },
+      macro: { status: "not_collected", reason: "fast_mode" },
+    };
+    fastSample.report.state.execution_handoff = {
+      status: "requires_structured_strategy", strategy_id: "structured-technical",
+    };
+    fastSample.report.state.news_report = "快速模式未接入新闻、宏观或基本面数据。";
+    fastSample.report.state.trader_investment_plan = "快速研究结果不可执行；请使用结构化策略、风控和人工闸门完成任何后续操作。";
+    displayResearch(fastSample);
+    $("#report-section").value = "2";
+    renderResearchSection();
+    checks.fastSentimentActionable = $("#report-section-body .report-capability-heading strong").textContent === "市场情绪数据未采集"
+      && Boolean($("#report-section-body [data-research-mode='full']"));
+    $("#report-section").value = "3";
+    renderResearchSection();
+    checks.fastNewsActionable = Boolean($("#report-section-body .report-capability [data-research-mode='full']"));
+    $("#report-section-body [data-research-mode='full']").click();
+    checks.fullModeSelectable = $("#ai-mode-full").checked && researchState.modeTouched;
+    $("#report-section").value = "5";
+    renderResearchSection();
+    checks.fastPlanStructured = $("#report-section-body .report-plan-heading strong").textContent === "观望"
+      && $("#report-section-body .report-plan-summary").textContent.includes("等待有效突破")
+      && $("#report-section-body .report-execution-boundary strong").textContent === "执行权限未授予"
+      && Boolean($("#report-section-body [data-run-structured-analysis]"));
+    displayResearch(sample);
     $("#report-section").value = "1";
     $("#report-section").dispatchEvent(new Event("change"));
     const prose = $("#report-section-body");
@@ -190,12 +228,19 @@ async function exerciseResearch() {
     await aiRun;
     checks.staleAIIgnoresSignal = state.analysis === newerSignal && researchState.record === null;
 
-    api = async (url, options) => url === "/api/v1/analysis/ai"
-      ? { data: { ...sample.report, ...metadata(sample) } } : normalApi(url, options);
+    let completedAiOptions;
+    api = async (url, options) => {
+      if (url === "/api/v1/analysis/ai") {
+        completedAiOptions = options;
+        return { data: { ...sample.report, ...metadata(sample) } };
+      }
+      return normalApi(url, options);
+    };
     await runAiAnalysis();
     checks.aiCompletionReadOnly = state.analysis === null && $("#execute-signal").disabled
       && $("#preview-signal").disabled && researchState.record.id === sample.id
       && $("#analysis-summary").textContent.includes("观望");
+    checks.fullModeRequested = JSON.parse(completedAiOptions.body).run_mode === "full";
     api = normalApi;
     researchState.sections = [["large", "长报告", "样".repeat(80001)]];
     $("#report-section").replaceChildren(new Option("长报告", "0"));
@@ -210,7 +255,7 @@ async function exerciseResearch() {
     setMessage("");
     updatePrivateActionAvailability();
     renderResearchEvidence();
-    checks.controlsContained = [".research-runtime", ".history-toolbar", ".history-pagination", ".report-section-control"]
+    checks.controlsContained = [".research-runtime", ".history-toolbar", ".history-pagination", ".report-section-control", ".ai-research-control", ".ai-mode-toggle"]
       .every(selector => {
         const parent = $(selector).getBoundingClientRect();
         return [...$(selector).children].filter(child => child.getClientRects().length).every(child => {

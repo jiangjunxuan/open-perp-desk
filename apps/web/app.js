@@ -2754,16 +2754,18 @@ async function runAiAnalysis() {
   const token = state.token;
   const request = ++state.analysisRequest;
   const { symbol, bar } = state;
+  const runMode = selectedResearchMode();
+  const runModeLabel = runMode === "full" ? "完整研究" : "快速研究";
   renderAnalysis(null);
   researchState.runBusy = true;
-  setBusy("#run-ai-analysis", true, "研究运行中...");
+  setBusy("#run-ai-analysis", true, `${runModeLabel}运行中...`);
   updateResearchAvailability();
-  researchRunMessage(`${symbol} · ${bar} 研究运行中，尚未生成报告。`);
+  researchRunMessage(`${symbol} · ${bar} · ${runModeLabel}运行中，尚未生成报告。`);
   setMessage("TradingAgents 正在运行...");
   try {
     const payload = await api("/api/v1/analysis/ai", {
       method: "POST",
-      body: JSON.stringify({ inst_id: symbol, bar, limit: 100 }),
+      body: JSON.stringify({ inst_id: symbol, bar, limit: 100, run_mode: runMode }),
     });
     if (token !== state.token) return;
     if (request !== state.analysisRequest) {
@@ -2788,7 +2790,7 @@ async function runAiAnalysis() {
       `研究证据：OKX ${marketContext.bar || state.bar} · ${marketContext.candle_count || 0} 根 K 线 · 采集于 ${formatTime(marketContext.captured_at)}${contextErrors}`,
     );
     acceptCurrentResearch(payload.data);
-    researchRunMessage(`${symbol} · ${bar} 研究完成，无委托权限。`, "good");
+    researchRunMessage(`${symbol} · ${bar} · ${runModeLabel}完成，无委托权限。`, "good");
     setMessage("TradingAgents 分析完成", "good");
   } catch (error) {
     if (token === state.token) {

@@ -59,6 +59,7 @@
 ## 6. 通知、备份与恢复
 
 - [ ] PushPlus 真实 token 已测试，微信端实际收到测试通知
+- [ ] `./infra/openperpdesk.sh pushplus-smoke` 已生成本次 `accepted=true`、`delivery_confirmed=false` 的脱敏证据
 - [ ] 测试通知的受理状态和微信收信已分别记录
 - [ ] 订单失败、成交、风控拒绝、急停、Worker 异常和私有流断线均有通知策略
 - [ ] `./infra/openperpdesk.sh backup` 生成快照和 SHA-256 清单

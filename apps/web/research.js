@@ -11,6 +11,7 @@ const researchState = {
   sections: [],
   runBusy: false,
   checkBusy: false,
+  modeTouched: false,
   loaded: false,
 };
 
@@ -37,6 +38,18 @@ function researchRunMessage(message, tone = "neutral") {
   $("#research-run-status").hidden = !message;
 }
 
+function selectedResearchMode() {
+  return document.querySelector('input[name="ai-run-mode"]:checked')?.value === "full" ? "full" : "fast";
+}
+
+function setResearchMode(mode, { user = false } = {}) {
+  const input = $(`#ai-mode-${mode === "full" ? "full" : "fast"}`);
+  if (!input || (user && input.disabled)) return false;
+  input.checked = true;
+  if (user) researchState.modeTouched = true;
+  return true;
+}
+
 function updateResearchAvailability() {
   const unlocked = Boolean(state.token);
   const runtime = researchState.runtime;
@@ -45,6 +58,11 @@ function updateResearchAvailability() {
   $("#run-ai-analysis").disabled = !unlocked || !runtime?.configured
     || runtime.busy || researchState.checkBusy || researchState.runBusy
     || $("#run-ai-analysis").hasAttribute("aria-busy");
+  const modes = new Set(runtime?.available_run_modes || ["fast", "full"]);
+  document.querySelectorAll('input[name="ai-run-mode"]').forEach(input => {
+    input.disabled = !unlocked || !runtime?.configured || runtime.busy
+      || researchState.checkBusy || researchState.runBusy || !modes.has(input.value);
+  });
   for (const selector of ["#history-source", "#history-contract", "#refresh-history"]) {
     $(selector).disabled = !unlocked;
   }
@@ -82,11 +100,12 @@ function renderResearchStatus(payload) {
     : !runtime.configured ? "未就绪"
       : ({ ready: "运行时就绪", failed: "运行失败", canceled: "已取消" })[runtime.runtime_state] || "待自检";
   const modeLabel = runtime.run_mode === "fast" ? "快速 OKX 研究" : "完整辩论研究";
+  if (!researchState.modeTouched && runtime.run_mode) setResearchMode(runtime.run_mode);
   setState("#ai-runtime-state", label, !runtime.configured || runtime.runtime_state === "failed"
     ? "warning" : runtime.runtime_state === "ready" ? "good" : "neutral");
   setText("#ai-runtime-note", runtime.last_error
     ? runtimeErrors[runtime.last_error] || `运行状态：${runtime.last_error}`
-    : `${modeLabel} · 研究与交易隔离 · 时限 ${runtime.timeout_seconds || "--"} 秒 · 自检不验证模型连通性`);
+    : `默认 ${modeLabel} · 研究与交易隔离 · 时限 ${runtime.timeout_seconds || "--"} 秒 · 自检不验证模型连通性`);
   updateResearchAvailability();
 }
 
@@ -241,15 +260,151 @@ function researchSections(record) {
   ].filter(([, , value]) => reportValuePresent(value));
 }
 
+function appendReportList(parent, title, values, emptyText = "未给出") {
+  const section = document.createElement("section");
+  section.className = "report-plan-list";
+  const heading = document.createElement("h4");
+  heading.textContent = title;
+  const list = document.createElement("ul");
+  const items = Array.isArray(values) && values.length ? values.slice(0, 8) : [emptyText];
+  items.forEach(value => {
+    const item = document.createElement("li");
+    item.textContent = String(value);
+    list.append(item);
+  });
+  section.append(heading, list);
+  parent.append(section);
+}
+
+function renderFastCapability(key, value, body) {
+  const report = researchState.record?.report || {};
+  const fields = report.state || {};
+  const fast = report.mode === "fast" || Boolean(fields.fast_research);
+  if (!fast) return false;
+
+  const scope = fields.evidence_scope || {};
+  const missingByField = scope[key]?.status === "not_collected";
+  const missingByLegacyText = typeof value === "string" && value.startsWith("快速模式未接入");
+  if (["news", "sentiment"].includes(key) && (missingByField || missingByLegacyText)) {
+    const content = key === "news"
+      ? {
+        title: "新闻与宏观数据未采集",
+        detail: "本次快速研究只使用 OKX 公共行情，未将新闻、宏观或基本面纳入判断。完整研究会尝试调用相应数据源，并明确标记缺失来源。",
+      }
+      : {
+        title: "市场情绪数据未采集",
+        detail: "本次快速研究未接入社交和情绪数据，因此不推断情绪方向。完整研究会尝试补充相应证据，并保留来源状态。",
+      };
+    const section = document.createElement("section");
+    section.className = "report-capability";
+    const header = document.createElement("div");
+    header.className = "report-capability-heading";
+    const label = document.createElement("span");
+    label.className = "report-status-tag warning";
+    label.textContent = "本次未采集";
+    const title = document.createElement("strong");
+    title.textContent = content.title;
+    header.append(label, title);
+    const detail = document.createElement("p");
+    detail.textContent = content.detail;
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = "button secondary";
+    action.dataset.researchMode = "full";
+    action.textContent = "选择完整研究";
+    section.append(header, detail, action);
+    body.append(section);
+    return true;
+  }
+
+  const handoff = fields.execution_handoff || {};
+  const structuredHandoff = handoff.status === "requires_structured_strategy";
+  const legacyHandoff = typeof value === "string" && value.startsWith("快速研究结果不可执行");
+  if (key === "trader" && (structuredHandoff || legacyHandoff)) {
+    const fastResult = fields.fast_research || {};
+    const plan = fields.investment_plan || {};
+    const decision = String(fastResult.decision || plan.decision || report.decision || "Hold");
+    const decisionLabel = ({ buy: "偏多", sell: "偏空", hold: "观望" })[decision.toLowerCase()] || decision;
+    const confidence = Number(fastResult.confidence ?? plan.confidence);
+    const section = document.createElement("section");
+    section.className = "report-plan";
+    const header = document.createElement("div");
+    header.className = "report-plan-heading";
+    const heading = document.createElement("div");
+    const eyebrow = document.createElement("span");
+    eyebrow.textContent = "研究交接";
+    const title = document.createElement("strong");
+    title.textContent = decisionLabel;
+    heading.append(eyebrow, title);
+    const tag = document.createElement("span");
+    tag.className = "report-status-tag";
+    tag.textContent = Number.isFinite(confidence) ? `置信度 ${Math.round(confidence * 100)}%` : "置信度未给出";
+    header.append(heading, tag);
+    section.append(header);
+
+    const summary = fastResult.summary || fields.market_report;
+    if (summary) {
+      const summaryText = document.createElement("p");
+      summaryText.className = "report-plan-summary";
+      summaryText.textContent = String(summary);
+      section.append(summaryText);
+    }
+
+    const facts = [
+      ["趋势", fastResult.trend || plan.trend || "未给出"],
+      ["周期", fastResult.time_horizon || plan.time_horizon || "未给出"],
+    ];
+    const details = document.createElement("dl");
+    details.className = "report-plan-grid";
+    facts.forEach(([termText, detailText]) => {
+      const row = document.createElement("div");
+      const term = document.createElement("dt");
+      term.textContent = termText;
+      const detail = document.createElement("dd");
+      detail.textContent = String(detailText);
+      row.append(term, detail);
+      details.append(row);
+    });
+    section.append(details);
+    appendReportList(section, "依据", fastResult.evidence || plan.evidence, "本次研究未给出明确依据");
+    appendReportList(section, "风险", fastResult.risks || plan.risks, "本次研究未给出独立风险项");
+    appendReportList(section, "失效条件", fastResult.invalidations || plan.invalidations, "本次研究未给出失效条件");
+
+    const boundary = document.createElement("div");
+    boundary.className = "report-execution-boundary";
+    const boundaryText = document.createElement("div");
+    const boundaryTitle = document.createElement("strong");
+    boundaryTitle.textContent = "执行权限未授予";
+    const boundaryDetail = document.createElement("span");
+    boundaryDetail.textContent = "研究结论不会直接创建订单，必须重新生成结构化策略并通过独立风控。";
+    boundaryText.append(boundaryTitle, boundaryDetail);
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = "button secondary";
+    action.dataset.runStructuredAnalysis = "true";
+    action.disabled = !state.token || researchState.runBusy;
+    action.textContent = "运行策略分析";
+    boundary.append(boundaryText, action);
+    section.append(boundary);
+    body.append(section);
+    return true;
+  }
+  return false;
+}
+
 function renderResearchSection() {
   const index = Number($("#report-section").value);
   const section = researchState.sections[index];
   const body = $("#report-section-body");
   body.replaceChildren();
   if (!section) return;
-  const [, title, value] = section;
+  const [key, title, value] = section;
   body.setAttribute("aria-label", title);
   setText("#report-section-count", `${index + 1} / ${researchState.sections.length}`);
+  if (renderFastCapability(key, value, body)) {
+    body.scrollTop = 0;
+    return;
+  }
   const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
   const maximum = 80000;
   const bounded = text.slice(0, maximum);
@@ -313,6 +468,7 @@ function renderResearchEvidence() {
   const context = record.source === "TradingAgents" ? record.report?.market_context || {} : {};
   const evidence = [
     ["研究合约", record.inst_id],
+    ["研究模式", record.report?.mode === "full" ? "完整研究" : record.report?.mode === "fast" ? "快速研究" : "--"],
     ["数据周期", context.bar || "--"],
     ["K 线数量", context.candle_count == null ? "--" : `${context.candle_count} 根`],
     ["采集时间 · UTC", formatTime(context.captured_at)],
@@ -348,7 +504,10 @@ function displayResearch(record, { focus = false } = {}) {
   $("#report-safety").hidden = false;
   $("#open-research-report").hidden = false;
   setText("#research-title", `${record.inst_id} 研究`);
-  setText("#report-meta", `${researchSources[record.source] || record.source} · ${formatTime(record.created_at)} UTC${record.id ? ` · #${record.id}` : ""}`);
+  const mode = record.source === "TradingAgents"
+    ? ({ fast: "快速研究", full: "完整研究" })[record.report?.mode]
+    : null;
+  setText("#report-meta", `${researchSources[record.source] || record.source}${mode ? ` · ${mode}` : ""} · ${formatTime(record.created_at)} UTC${record.id ? ` · #${record.id}` : ""}`);
   const select = $("#report-section");
   select.replaceChildren();
   researchState.sections.forEach(([, title], index) => select.add(new Option(title, String(index))));
@@ -411,6 +570,20 @@ function initializeResearch() {
     if (button) selectResearch(Number(button.dataset.analysisId));
   });
   $("#report-section").addEventListener("change", renderResearchSection);
+  document.querySelectorAll('input[name="ai-run-mode"]').forEach(input => {
+    input.addEventListener("change", () => {
+      researchState.modeTouched = true;
+    });
+  });
+  $("#report-section-body").addEventListener("click", event => {
+    const mode = event.target.closest("[data-research-mode]")?.dataset.researchMode;
+    if (mode && setResearchMode(mode, { user: true })) {
+      researchRunMessage("已选择完整研究；下次 TradingAgents 研究将采集外部数据。", "good");
+      $("#ai-mode-full").focus({ preventScroll: true });
+      return;
+    }
+    if (event.target.closest("[data-run-structured-analysis]")) $("#run-analysis").click();
+  });
   $("#download-research").addEventListener("click", () => {
     if (!state.token || !researchState.record) return;
     const record = researchState.record;

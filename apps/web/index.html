@@ -494,7 +494,20 @@
               <section class="ticket-pane" id="signal-pane" aria-labelledby="ticket-tab-signal">
               <div class="research-actions">
                 <button class="button primary" id="run-analysis" type="button" disabled><i data-icon="scan-line" aria-hidden="true"></i><span>策略分析</span></button>
-                <button class="button secondary" id="run-ai-analysis" type="button" disabled><i data-icon="workflow" aria-hidden="true"></i><span>TradingAgents 研究</span></button>
+                <div class="ai-research-control">
+                  <fieldset class="ai-mode-toggle" id="ai-run-mode">
+                    <legend class="sr-only">TradingAgents 研究模式</legend>
+                    <label title="仅使用 OKX 公共行情，响应较快">
+                      <input id="ai-mode-fast" type="radio" name="ai-run-mode" value="fast" checked>
+                      <span>快速</span>
+                    </label>
+                    <label title="运行新闻、宏观、情绪与多智能体研究链">
+                      <input id="ai-mode-full" type="radio" name="ai-run-mode" value="full">
+                      <span>完整</span>
+                    </label>
+                  </fieldset>
+                  <button class="button secondary" id="run-ai-analysis" type="button" disabled><i data-icon="workflow" aria-hidden="true"></i><span>TradingAgents 研究</span></button>
+                </div>
               </div>
                 <div class="analysis-head">
                   <div>

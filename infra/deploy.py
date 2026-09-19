@@ -430,6 +430,100 @@ class Deployment:
         print(json.dumps(report, ensure_ascii=True, indent=2))
         return report
 
+    def pushplus_smoke(self, origin: str | None = None) -> dict:
+        output = self.root / "outputs/pushplus-verification.json"
+        output.unlink(missing_ok=True)
+        environment = effective_environment(self.config())
+        admin_token = environment.get("ADMIN_API_TOKEN", "").strip()
+        pushplus_token = environment.get("PUSHPLUS_TOKEN", "").strip()
+        if not admin_token:
+            raise DeploymentError("PushPlus smoke requires the configured admin token.")
+        if not pushplus_token:
+            raise DeploymentError("PushPlus is not configured in the resolved API environment.")
+        origin = origin or binding_origin(self.compose("port", "web", "80").stdout.decode())
+        requested_at = datetime.now(timezone.utc)
+        body = json.dumps({
+            "title": "OpenPerpDesk PushPlus 部署验收",
+            "content": (
+                "PushPlus API 受理测试。请在微信端人工核对是否收到；"
+                f"请求时间：{requested_at.isoformat()}。"
+            ),
+        }, ensure_ascii=True).encode()
+        request = urllib.request.Request(
+            origin.rstrip("/") + "/api/v1/notifications/test",
+            data=body,
+            headers={"Content-Type": "application/json", "X-Admin-Token": admin_token},
+            method="POST",
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(request, timeout=15) as response:
+                status = response.status
+                response_body = response.read(65_537)
+        except urllib.error.HTTPError as error:
+            try:
+                status = error.code
+            finally:
+                error.close()
+            if status == 401:
+                raise DeploymentError("PushPlus smoke could not authenticate with the configured admin token.") from None
+            if status == 503:
+                raise DeploymentError("PushPlus is not configured in the running API container; no message was retried.") from None
+            if status == 502:
+                raise DeploymentError(
+                    "PushPlus acceptance was rejected or is unknown; do not retry blindly before checking provider records."
+                ) from None
+            raise DeploymentError(f"PushPlus smoke returned HTTP {status}; no message was retried.") from None
+        except (OSError, urllib.error.URLError):
+            raise DeploymentError(
+                "PushPlus smoke transport failed and acceptance may be unknown; do not retry blindly before checking provider records."
+            ) from None
+
+        try:
+            if status != 200 or len(response_body) > 65_536:
+                raise ValueError("invalid HTTP response")
+            payload = json.loads(response_body)
+            outer_fields = {"accepted", "delivery_confirmed", "result"}
+            inner_fields = {"code", "msg", "accepted", "delivery_confirmed", "message_id"}
+            if not isinstance(payload, dict) or set(payload) != outer_fields:
+                raise ValueError("unexpected response fields")
+            if payload["accepted"] is not True or payload["delivery_confirmed"] is not False:
+                raise ValueError("invalid outer acceptance state")
+            result = payload["result"]
+            if not isinstance(result, dict) or set(result) != inner_fields:
+                raise ValueError("unexpected result fields")
+            if type(result["code"]) not in {int, str} or str(result["code"]) != "200":
+                raise ValueError("invalid provider code")
+            if result["msg"] != "request_accepted":
+                raise ValueError("invalid provider message")
+            if result["accepted"] is not True or result["delivery_confirmed"] is not False:
+                raise ValueError("invalid provider acceptance state")
+            message_id = result["message_id"]
+            if message_id is not None and (
+                not isinstance(message_id, str)
+                or not re.fullmatch(r"[a-fA-F0-9]{32}", message_id)
+                or message_id.casefold() in {admin_token.casefold(), pushplus_token.casefold()}
+            ):
+                raise ValueError("invalid message identifier")
+        except (ValueError, TypeError, KeyError):
+            raise DeploymentError(
+                "PushPlus smoke returned unknown acceptance evidence; no report was published and no message was retried."
+            ) from None
+
+        report = {
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "scope": "pushplus_api_acceptance_only",
+            "http_status": 200,
+            "accepted": True,
+            "delivery_confirmed": False,
+            "message_id": message_id,
+            "proxy_configured": bool(environment.get("PUSHPLUS_PROXY_URL", "").strip()),
+        }
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_json(output, report)
+        print(json.dumps(report, ensure_ascii=True, indent=2))
+        return report
+
     def ai_live_smoke(
         self, *, timeout: float = 240, inst_id: str = "BTC-USDT-SWAP",
         bar: str = "15m", limit: int = 100, run_mode: str | None = None,
@@ -616,6 +710,7 @@ def main() -> None:
     proxy_smoke = commands.add_parser("proxy-smoke")
     proxy_smoke.add_argument("--timeout", type=float, default=45)
     proxy_smoke.add_argument("--symbols", default="BTC-USDT-SWAP,ETH-USDT-SWAP")
+    commands.add_parser("pushplus-smoke").add_argument("origin", nargs="?")
     ai_live_smoke = commands.add_parser("ai-live-smoke")
     ai_live_smoke.add_argument("--timeout", type=float, default=240)
     ai_live_smoke.add_argument("--inst-id", default="BTC-USDT-SWAP")
@@ -640,6 +735,8 @@ def main() -> None:
                 deployment.private_smoke(timeout=args.timeout, allow_live=args.allow_live)
             elif args.command == "proxy-smoke":
                 deployment.proxy_smoke(timeout=args.timeout, symbols=args.symbols)
+            elif args.command == "pushplus-smoke":
+                deployment.pushplus_smoke(args.origin)
             elif args.command == "ai-live-smoke":
                 deployment.ai_live_smoke(
                     timeout=args.timeout, inst_id=args.inst_id,
