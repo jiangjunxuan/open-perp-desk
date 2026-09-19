@@ -64,7 +64,7 @@
 - [x] TradingAgents 独立运行时、超时/取消/父进程退出清理、并发互斥和环境凭据隔离
 - [x] 真实 TradingAgents 多代理与四种结构化输出协议联调（本地模型测试服务 + OKX 公共快照）
 - [x] Web 完整研究报告、分页历史筛选、运行时自检与只读研究隔离
-- [ ] TradingAgents 真实模型服务与外部数据工具的端到端研究验收
+- [x] TradingAgents 真实模型服务与公共数据工具的端到端研究验收（目标服务器 `fast` / `full`，2026-09-19）
 - [x] 回测和历史重放
 - [x] TradingView Webhook 信号桥接、合约白名单、过期校验和幂等执行（默认关闭，见 `docs/TRADINGVIEW.md`）
 - [x] TradingView 持久化接收与异步处理、重复内容冲突拦截、原始时效与账户身份绑定、中断不重发和中文告警推送面板（本机测试，不代表真实 TradingView/OKX 验收）
@@ -108,8 +108,10 @@
 - [x] 真实 API 子进程全链路联调（本机交易所协议测试服务）：分析、核验、幂等发单、成交与原生保护、Worker、急停持久化及发单途中崩溃恢复
 - [ ] PushPlus 使用真实 token 的端到端测试
 - [ ] OKX Demo 私有 WS、订单状态和成交回报对账测试
-- [ ] Docker Compose 在服务器环境构建并运行
+- [x] Docker Compose release 镜像在目标服务器构建并运行（2026-09-19，`71fccf3`）
+- [x] 目标服务器 SOCKS5 公共 REST、报价 WebSocket 和四周期 K 线只读验收（2026-09-19）
 - [x] CI 容器自定义路径备份恢复、重启持久性演练实际运行通过（2026-09-13，`b58edbc` 基线）
 - [x] 实时 SSE 经容器 Nginx 和备份恢复重启后的连通性验收（2026-09-13，`0c4280e`，CI `34750347409`）
-- [ ] 宝塔反向代理、HTTPS、备份和回滚演练
+- [x] 宝塔反向代理、HTTPS、部署前备份和镜像 digest 验收（见 `DEPLOYMENT_ACCEPTANCE_2026-09-19.md`）
+- [ ] 目标服务器实际恢复、旧镜像回滚、重启和断电恢复演练
 - [x] 实盘上线前的人工审批清单（见 `docs/LIVE_APPROVAL_CHECKLIST.md`；实际批准仍需目标环境证据）

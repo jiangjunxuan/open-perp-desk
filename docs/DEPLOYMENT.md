@@ -484,14 +484,22 @@ CI 基线 `b58edbc` 已在 2026-09-13 实际构建镜像、验证图标、在自
 实时 SSE 版本 `0c4280e` 已通过 CI `34750347409`：容器 Nginx 前后两轮流式检查通过，
 恢复重启后连续行情事件间隔为 0.250 秒、系统心跳为 5.005 秒，未认证私有请求返回 401，
 执行关闭和急停开启均已校验。此记录不替代后续版本自己的 CI。
-当前开发机没有 Docker，目标服务器 HTTPS、宝塔和实际外部凭据仍需另行验收；
-离线研究自检不能证明真实模型连接可用。
+版本 `71fccf3` 已在 2026-09-19 完成目标服务器 release 镜像、宝塔 HTTPS、公开 SSE、
+服务端 SOCKS5 公共行情和 TradingAgents `fast` / `full` 真实模型只读验收；镜像、
+备份、CI、实时性和安全开关证据见
+[`DEPLOYMENT_ACCEPTANCE_2026-09-19.md`](DEPLOYMENT_ACCEPTANCE_2026-09-19.md)。
+该验收不包含 OKX 私有 Demo、PushPlus 微信送达、TradingView Alert、实际恢复/回滚切换
+或断电恢复，不能作为实盘批准。
 
 ## 7. 最小上线检查
 
 正式进入真实资金环境前，必须完成并留存
 [`docs/LIVE_APPROVAL_CHECKLIST.md`](LIVE_APPROVAL_CHECKLIST.md)；
 本节只是部署存活检查，不是实盘批准。
+
+2026-09-19 的目标服务器实例记录见
+[`DEPLOYMENT_ACCEPTANCE_2026-09-19.md`](DEPLOYMENT_ACCEPTANCE_2026-09-19.md)；
+下面保留为每次部署都需要重新执行的通用清单，不因一次验收永久勾选。
 
 - [ ] 域名 HTTPS 可访问
 - [ ] `./infra/openperpdesk.sh preflight` 通过

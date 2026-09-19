@@ -3,7 +3,7 @@
 OpenPerpDesk 是一个开源的 AI 辅助永续合约交易后台。它运行在服务器上，
 通过浏览器访问，并使用 Docker 部署。
 
-计划整合：
+主要组成：
 
 - TradingAgents：研究分析和多智能体市场研判
 - OKX 官方 agent skills 或 API 适配层：行情和交易能力
@@ -48,8 +48,11 @@ OpenPerpDesk 是一个开源的 AI 辅助永续合约交易后台。它运行在
 - 实盘有独立安全闸门，必须满足多项配置并由管理员在进程内手动解锁，服务重启后自动回锁
 
 在交易执行、持仓校验、风险控制和异常场景测试完成前，不要使用真实资金。
-目前仍需用真实 OKX Demo 文件完成季度归档端到端验收，完善统一币种的完整绩效和目标服务器断线与断电恢复演练，
-并完成真实 Demo 和目标服务器验收。详见 `docs/ROADMAP.md`。
+截至 2026-09-19，目标服务器的 Docker/宝塔 HTTPS、公开实时行情、服务端 SOCKS5
+代理和 TradingAgents 快速/完整真实模型研究已经完成只读验收。仍需完成真实 OKX Demo
+私有账户与订单闭环、PushPlus 微信送达、TradingView Alert、季度文件以及目标服务器
+恢复/回滚和断电演练。详见 `docs/ROADMAP.md` 和
+[`docs/DEPLOYMENT_ACCEPTANCE_2026-09-19.md`](docs/DEPLOYMENT_ACCEPTANCE_2026-09-19.md)。
 
 ## 本地启动
 
@@ -105,7 +108,7 @@ API 健康检查地址为 `/api/v1/health`。
 - 原币种账户账单：交易损益、手续费、资金费及其他扣款，按账户范围幂等落盘
 - 近期历史账单补录：完整 UTC 日原子发布、可重试、覆盖缺口和进度查看，
   原币种永续损益与账户划转分别汇总
-- SQLite 本地状态落盘和 Docker Compose 部署骨架
+- SQLite 本地状态落盘和 Docker Compose 部署
 - Docker、宝塔反向代理、HTTPS、服务端 SOCKS5/HTTP 代理、SQLite 备份恢复说明见
   [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
 - TradingAgents 需要额外依赖时，可使用 `docker-compose.tradingagents.yml` 构建可选 API 镜像
@@ -211,7 +214,9 @@ REST/WebSocket/PushPlus 测试服务。不会读取现有交易凭据或连接�
 
 本次工作树验证结果：
 
-- 完整 CI 基线 `7c605d9`：API 单元和集成测试 777 项通过。
+- 当前提交 `71fccf3` 的 push 与 pull request 两次 CI 均通过；本轮功能专项
+  Python 测试 71/71、Node 实时与外观测试 13/13 通过，同一工作树较早的完整
+  API 回归 839/839 通过。
 - TradingView 专项现有 39 项通过：快速接收、持久化排队、异步风控执行、
   并发去重、参数冲突、过期、跨账户拒绝、进程崩溃不重发与私有 SSE。
   回执基于订单账本区分明确拒单和结果未知，包含真实 API 子进程回归；
@@ -223,12 +228,12 @@ REST/WebSocket/PushPlus 测试服务。不会读取现有交易凭据或连接�
   本机协议浏览器验收无交易所变更请求。这不代表真实 TradingView 告警已验收。
 - Demo 交易闭环：9 个场景全部通过，覆盖幂等发单、成交、原生保护、
   Worker、急停、进程崩溃恢复和禁止重复发单。
-- TradingAgents：真实图和结构化协议通过本地模型夹具，11 次调用均带
-  OKX 公共行情证据；真实模型服务仍未验证，且不会授权执行。
+- TradingAgents：真实图和结构化协议通过本地模型夹具；目标服务器上的真实模型
+  `fast` 与 `full` 研究也已通过只读验收，均带 OKX 公共行情证据且不会授权执行。
 - 实时 SSE：市场事件约 250ms 更新、系统心跳约 5 秒、私有未认证请求返回
   401；断流时页面清空当前旧快照并锁定执行。
-- Docker/宝塔、真实 OKX 私有流、PushPlus 微信送达和目标服务器验收仍需在
-  外部环境完成。
+- Docker/宝塔 HTTPS、公开实时行情、服务端 SOCKS5 代理和目标服务器容器已验收；
+  真实 OKX 私有流、PushPlus 微信送达、TradingView Alert 和实际回滚演练仍未完成。
 
 ## 目录结构
 
@@ -243,9 +248,11 @@ docker-compose.yml
 
 生产部署前请先阅读 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)。当前 Compose
 只持久化 API 的 SQLite 数据卷；Web 通过 Nginx 反代到 API。实盘默认被独立
-安全闸门锁定，不能把“页面可访问”视为“交易已启用”。真实 OKX Demo 私有
-WebSocket、订单状态/成交回报、PushPlus token、服务器构建、宝塔 HTTPS 和回滚
-仍需要在目标环境逐项验收。
+安全闸门锁定，不能把“页面可访问”视为“交易已启用”。目标服务器构建、宝塔 HTTPS、
+公开 SSE、服务端 SOCKS5 代理和真实模型研究的 2026-09-19 验收记录见
+[`docs/DEPLOYMENT_ACCEPTANCE_2026-09-19.md`](docs/DEPLOYMENT_ACCEPTANCE_2026-09-19.md)。
+真实 OKX Demo 私有 WebSocket、订单状态/成交回报、PushPlus token、TradingView Alert
+和实际恢复/回滚仍需要在目标环境逐项验收。
 
 部署命令入口为 `infra/openperpdesk.sh`，主机需要 Python 3.11+ 和 Compose v2。
 `preflight` 校验 Compose 最终解析配置；`backup` 生成含 WAL 提交数据的一致性快照及
