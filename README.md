@@ -48,11 +48,13 @@ OpenPerpDesk 是一个开源的 AI 辅助永续合约交易后台。它运行在
 - 实盘有独立安全闸门，必须满足多项配置并由管理员在进程内手动解锁，服务重启后自动回锁
 
 在交易执行、持仓校验、风险控制和异常场景测试完成前，不要使用真实资金。
-截至 2026-09-19，目标服务器的 Docker/宝塔 HTTPS、公开实时行情、服务端 SOCKS5
-代理和 TradingAgents 快速/完整真实模型研究已经完成只读验收。仍需完成真实 OKX Demo
-私有账户与订单闭环、PushPlus 微信送达、TradingView Alert、季度文件以及目标服务器
-恢复/回滚和断电演练。详见 `docs/ROADMAP.md` 和
-[`docs/DEPLOYMENT_ACCEPTANCE_2026-09-19.md`](docs/DEPLOYMENT_ACCEPTANCE_2026-09-19.md)。
+2026-09-19，目标服务器的 Docker/宝塔 HTTPS、公开实时行情、服务端 SOCKS5
+代理和 TradingAgents 快速/完整真实模型研究完成只读验收。
+2026-09-20 又完成生产同镜像重启、API 进程崩溃自动恢复和当前停写快照的实际恢复。
+仍需完成真实 OKX Demo 私有账户与订单闭环、PushPlus 微信送达、TradingView Alert、
+季度文件、旧应用镜像回滚和宿主机断电演练。详见 `docs/ROADMAP.md`、
+[`2026-09-19 验收记录`](docs/DEPLOYMENT_ACCEPTANCE_2026-09-19.md) 和
+[`2026-09-20 恢复记录`](docs/DEPLOYMENT_ACCEPTANCE_2026-09-20.md)。
 
 ## 本地启动
 
