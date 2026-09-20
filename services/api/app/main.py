@@ -43,6 +43,7 @@ from .strategy_engine import StrategyEngine
 from .trading_signal import TradeSignal
 from . import tradingview
 from .tradingview_worker import TradingViewWorker
+from .private_connection import PrivateConnectionCheck, PrivateProbeError
 from .realtime import control_events, private_events
 
 
@@ -56,6 +57,7 @@ market_stream = OkxMarketStream(_symbols())
 account_client = OkxAccountClient()
 account_stream = OkxAccountStream()
 algo_stream = OkxAlgoOrderStream()
+private_connection_check = PrivateConnectionCheck()
 pushplus_client = PushPlusClient()
 risk_engine = RiskEngine()
 trade_client = OkxTradeClient()
@@ -133,6 +135,7 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        await private_connection_check.close()
         await tradingview_worker.close()
         await equity_baseline.stop()
         await account_performance.close()
@@ -494,10 +497,26 @@ async def account_events(
         return bool(expected and x_admin_token and secrets.compare_digest(x_admin_token, expected))
 
     return StreamingResponse(
-        private_events(state_store, account_stream, account_client, authorized, lambda: market_client.rate_scope),
+        private_events(
+            state_store, account_stream, account_client, authorized,
+            lambda: market_client.rate_scope, private_connection_check.snapshot,
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/api/v1/account/connection-check")
+def private_connection_status(_: None = Depends(require_admin_token)) -> dict[str, object]:
+    return {"data": private_connection_check.snapshot()}
+
+
+@app.post("/api/v1/account/connection-check", status_code=202)
+async def start_private_connection_check(_: None = Depends(require_admin_token)) -> dict[str, object]:
+    try:
+        return {"data": private_connection_check.start()}
+    except PrivateProbeError as error:
+        raise HTTPException(status_code=409, detail=error.code) from None
 
 
 @app.get("/api/v1/account/overview")

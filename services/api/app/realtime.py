@@ -39,7 +39,9 @@ async def control_events(
         await asyncio.sleep(.25)
 
 
-async def private_events(store, account, account_client, authorized, rate_scope=lambda: None) -> AsyncIterator[str]:
+async def private_events(
+    store, account, account_client, authorized, rate_scope=lambda: None, connection_check=None,
+) -> AsyncIterator[str]:
     def account_state() -> tuple[bool, bool, bool]:
         connected = bool(account.connected)
         authenticated = bool(account.authenticated)
@@ -67,6 +69,8 @@ async def private_events(store, account, account_client, authorized, rate_scope=
                 "last_message_at": account.last_message_at,
             },
         }
+        if connection_check is not None:
+            payloads["connection_check"] = {"data": connection_check()}
         if current_revision != revision:
             # No exchange requests here. Reading the durable ledger cannot place
             # an order, trigger reconciliation, or multiply REST traffic per tab.

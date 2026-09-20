@@ -56,6 +56,6 @@ test("existing script and stylesheet URLs leave legacy heuristic caches", async 
   const sources = [...html.matchAll(/<(?:script|link)\b[^>]*(?:src|href)="([^"]+)"/g)]
     .map(match => new URL(match[1], "https://console.test"))
     .filter(url => /\.(js|css)$/.test(url.pathname));
-  assert.equal(sources.length, 9);
+  assert.equal(sources.length, 10);
   assert.ok(sources.every(url => url.searchParams.get("cache") === "validate-v1"));
 });

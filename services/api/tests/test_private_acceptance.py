@@ -33,7 +33,7 @@ class PrivateProbeTests(unittest.IsolatedAsyncioTestCase):
                         "orders_history", "fills_history", "pending_algo_orders")
         for name in self.methods:
             setattr(self.account, name, AsyncMock(return_value=[{"private": "never-publish"}]))
-        self.streams = [SimpleNamespace(connected=True, authenticated=True, last_error=None,
+        self.streams = [SimpleNamespace(connected=True, authenticated=True, last_error=None, proxy_url=None,
                                       start=AsyncMock(), stop=AsyncMock()) for _ in range(2)]
         for name, instance in zip(
             ("OkxAccountClient", "OkxAccountStream", "OkxAlgoOrderStream"),

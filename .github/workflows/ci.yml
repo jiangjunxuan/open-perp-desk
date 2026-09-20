@@ -78,6 +78,7 @@ jobs:
           curl --fail --silent http://127.0.0.1:8080/research.js | grep 'initializeResearch' >/dev/null
           curl --fail --silent http://127.0.0.1:8080/theme.js | grep 'openperpdesk.theme' >/dev/null
           curl --fail --silent http://127.0.0.1:8080/account-history.js | grep 'initializeBillHistory' >/dev/null
+          curl --fail --silent http://127.0.0.1:8080/connection-check.js | grep 'initializeConnectionCheck' >/dev/null
           curl --fail --silent http://127.0.0.1:8080/live.js | grep 'openLiveStream' >/dev/null
           curl --fail --silent http://127.0.0.1:8080/assets/reports/marked.js | grep 'Marked' >/dev/null
           curl --fail --silent http://127.0.0.1:8080/assets/reports/purify.min.js | grep 'DOMPurify' >/dev/null
@@ -296,6 +297,7 @@ jobs:
       - run: node --check apps/web/theme.js
       - run: node --check apps/web/account-history.js
       - run: node --check apps/web/protection-review.js
+      - run: node --check apps/web/connection-check.js
       - run: node --check apps/web/live.js
       - run: node --test infra/appearance.test.mjs infra/live.test.mjs
       - run: bash -n infra/openperpdesk.sh

@@ -21,6 +21,8 @@ OpenPerpDesk 是一个开源的 AI 辅助永续合约交易后台。它运行在
 - 仓库不保存任何 API 密钥
 - Web 页面可读取公开行情和不敏感的系统状态
 - 私有账户总览需要 `X-Admin-Token`；账户适配器已实现但默认未配置密钥
+- “风控与连接”提供管理员只读模拟盘检测，逐项推送私有认证和账户查询结果；
+  通过不代表已验证下单或成交
 - 私有账户 WebSocket 已实现基础登录和账户、持仓、订单事件缓存
 - 订单 WebSocket 中的有效成交会写入幂等成交账本；REST 对账可校正成交值，
   旧 WS 缓存不会覆盖校正结果，同一成交只通知一次
@@ -54,8 +56,9 @@ OpenPerpDesk 是一个开源的 AI 辅助永续合约交易后台。它运行在
 代理和 TradingAgents 快速/完整真实模型研究完成只读验收。
 2026-09-20 又完成生产同镜像重启、API 进程崩溃自动恢复、当前停写快照实际恢复，
 以及生产 API/Web 旧镜像切换与当前镜像返回。
-仍需完成真实 OKX Demo 私有账户与订单闭环、PushPlus 微信送达、TradingView Alert、
-季度文件和宿主机断电演练。详见 `docs/ROADMAP.md`、
+仍需完成真实 OKX Demo 私有账户与订单闭环、PushPlus 微信送达、
+季度文件和宿主机断电演练。TradingView 是可选信号源，其真实 Alert 验收
+不阻塞内置策略自动化，也不要求用户注册 TradingView。详见 `docs/ROADMAP.md`、
 [`2026-09-19 验收记录`](docs/DEPLOYMENT_ACCEPTANCE_2026-09-19.md) 和
 [`2026-09-20 恢复记录`](docs/DEPLOYMENT_ACCEPTANCE_2026-09-20.md)。
 

@@ -1273,6 +1273,7 @@ function renderStrategy(strategy) {
 
 function updatePrivateActionAvailability() {
   const unlocked = Boolean(state.token);
+  renderConnectionCheck();
   if (!unlocked) renderTradingViewAlerts(null);
   const worker = state.status?.automation_worker || {};
   const integrations = state.status?.integrations || {};
@@ -2443,6 +2444,7 @@ function lockPrivateAccess() {
   state.privateFeedState = "locked";
   state.privateAccountReady = false;
   state.token = "";
+  clearConnectionCheck();
   state.privateUpdates += 1;
   state.adjustments = [];
   state.incidents = [];
@@ -2515,7 +2517,7 @@ async function refreshLivePerformance() {
 
 function applyPrivateEvent(event, payload) {
   if (!state.token) return;
-  if (event === "tradingview_alerts" && state.privateFeedState !== "open") return;
+  if (["tradingview_alerts", "connection_check"].includes(event) && state.privateFeedState !== "open") return;
   if (event === "heartbeat") return;
   if (event === "locked") {
     lockPrivateAccess();
@@ -2539,6 +2541,7 @@ function applyPrivateEvent(event, payload) {
     state.activityRequest += 1;
     renderActivity(payload.data);
   } else if (event === "tradingview_alerts") renderTradingViewAlerts(payload.data);
+  else if (event === "connection_check") applyConnectionCheck(payload.data);
   else if (event === "chart_annotations") {
     state.chartRemoteLoaded = true;
     state.chartRemoteStatus = "cloud";
@@ -2607,12 +2610,15 @@ function connectPrivateFeed() {
       state.privateFeedState = status;
       if (status === "locked") lockPrivateAccess();
       else if (status === "connecting") {
+        clearConnectionCheck();
         clearPrivateDisplay("账户推送连接中", "等待实时账户数据");
         renderTradingViewAlerts(null, "推送连接中");
       } else if (status !== "open") {
+        clearConnectionCheck();
         clearPrivateDisplay("账户推送断开", "实时账户数据不可用");
         renderTradingViewAlerts(null, "推送连接断开");
       }
+      renderConnectionCheck();
       scheduleBillImportPoll();
     },
     onEvent(event, payload) {
@@ -3357,6 +3363,7 @@ $("#auth-form").addEventListener("submit", async (event) => {
   privateFeed?.close();
   privateFeed = null;
   state.privateFeedState = "locked";
+  clearConnectionCheck();
   state.token = $("#admin-token").value.trim();
   if (!state.token) lockPrivateAccess();
   try {
@@ -3484,6 +3491,7 @@ document.addEventListener("visibilitychange", () => {
     state.controlSnapshotFresh = false;
     state.controlUpdates += 1;
     state.privateFeedState = "offline";
+    clearConnectionCheck();
   } else {
     connectMarketFeed();
     connectControlFeed();
@@ -3511,6 +3519,7 @@ loadChartAnnotations();
 initializeResearch();
 initializeBillHistory();
 initializeProtectionReviews();
+initializeConnectionCheck();
 showView(location.hash.slice(1));
 tickClock();
 setInterval(tickClock, 1000);

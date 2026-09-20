@@ -13,13 +13,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "services/api"))
 
-from tests.fixtures.api_process import ApiProcess
+from tests.fixtures.api_process import ADMIN_TOKEN, ApiProcess
 from tests.fixtures.exchange_server import ExchangeServer
 
 
 async def main():
     artifacts = ROOT / "work/ci-ui-artifacts"
     artifacts.mkdir(parents=True, exist_ok=True)
+    for name in ("ui-verification.json", "acceptance-summary.json"):
+        (artifacts / name).unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(prefix="openperpdesk-ui-acceptance-") as directory:
         exchange = ExchangeServer()
         api = None
@@ -41,9 +43,12 @@ async def main():
                 "OPENPERPDESK_ORIGIN": api.origin,
                 "OPENPERPDESK_OUTPUT_DIR": str(artifacts),
                 "OPENPERPDESK_DISABLE_PROXY": "true",
+                "OPENPERPDESK_UI_ADMIN_TOKEN": ADMIN_TOKEN,
             }
             if os.getenv("CHROME_BIN"):
                 environment["CHROME_BIN"] = os.environ["CHROME_BIN"]
+            if os.getenv("OPENPERPDESK_UI_TRACE"):
+                environment["OPENPERPDESK_UI_TRACE"] = os.environ["OPENPERPDESK_UI_TRACE"]
             with (artifacts / "browser.log").open("wb") as log:
                 browser = await asyncio.create_subprocess_exec(
                     "node", str(ROOT / "infra/ui-smoke.mjs"), cwd=ROOT,
@@ -72,6 +77,9 @@ async def main():
                 "protection_review_groups": len(report["protectionReview"]),
                 "tradingview_checks": len(report["tradingView"]["checks"]),
                 "tradingview_layouts": len(report["tradingView"]["layouts"]),
+                "connection_checks": len(report["connectionCheck"]["checks"]),
+                "connection_layouts": len(report["connectionCheck"]["layouts"]),
+                "connection_round_trip": report["connectionRoundTrip"],
                 "browser_errors": report["browserErrors"],
                 "exchange_mutations": len(exchange.posts),
                 "execution_enabled": False,

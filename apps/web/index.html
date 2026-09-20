@@ -322,6 +322,19 @@
                 <button class="button secondary" id="test-notification" type="button" disabled><i data-icon="bell" aria-hidden="true"></i><span>测试 PushPlus</span></button>
                 <button class="button secondary" id="resume-trading" type="button" disabled><i data-icon="play" aria-hidden="true"></i><span>解除急停</span></button>
               </div>
+              <details class="connection-check" data-views="risk" hidden>
+                <summary>账户连接检测</summary>
+                <div class="connection-check-heading">
+                  <span class="tag">模拟盘 · 只读</span>
+                  <button class="button secondary" id="check-account-connection" type="button" disabled><i data-icon="refresh-cw" aria-hidden="true"></i><span>检测连接</span></button>
+                </div>
+                <div class="connection-check-summary">
+                  <strong id="account-check-status" role="status" aria-live="polite">管理员未解锁</strong>
+                  <span id="account-check-time" class="mono">--</span>
+                </div>
+                <dl id="account-check-results" class="connection-check-results"></dl>
+                <span class="settings-message">检测范围：只读连接，不含下单及成交验证</span>
+              </details>
               <details class="tradingview-setup" data-views="risk" hidden>
                 <summary>TradingView 信号接入</summary>
                 <div class="tradingview-setup-body">
@@ -852,6 +865,7 @@
     <script src="/research.js?cache=validate-v1"></script>
     <script src="/account-history.js?cache=validate-v1"></script>
     <script src="/protection-review.js?cache=validate-v1"></script>
+    <script src="/connection-check.js?cache=validate-v1"></script>
     <script src="/live.js?cache=validate-v1"></script>
     <script src="/app.js?cache=validate-v1"></script>
   </body>

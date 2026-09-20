@@ -1,5 +1,9 @@
 # TradingView 信号接入
 
+这是可选的外部信号入口。内置结构化策略直接使用 OKX 行情并调用独立风控和
+执行引擎，不依赖 TradingView 账户；不用此入口时，无需注册 TradingView，
+平台告警验收也不作为内置策略模拟盘验收的前置条件。
+
 OpenPerpDesk 将 TradingView 作为看盘和策略信号来源，TradingView 不直接持有
 OKX API 密钥，也不绕过后台风控。Alert 进入服务器后会依次经过：
 

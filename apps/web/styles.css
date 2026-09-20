@@ -181,6 +181,16 @@ input::placeholder { color: var(--muted); }
 .private-access .button { margin-left: auto; }
 .private-access.is-unlocked { display: none; }
 .tradingview-setup { margin-top: 16px; border-top: 1px solid var(--border-soft); }
+.connection-check { margin-top: 16px; padding-bottom: 16px; border-top: 1px solid var(--border-soft); }
+.connection-check summary { min-height: 48px; padding: 14px 0; color: var(--muted-strong); font-size: 12px; font-weight: 600; }
+.connection-check-heading, .connection-check-summary { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; }
+.connection-check-summary { margin-top: 12px; font-size: 12px; }
+.connection-check-summary > * { min-width: 0; overflow-wrap: anywhere; }
+.connection-check-summary .mono { color: var(--muted); }
+.connection-check-results { display: grid; margin: 12px 0; font-size: 12px; }
+.connection-check-results > div { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: center; gap: 12px; min-height: 36px; border-bottom: 1px solid var(--border-soft); }
+.connection-check-results dt { color: var(--muted); }
+.connection-check-results dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
 .tradingview-setup summary { min-height: 48px; padding: 14px 0; color: var(--muted-strong); font-size: 12px; font-weight: 600; }
 .tradingview-setup-body { display: grid; gap: 14px; padding: 0 0 16px; }
 .tradingview-summary { display: flex; gap: 8px 16px; flex-wrap: wrap; font-size: 12px; }

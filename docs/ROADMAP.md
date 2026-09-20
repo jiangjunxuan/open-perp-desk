@@ -23,6 +23,7 @@
 - [x] 私有 WS 到达即唤醒账本同步，保留 REST 周期校验与断线补漏
 - [x] OKX 签名私有 REST 只读适配器（余额、持仓、账户配置）
 - [x] OKX 私有 WebSocket 适配器
+- [x] 网页模拟盘账户只读连接检测：两路私有认证、七项 REST、管理员鉴权、进度推送与脱敏结果（本机协议验收，不代表真实成交）
 - [x] PushPlus 通知客户端和配置状态
 - [x] PushPlus 发送接口测试（MockTransport）；真实 token 连通性仍需部署环境验证
 - [x] 带认证 HTTP/SOCKS5 代理的真实本机套接字联调：REST 签名、四路 WebSocket、保护参数和 PushPlus 传输
@@ -69,8 +70,8 @@
 - [x] TradingView Webhook 信号桥接、合约白名单、过期校验和幂等执行（默认关闭，见 `docs/TRADINGVIEW.md`）
 - [x] TradingView 持久化接收与异步处理、重复内容冲突拦截、原始时效与账户身份绑定、中断不重发和中文告警推送面板（本机测试，不代表真实 TradingView/OKX 验收）
 - [x] 目标 HTTPS TradingView 只接收模式、持久化回执、私有 SSE、去重及拒绝路径验收（2026-09-20，受控脚本请求，零订单）
-- [ ] TradingView 平台真实发出 `hold` 告警并核对平台日志与服务器回执（不依赖 OKX 私有凭据）
-- [ ] 真实 TradingView Alert 经目标 HTTPS 入口到 OKX Demo 的端到端验收
+- [ ] 可选 TradingView 接入：平台真实发出 `hold` 告警并核对平台日志与服务器回执（不依赖 OKX 私有凭据，不阻塞内置策略主线）
+- [ ] 可选 TradingView 接入：真实 Alert 经目标 HTTPS 入口到 OKX Demo 的端到端验收
 - [x] 策略配置页面和完整启停联动
 - [x] Web Worker 运行时启停和 Dry Run 安全控制
 - [x] Worker 周期互斥、账户快照失败停机、合约步长与非有限数值边界测试

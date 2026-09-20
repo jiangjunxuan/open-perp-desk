@@ -12,6 +12,7 @@ import { checkPositionLots } from "./position-lots-ui-checks.mjs";
 import { checkProtectionIncidents } from "./protection-incident-ui-checks.mjs";
 import { checkProtectionReview } from "./protection-review-ui-checks.mjs";
 import { checkTradingView } from "./tradingview-ui-checks.mjs";
+import { checkConnectionUI, checkConnectionRoundTrip } from "./connection-check-ui-checks.mjs";
 
 const root = process.cwd();
 const outputDirectory = path.resolve(root, process.env.OPENPERPDESK_OUTPUT_DIR || "outputs");
@@ -57,15 +58,22 @@ let socket;
 let nextId = 1;
 const pending = new Map();
 const browserErrors = [];
+const trace = process.env.OPENPERPDESK_UI_TRACE === "true";
 
 async function command(method, params = {}) {
   const id = nextId++;
+  if (trace) console.error(`CDP ${id}: ${method}`);
   return new Promise((resolve, reject) => {
+    const stalled = trace ? setTimeout(() => {
+      console.error(`Slow CDP ${id}: ${method}`);
+      socket.send(JSON.stringify({ id: nextId++, method: "Debugger.pause" }));
+    }, 5000) : null;
     const timeout = setTimeout(() => {
       pending.delete(id);
+      clearTimeout(stalled);
       reject(new Error(`CDP timeout: ${method}`));
     }, 15000);
-    pending.set(id, { resolve, reject, timeout });
+    pending.set(id, { resolve, reject, timeout, stalled });
     socket.send(JSON.stringify({ id, method, params }));
   });
 }
@@ -112,6 +120,12 @@ try {
   });
   socket.addEventListener("message", (event) => {
     const response = JSON.parse(event.data);
+    if (trace && response.method === "Debugger.paused") {
+      console.error("Paused browser stack:", JSON.stringify(response.params.callFrames.map(frame => ({
+        function: frame.functionName, location: frame.location,
+      }))));
+      socket.send(JSON.stringify({ id: nextId++, method: "Debugger.resume" }));
+    }
     if (response.method === "Runtime.exceptionThrown") {
       browserErrors.push(response.params.exceptionDetails.exception?.description || response.params.exceptionDetails.text);
       console.error(browserErrors.at(-1));
@@ -123,12 +137,14 @@ try {
     if (!waiting) return;
     pending.delete(response.id);
     clearTimeout(waiting.timeout);
+    clearTimeout(waiting.stalled);
     if (response.error) waiting.reject(new Error(response.error.message));
     else waiting.resolve(response.result || {});
   });
   await command("Page.enable");
   await command("Runtime.enable");
   await command("Network.enable");
+  if (trace) await command("Debugger.enable");
   await mkdir(outputDirectory, { recursive: true });
 
   const results = [];
@@ -828,7 +844,19 @@ try {
     },
   });
   if (browserErrors.length) throw new Error(`Browser exceptions: ${JSON.stringify(browserErrors)}`);
-  const report = { results, paused, symbol, oldSignalCleared, historyPassed, deepLinkPassed, researchChecks, contrast, reducedMotion, appearance, management, billHistory, realtime, annotations, positionLots, protectionIncidents, protectionReview, tradingView, browserErrors };
+  const connectionCheck = await checkConnectionUI({
+    evaluate, command,
+    screenshot: async name => {
+      const shot = await command("Page.captureScreenshot", { format: "png" });
+      await writeFile(path.join(outputDirectory, name), Buffer.from(shot.data, "base64"));
+    },
+  });
+  if (browserErrors.length) throw new Error(`Browser exceptions: ${JSON.stringify(browserErrors)}`);
+  const connectionRoundTrip = await checkConnectionRoundTrip({
+    evaluate, command, origin, token: process.env.OPENPERPDESK_UI_ADMIN_TOKEN,
+  });
+  if (browserErrors.length) throw new Error(`Browser exceptions: ${JSON.stringify(browserErrors)}`);
+  const report = { results, paused, symbol, oldSignalCleared, historyPassed, deepLinkPassed, researchChecks, contrast, reducedMotion, appearance, management, billHistory, realtime, annotations, positionLots, protectionIncidents, protectionReview, tradingView, connectionCheck, connectionRoundTrip, browserErrors };
   await writeFile(path.join(outputDirectory, "ui-verification.json"), JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
 } finally {
