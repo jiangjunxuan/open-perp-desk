@@ -4,9 +4,14 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   api:
     runs-on: ubuntu-latest
+    # Shared runners can need about 25 minutes for the full suite, before cleanup.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -18,37 +23,297 @@ jobs:
 
   compose:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - run: docker compose config
-      - run: docker compose build
-      - name: compose runtime smoke
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: isolated Compose configuration
+        run: |
+          python - <<'PY'
+          import os, secrets
+          from pathlib import Path
+          path = Path(".env")
+          path.write_text("\n".join([
+              "APP_ENV=test",
+              "COMPOSE_PROJECT_NAME=openperpdesk-ci",
+              "ADMIN_API_TOKEN=ci-" + secrets.token_hex(24),
+              "STATE_DB_PATH=/data/ci/nested/control.sqlite3",
+              "EXECUTION_ENABLED=false",
+              "LIVE_TRADING_ENABLED=false",
+              "AUTO_TRADING_ENABLED=false",
+              "AUTO_TRADING_DRY_RUN=true",
+              "TRADINGVIEW_ENABLED=true",
+              "TRADINGVIEW_WEBHOOK_SECRET=" + secrets.token_hex(32),
+              "TRADINGVIEW_EXECUTION_ENABLED=false",
+              "TRADINGVIEW_DRY_RUN=true",
+              "TRADINGVIEW_SYMBOLS=BTC-USDT-SWAP",
+              "TRADINGVIEW_DEFAULT_SIZE=3",
+              "TRADINGVIEW_SIGNAL_TTL_SECONDS=45",
+              "TRADINGVIEW_MAX_AGE_SECONDS=60",
+              "TRADINGVIEW_ACCOUNT_EQUITY=2345",
+              "TRADINGVIEW_DAILY_PNL_PCT=-0.5",
+              "TRADINGVIEW_CURRENT_NOTIONAL=1.5",
+          ]) + "\n")
+          os.chmod(path, 0o600)
+          PY
+          docker compose config --quiet
+          ./infra/openperpdesk.sh preflight
+          if TRADINGVIEW_SYMBOLS= ./infra/openperpdesk.sh preflight; then
+            echo "An explicitly empty TradingView allowlist must fail preflight."
+            exit 1
+          fi
+          if TRADINGVIEW_DRY_RUN=tru ./infra/openperpdesk.sh preflight; then
+            echo "A malformed TradingView Dry Run flag must fail preflight."
+            exit 1
+          fi
+      - name: container build, persistence and recovery drill
         run: |
           set -eu
           trap 'docker compose logs --no-color; docker compose down -v' EXIT
-          docker compose up -d
-          for attempt in $(seq 1 30); do
-            if curl --fail --silent http://127.0.0.1:8080/api/v1/health >/dev/null; then
-              break
-            fi
-            if [ "$attempt" = "30" ]; then
-              exit 1
-            fi
-            sleep 2
-          done
+          ./infra/openperpdesk.sh up
           curl --fail --silent http://127.0.0.1:8080/ >/dev/null
-          curl --fail --silent http://127.0.0.1:8080/api/v1/system/status >/dev/null
+          curl --fail --silent http://127.0.0.1:8080/assets/icons/chart-candlestick.svg | grep '<svg' >/dev/null
+          curl --fail --silent http://127.0.0.1:8080/research.js | grep 'initializeResearch' >/dev/null
+          curl --fail --silent http://127.0.0.1:8080/theme.js | grep 'openperpdesk.theme' >/dev/null
+          curl --fail --silent http://127.0.0.1:8080/account-history.js | grep 'initializeBillHistory' >/dev/null
+          curl --fail --silent http://127.0.0.1:8080/connection-check.js | grep 'initializeConnectionCheck' >/dev/null
+          curl --fail --silent http://127.0.0.1:8080/live.js | grep 'openLiveStream' >/dev/null
+          curl --fail --silent http://127.0.0.1:8080/assets/reports/marked.js | grep 'Marked' >/dev/null
+          curl --fail --silent http://127.0.0.1:8080/assets/reports/purify.min.js | grep 'DOMPurify' >/dev/null
+          docker compose exec -T api python - <<'PY'
+          import json, os, time, urllib.request
+          from datetime import datetime, timezone
+          from app import tradingview
+          for asset in ("/", "/app.js?cache=validate-v1", "/styles.css?cache=validate-v1"):
+              with urllib.request.urlopen("http://web" + asset, timeout=3) as response:
+                  assert response.status == 200
+                  assert "no-cache" in response.headers.get("Cache-Control", "")
+                  assert response.headers.get("ETag")
+          expected = {
+              "TRADINGVIEW_ENABLED": "true", "TRADINGVIEW_EXECUTION_ENABLED": "false",
+              "TRADINGVIEW_DRY_RUN": "true", "TRADINGVIEW_SYMBOLS": "BTC-USDT-SWAP",
+              "TRADINGVIEW_DEFAULT_SIZE": "3", "TRADINGVIEW_SIGNAL_TTL_SECONDS": "45",
+              "TRADINGVIEW_MAX_AGE_SECONDS": "60", "TRADINGVIEW_ACCOUNT_EQUITY": "2345",
+              "TRADINGVIEW_DAILY_PNL_PCT": "-0.5", "TRADINGVIEW_CURRENT_NOTIONAL": "1.5",
+          }
+          assert all(os.environ.get(name) == value for name, value in expected.items())
+          assert len(os.environ.get("TRADINGVIEW_WEBHOOK_SECRET", "")) == 64
+          assert tradingview.status()["configured"] and tradingview.status()["dry_run"]
+          assert tradingview.numeric_context() == {
+              "account_equity": 2345, "daily_pnl_pct": -0.5, "current_notional": 1.5,
+          }
+          payload = {
+              "secret": os.environ["TRADINGVIEW_WEBHOOK_SECRET"], "alert_id": "ci-compose-hold",
+              "symbol": "BTC-USDT-SWAP", "action": "hold", "dry_run": True,
+              "timestamp": datetime.now(timezone.utc).isoformat(),
+          }
+          body = json.dumps(payload).encode()
+          signal, size, _, _ = tradingview.to_signal(tradingview.parse_body(body), body=body)
+          assert size == 3 and 44 <= (signal.expires_at - signal.created_at).total_seconds() <= 45
+          url = "http://web/api/v1/integrations/tradingview"
+          def send():
+              request = urllib.request.Request(url + "/webhook", data=body, headers={"Content-Type": "application/json"})
+              with urllib.request.urlopen(request, timeout=3) as response:
+                  assert response.status == 202
+                  return json.load(response)
+          receipt = send()
+          assert receipt["accepted"] and receipt["dry_run"] and not receipt["idempotent"]
+          request = urllib.request.Request(url + "/alerts", headers={"X-Admin-Token": os.environ["ADMIN_API_TOKEN"]})
+          deadline = time.monotonic() + 10
+          while True:
+              with urllib.request.urlopen(request, timeout=3) as response:
+                  rows = json.load(response)["data"]
+              assert len(rows) == 1
+              if rows[0]["status"] == "observed":
+                  break
+              assert time.monotonic() < deadline, "TradingView hold was not processed"
+              time.sleep(0.1)
+          assert rows[0]["client_order_id"] is None
+          assert os.environ["TRADINGVIEW_WEBHOOK_SECRET"] not in json.dumps(rows)
+          assert send()["idempotent"]
+          print("Compose TradingView environment and Nginx hold receipt passed; no trading performed.")
+          PY
+          python infra/realtime-smoke.py --base-url http://127.0.0.1:8080
+          ./infra/openperpdesk.sh smoke http://127.0.0.1:8080
+          docker compose exec -T api python -c \
+            'from app.state_store import StateStore; StateStore().set_control_flag("ci_roundtrip", True)'
+          ./infra/openperpdesk.sh backup
+          docker compose exec -T api python -c \
+            'from app.state_store import StateStore; StateStore().set_control_flag("ci_roundtrip", False)'
+          set -- backups/*.sqlite3
+          ./infra/openperpdesk.sh restore "$1"
+          docker compose exec -T api python -c \
+            'from app.state_store import StateStore; s=StateStore(); assert s.get_control_flag("ci_roundtrip"); assert s.get_control_flag("emergency_stop")'
+          for mode in source prebuilt; do
+            api_before=$(docker compose ps -q api)
+            web_before=$(docker compose ps -q web)
+            test -n "$api_before"
+            test -n "$web_before"
+            if [ "$mode" = prebuilt ]; then
+              OPENPERPDESK_COMPOSE_OVERLAY=docker-compose.release.yml \
+              OPENPERPDESK_API_IMAGE=openperpdesk-api:latest \
+              OPENPERPDESK_WEB_IMAGE=openperpdesk-web:latest \
+              ./infra/openperpdesk.sh restart
+            else
+              ./infra/openperpdesk.sh restart
+            fi
+            api_after=$(docker compose ps -q api)
+            web_after=$(docker compose ps -q web)
+            test -n "$api_after"
+            test -n "$web_after"
+            test "$api_before" != "$api_after"
+            test "$web_before" != "$web_after"
+            docker compose exec -T api python -m app.database_maintenance verify-runtime
+            docker compose exec -T api python -c \
+              'from app.state_store import StateStore; assert StateStore().get_control_flag("ci_roundtrip")'
+            python infra/realtime-smoke.py --base-url http://127.0.0.1:8080
+          done
+          python - <<'PY'
+          import json, subprocess, time
+          compose = ["docker", "compose"]
+          def inspect(container):
+              return json.loads(subprocess.check_output(["docker", "inspect", container]))[0]
+          container = subprocess.check_output([*compose, "ps", "-q", "api"], text=True).strip()
+          assert container
+          before = inspect(container)
+          assert before["Config"]["Labels"]["com.docker.compose.project"] == "openperpdesk-ci"
+          assert before["HostConfig"]["Init"] is True
+          assert before["HostConfig"]["RestartPolicy"]["Name"] == "unless-stopped"
+          program = """
+          import os, signal
+          from pathlib import Path
+          assert os.environ['EXECUTION_ENABLED'] == 'false'
+          assert os.environ['LIVE_TRADING_ENABLED'] == 'false'
+          assert os.environ['AUTO_TRADING_ENABLED'] == 'false'
+          assert not any(os.environ.get(key) for key in ('OKX_API_KEY','OKX_SECRET_KEY','OKX_PASSPHRASE'))
+          assert Path('/proc/1/comm').read_text().strip() == 'docker-init'
+          candidates = []
+          for entry in Path('/proc').iterdir():
+              if not entry.name.isdigit():
+                  continue
+              try:
+                  args = (entry / 'cmdline').read_bytes().split(bytes([0]))
+                  if b'app.main:app' in args and any(value.endswith(b'/uvicorn') for value in args[:2]):
+                      candidates.append(int(entry.name))
+              except FileNotFoundError:
+                  continue
+          assert len(candidates) == 1 and candidates[0] not in (1, os.getpid())
+          status = Path(f'/proc/{candidates[0]}/status').read_text().splitlines()
+          assert next(line for line in status if line.startswith('PPid:')).split()[1] == '1'
+          os.kill(candidates[0], signal.SIGKILL)
+          """
+          # Kill the app child, not Docker itself or an explicitly stopped container.
+          subprocess.run(["docker", "exec", "--user", "0", "-i", container, "python", "-"],
+                         input=program, text=True, timeout=15, check=False)
+          deadline = time.monotonic() + 90
+          while True:
+              after = inspect(container)
+              if (after["RestartCount"] == before["RestartCount"] + 1
+                      and after["State"]["Running"]
+                      and after["State"].get("Health", {}).get("Status") == "healthy"):
+                  break
+              assert time.monotonic() < deadline, "API did not automatically recover from SIGKILL"
+              time.sleep(1)
+          assert after["State"]["Pid"] != before["State"]["Pid"]
+          assert after["State"]["StartedAt"] != before["State"]["StartedAt"]
+          assert after["Image"] == before["Image"] and after["Mounts"] == before["Mounts"]
+          assert subprocess.check_output([*compose, "ps", "-q", "api"], text=True).strip() == container
+          print("API recovered automatically from SIGKILL; same container/image/volume, new process.")
+          PY
+          docker compose exec -T api python -m app.database_maintenance verify-runtime
+          docker compose exec -T api python -c \
+            'from app.state_store import StateStore; assert StateStore().get_control_flag("ci_roundtrip")'
+          python infra/realtime-smoke.py --base-url http://127.0.0.1:8080
 
-  web:
+  tradingagents-image:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: build the pinned optional research runtime
+        run: docker build --file services/api/Dockerfile.tradingagents --tag openperpdesk-ai:ci .
+      - name: offline non-root research process self-check
+        run: |
+          docker run --rm --init --network none \
+            -e DATA_DIR=/data \
+            -e TRADINGAGENTS_ENABLED=true \
+            -e TRADINGAGENTS_PATH=/opt/tradingagents \
+            -e TRADINGAGENTS_TIMEOUT_SECONDS=60 \
+            -e TRADINGAGENTS_LLM_PROVIDER=openai_compatible \
+            -e TRADINGAGENTS_LLM_BACKEND_URL=http://127.0.0.1:9/v1 \
+            -e TRADINGAGENTS_DEEP_THINK_LLM=protocol-fixture \
+            -e TRADINGAGENTS_QUICK_THINK_LLM=protocol-fixture \
+            -e OPENAI_COMPATIBLE_API_KEY=ci-not-a-real-key \
+            -e EXECUTION_ENABLED=false \
+            -e LIVE_TRADING_ENABLED=false \
+            -e AUTO_TRADING_ENABLED=false \
+            openperpdesk-ai:ci python -c \
+            'import asyncio, json, os; from app.ai_analysis import TradingAgentsAdapter; assert os.geteuid() != 0; result = asyncio.run(TradingAgentsAdapter().check_ready()); assert result["runtime_state"] == "ready"; assert result["provider_connection_verified"] is False; assert result["execution_authorized"] is False; print(json.dumps(result))'
+
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Chinese browser font support
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y fonts-noto-cjk
+          test -n "$(fc-list :lang=zh family)"
+      - run: python -m pip install -r services/api/requirements.txt
+      - name: browser flows against isolated loopback protocol fixtures
+        env:
+          CHROME_BIN: google-chrome
+        run: python infra/ui-acceptance.py
+      - name: browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-acceptance
+          path: work/ci-ui-artifacts/
+          retention-days: 7
+
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - run: node --check apps/web/app.js
+      - run: node --check apps/web/research.js
+      - run: node --check apps/web/theme.js
+      - run: node --check apps/web/account-history.js
+      - run: node --check apps/web/protection-review.js
+      - run: node --check apps/web/connection-check.js
+      - run: node --check apps/web/live.js
+      - run: node --test infra/appearance.test.mjs infra/live.test.mjs
       - run: bash -n infra/openperpdesk.sh
+      - run: python -m py_compile infra/deploy.py infra/okx-private-smoke.py infra/proxy-smoke.py infra/ai-live-smoke.py
       - run: ./infra/openperpdesk.sh --help
+      - name: preflight safety smoke
+        run: |
+          set -eu
+          env_file="$(mktemp)"
+          cp .env.example "$env_file"
+          chmod 600 "$env_file"
+          awk -F= '$1 == "ADMIN_API_TOKEN" { print "ADMIN_API_TOKEN=ci-preflight-token-123456"; next } { print }' \
+            "$env_file" > "$env_file.next"
+          mv "$env_file.next" "$env_file"
+          chmod 600 "$env_file"
+          OPENPERPDESK_ENV_FILE="$env_file" ./infra/openperpdesk.sh preflight
       - run: |
           node <<'NODE'
           const fs = require("fs");

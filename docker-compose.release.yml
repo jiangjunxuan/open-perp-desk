@@ -1,0 +1,15 @@
+# Optional release overlay for images built and smoke-tested outside Compose.
+#
+# Set OPENPERPDESK_COMPOSE_OVERLAY=docker-compose.release.yml in the protected
+# deployment .env. The deployment wrapper then uses these exact images for
+# status, restart, backup and recovery instead of falling back to build rules.
+services:
+  web:
+    image: ${OPENPERPDESK_WEB_IMAGE:?OPENPERPDESK_WEB_IMAGE is required}
+    build: null
+
+  api:
+    image: ${OPENPERPDESK_API_IMAGE:?OPENPERPDESK_API_IMAGE is required}
+    build: null
+    environment:
+      OPENPERPDESK_USE_PREBUILT_IMAGES: "true"

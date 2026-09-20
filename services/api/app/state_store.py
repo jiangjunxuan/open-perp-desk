@@ -1,16 +1,66 @@
 import json
+import math
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from uuid import uuid4
 
+from .database_maintenance import recovery_marker
+from .equity_baseline import BASELINE_POLICY, CAPTURE_WINDOW_MS, baseline_window, total_equity
+from .equity_performance import observation_bounds, summarize_performance
+from .historical_ledger import DAY_MS, combine_history_windows, day_ms
+from .historical_valuation import MINUTE_MS, required_rates, value_history
 from .strategy_engine import DEFAULT_STRATEGY_CONFIG
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+ACTIVE_ORDER_STATUSES = (
+    "preparing", "submitting", "submitted", "pending", "accepted", "live",
+    "partially_filled", "submission_unknown", "unknown", "cancel_failed", "canceling",
+)
+TERMINAL_ORDER_STATUSES = {
+    "filled", "canceled", "cancelled", "failed", "rejected",
+    "effective", "triggered", "order_failed", "expired", "mmp_canceled",
+}
+LOT_RECONSTRUCTION_VERSION = 2
+
+
+class ExposureSnapshotChanged(RuntimeError):
+    """A different submission reserved risk budget after the snapshot was read."""
+
+
+class OrderSnapshotConflict(ValueError):
+    """Exchange evidence does not match the durable order identity."""
+
+
+class BillImportBusy(RuntimeError):
+    """The account already has an import with a current lease."""
+
+
+class BillImportLeaseLost(RuntimeError):
+    """A stopped or superseded importer cannot publish more data."""
+
+
+class ValuationLeaseLost(RuntimeError):
+    """A stale worker cannot publish valuation progress."""
+
+
+class PerformanceLeaseLost(RuntimeError):
+    """Canceled or superseded account-performance work cannot publish."""
+
+class TradingViewAlertConflict(ValueError):
+    """An alert identifier was reused for a different instruction."""
+
+
+class TradingViewQueueFull(ValueError):
+    """The bounded durable inbox cannot accept another alert."""
 
 
 class StateStore:
@@ -22,6 +72,8 @@ class StateStore:
     """
 
     def __init__(self, path: str | None = None) -> None:
+        self.revision = 0
+        self._revision_lock = threading.Lock()
         configured = path or os.getenv("STATE_DB_PATH", "")
         if configured:
             self.path = Path(configured)
@@ -32,12 +84,17 @@ class StateStore:
         self._initialize()
 
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path, timeout=10)
+    def _connection(self, *, timeout: float = 10) -> Iterator[sqlite3.Connection]:
+        if recovery_marker(self.path).exists():
+            raise RuntimeError("State database recovery is incomplete; API access is locked.")
+        connection = sqlite3.connect(self.path, timeout=timeout)
         connection.row_factory = sqlite3.Row
         try:
             yield connection
             connection.commit()
+            if connection.total_changes:
+                with self._revision_lock:
+                    self.revision += 1
         finally:
             connection.close()
 
@@ -83,10 +140,146 @@ class StateStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_fills_filled_at
                     ON fills(filled_at DESC);
+                CREATE TABLE IF NOT EXISTS account_bills (
+                    account_scope TEXT NOT NULL,
+                    bill_id TEXT NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    currency TEXT NOT NULL,
+                    inst_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY (account_scope, bill_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_account_bills_time
+                    ON account_bills(account_scope, timestamp_ms DESC);
+                CREATE TABLE IF NOT EXISTS account_bill_snapshots (
+                    account_scope TEXT PRIMARY KEY,
+                    captured_at TEXT NOT NULL,
+                    summary_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS account_bill_history (
+                    account_scope TEXT NOT NULL,
+                    bill_id TEXT NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY (account_scope, bill_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_bill_history_cursor
+                    ON account_bill_history(account_scope, timestamp_ms DESC, bill_id DESC);
+                CREATE TABLE IF NOT EXISTS account_bill_history_windows (
+                    account_scope TEXT NOT NULL,
+                    day_utc TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    summary_json TEXT NOT NULL,
+                    PRIMARY KEY (account_scope, day_utc)
+                );
+                CREATE TABLE IF NOT EXISTS account_bill_imports (
+                    id TEXT PRIMARY KEY,
+                    account_scope TEXT NOT NULL,
+                    start_day TEXT NOT NULL,
+                    end_day TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    total_days INTEGER NOT NULL,
+                    completed_days INTEGER NOT NULL DEFAULT 0,
+                    rows_imported INTEGER NOT NULL DEFAULT 0,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    lease_until_ms INTEGER NOT NULL,
+                    error TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_bill_import
+                    ON account_bill_imports(account_scope) WHERE status = 'running';
+                CREATE TABLE IF NOT EXISTS account_bill_archives (
+                    id TEXT PRIMARY KEY,
+                    account_scope TEXT NOT NULL,
+                    year INTEGER NOT NULL,
+                    quarter TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    requested_at_ms INTEGER,
+                    next_attempt_ms INTEGER NOT NULL,
+                    lease_owner TEXT,
+                    lease_until_ms INTEGER NOT NULL DEFAULT 0,
+                    import_job_id TEXT,
+                    failures INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    error TEXT,
+                    UNIQUE(account_scope, year, quarter)
+                );
+                CREATE TABLE IF NOT EXISTS historical_fx_rates (
+                    market_scope TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    candle_ms INTEGER NOT NULL,
+                    rate TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    PRIMARY KEY (market_scope, currency, candle_ms)
+                );
+                CREATE TABLE IF NOT EXISTS account_equity_snapshots (
+                    account_scope TEXT NOT NULL,
+                    captured_at_ms INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    equity_usd TEXT NOT NULL,
+                    balance_json TEXT NOT NULL,
+                    PRIMARY KEY (account_scope, captured_at_ms, source)
+                );
+                CREATE INDEX IF NOT EXISTS idx_equity_snapshots_time
+                    ON account_equity_snapshots(account_scope, captured_at_ms);
+                CREATE TABLE IF NOT EXISTS account_equity_baselines (
+                    account_scope TEXT NOT NULL,
+                    target_ms INTEGER NOT NULL,
+                    request_started_ms INTEGER NOT NULL,
+                    received_at_ms INTEGER NOT NULL,
+                    equity_usd TEXT NOT NULL,
+                    balance_json TEXT NOT NULL,
+                    PRIMARY KEY (account_scope, target_ms)
+                );
+                CREATE TABLE IF NOT EXISTS account_bill_valuations (
+                    id TEXT PRIMARY KEY,
+                    account_scope TEXT NOT NULL,
+                    market_scope TEXT NOT NULL,
+                    start_day TEXT NOT NULL,
+                    end_day TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    total_days INTEGER NOT NULL,
+                    completed_days INTEGER NOT NULL DEFAULT 0,
+                    rates_loaded INTEGER NOT NULL DEFAULT 0,
+                    rates_missing INTEGER NOT NULL DEFAULT 0,
+                    lease_owner TEXT,
+                    lease_until_ms INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_bill_valuation
+                    ON account_bill_valuations(account_scope) WHERE state IN ('queued', 'running');
+                CREATE TABLE IF NOT EXISTS account_performance_intervals (
+                    id TEXT PRIMARY KEY,
+                    account_scope TEXT NOT NULL,
+                    market_scope TEXT NOT NULL,
+                    target_ms INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_ms INTEGER NOT NULL,
+                    lease_owner TEXT,
+                    lease_until_ms INTEGER NOT NULL DEFAULT 0,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    error TEXT,
+                    report_json TEXT,
+                    evidence_json TEXT,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(account_scope, market_scope, target_ms)
+                );
+                CREATE INDEX IF NOT EXISTS idx_performance_pending
+                    ON account_performance_intervals(account_scope, market_scope, state, next_attempt_ms);
                 CREATE TABLE IF NOT EXISTS positions (
                     position_key TEXT PRIMARY KEY,
                     inst_id TEXT NOT NULL,
                     pos_side TEXT NOT NULL,
+                    td_mode TEXT NOT NULL DEFAULT '',
+                    account_scope TEXT,
+                    exchange_trade_id TEXT,
+                    protection_order_id TEXT,
                     size REAL NOT NULL,
                     entry_price REAL NOT NULL,
                     mark_price REAL,
@@ -95,6 +288,7 @@ class StateStore:
                     take_profit REAL,
                     unrealized_pnl REAL NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'open',
+                    lifecycle_generation INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
@@ -105,6 +299,107 @@ class StateStore:
                     payload_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS tradingview_alerts (
+                    alert_id TEXT PRIMARY KEY,
+                    fingerprint TEXT NOT NULL,
+                    inst_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    dry_run INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    instruction_json TEXT NOT NULL,
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    owner TEXT,
+                    deadline_ms INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_tradingview_queue
+                    ON tradingview_alerts(status, created_at);
+                CREATE TABLE IF NOT EXISTS chart_annotations (
+                    account_scope TEXT NOT NULL,
+                    annotation_id TEXT NOT NULL,
+                    inst_id TEXT NOT NULL,
+                    bar TEXT NOT NULL,
+                    annotation_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (account_scope, annotation_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_chart_annotations_scope
+                    ON chart_annotations(account_scope, inst_id, bar, updated_at);
+                CREATE TABLE IF NOT EXISTS position_lot_snapshots (
+                    account_scope TEXT NOT NULL,
+                    position_key TEXT NOT NULL,
+                    position_trade_id TEXT NOT NULL,
+                    position_size REAL NOT NULL,
+                    lifecycle_generation INTEGER NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (account_scope, position_key)
+                );
+                CREATE TABLE IF NOT EXISTS protection_handoffs (
+                    handoff_id TEXT PRIMARY KEY,
+                    account_scope TEXT NOT NULL,
+                    inst_id TEXT NOT NULL,
+                    position_key TEXT NOT NULL,
+                    lot_id TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    native_evidence_json TEXT,
+                    native_settlement_json TEXT,
+                    reason TEXT NOT NULL,
+                    trigger_price REAL,
+                    status TEXT NOT NULL DEFAULT 'cancel_pending',
+                    version INTEGER NOT NULL DEFAULT 0,
+                    cancel_attempts INTEGER NOT NULL DEFAULT 0,
+                    cancel_after_ms INTEGER NOT NULL DEFAULT 0,
+                    close_sequence INTEGER NOT NULL DEFAULT 0,
+                    close_order_id TEXT,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(account_scope, lot_id)
+                );
+                CREATE TABLE IF NOT EXISTS protection_adjustments (
+                    adjustment_id TEXT PRIMARY KEY,
+                    account_scope TEXT NOT NULL,
+                    inst_id TEXT NOT NULL,
+                    position_key TEXT NOT NULL,
+                    opening_order_id TEXT NOT NULL,
+                    lot_id TEXT,
+                    evidence_json TEXT NOT NULL,
+                    target_size TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'prepared',
+                    version INTEGER NOT NULL DEFAULT 0,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    retry_after_ms INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS one_active_protection_adjustment
+                    ON protection_adjustments(account_scope, inst_id)
+                    WHERE status NOT IN ('complete', 'rejected', 'superseded');
+                CREATE TABLE IF NOT EXISTS protection_incidents (
+                    incident_id TEXT PRIMARY KEY,
+                    account_scope TEXT NOT NULL,
+                    inst_id TEXT NOT NULL,
+                    position_key TEXT,
+                    opening_order_id TEXT NOT NULL,
+                    exchange_order_id TEXT,
+                    expected_protection_json TEXT NOT NULL DEFAULT '{}',
+                    failure_code TEXT NOT NULL,
+                    failure_detail TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'open',
+                    resolution TEXT,
+                    resolution_note TEXT,
+                    version INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    resolved_at TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS one_active_protection_incident
+                    ON protection_incidents(account_scope, opening_order_id)
+                    WHERE status IN ('open', 'review');
                 CREATE TABLE IF NOT EXISTS analyses (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     inst_id TEXT NOT NULL,
@@ -127,6 +422,12 @@ class StateStore:
                     reason TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS execution_generation (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    generation INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT OR IGNORE INTO execution_generation (singleton, generation)
+                    VALUES (1, 0);
                 """
             )
             position_columns = {
@@ -137,6 +438,52 @@ class StateStore:
                 connection.execute(
                     "ALTER TABLE positions ADD COLUMN notional REAL NOT NULL DEFAULT 0"
                 )
+            if "lifecycle_generation" not in position_columns:
+                connection.execute(
+                    "ALTER TABLE positions ADD COLUMN lifecycle_generation INTEGER NOT NULL DEFAULT 0"
+                )
+            for column, declaration in (
+                ("td_mode", "TEXT NOT NULL DEFAULT ''"), ("account_scope", "TEXT"),
+                ("exchange_trade_id", "TEXT"), ("protection_order_id", "TEXT"),
+            ):
+                if column not in position_columns:
+                    connection.execute(f"ALTER TABLE positions ADD COLUMN {column} {declaration}")
+            order_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(orders)")
+            }
+            handoff_columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(protection_handoffs)")}
+            if "trigger_price" not in handoff_columns:
+                connection.execute("ALTER TABLE protection_handoffs ADD COLUMN trigger_price REAL")
+            if "native_evidence_json" not in handoff_columns:
+                connection.execute("ALTER TABLE protection_handoffs ADD COLUMN native_evidence_json TEXT")
+            if "native_settlement_json" not in handoff_columns:
+                connection.execute("ALTER TABLE protection_handoffs ADD COLUMN native_settlement_json TEXT")
+            if "risk_notional" not in order_columns:
+                connection.execute("ALTER TABLE orders ADD COLUMN risk_notional REAL")
+            if "account_scope" not in order_columns:
+                connection.execute("ALTER TABLE orders ADD COLUMN account_scope TEXT")
+            if "protection_context_json" not in order_columns:
+                connection.execute("ALTER TABLE orders ADD COLUMN protection_context_json TEXT NOT NULL DEFAULT '{}'")
+            if "order_kind" not in order_columns:
+                connection.execute("ALTER TABLE orders ADD COLUMN order_kind TEXT NOT NULL DEFAULT 'standard'")
+                connection.execute("UPDATE orders SET order_kind = 'algo' WHERE source LIKE 'okx-algo%'")
+            if "exchange_updated_ms" not in order_columns:
+                connection.execute("ALTER TABLE orders ADD COLUMN exchange_updated_ms INTEGER")
+                for row in connection.execute("SELECT client_order_id, raw_json FROM orders").fetchall():
+                    try:
+                        timestamp = int(json.loads(row["raw_json"]).get("uTime", 0))
+                    except (ValueError, TypeError, AttributeError):
+                        continue
+                    if timestamp > 0:
+                        connection.execute(
+                            "UPDATE orders SET exchange_updated_ms = ? WHERE client_order_id = ?",
+                            (timestamp, row["client_order_id"]),
+                        )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_orders_protection_match "
+                "ON orders(account_scope, inst_id, pos_side, td_mode, order_kind, status)"
+            )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO strategies
@@ -164,23 +511,37 @@ class StateStore:
             ).fetchone()
         return self._row(row)
 
-    def save_order(self, order: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _write_order(
+        connection: sqlite3.Connection,
+        order: dict[str, Any],
+        *,
+        replace: bool,
+    ) -> sqlite3.Cursor:
         now = order.get("updated_at") or _utc_now()
         created_at = order.get("created_at") or now
-        with self._connection() as connection:
-            connection.execute(
+        on_conflict = (
+            """
+            DO UPDATE SET
+                exchange_order_id = excluded.exchange_order_id,
+                status = excluded.status,
+                raw_json = excluded.raw_json,
+                updated_at = excluded.updated_at,
+                exchange_updated_ms = COALESCE(excluded.exchange_updated_ms, orders.exchange_updated_ms),
+                account_scope = COALESCE(orders.account_scope, excluded.account_scope),
+                order_kind = excluded.order_kind
+            """ if replace else "DO NOTHING"
+        )
+        return connection.execute(
                 """
                 INSERT INTO orders (
                     client_order_id, exchange_order_id, status, inst_id, side,
                     pos_side, ord_type, td_mode, size, price, reduce_only,
-                    stop_loss, take_profit, source, raw_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(client_order_id) DO UPDATE SET
-                    exchange_order_id = excluded.exchange_order_id,
-                    status = excluded.status,
-                    raw_json = excluded.raw_json,
-                    updated_at = excluded.updated_at
-                """,
+                    stop_loss, take_profit, source, raw_json, created_at, updated_at,
+                    risk_notional, exchange_updated_ms, account_scope, order_kind, protection_context_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(client_order_id)
+                """ + on_conflict,
                 (
                     order["client_order_id"],
                     order.get("exchange_order_id"),
@@ -199,9 +560,567 @@ class StateStore:
                     json.dumps(order.get("raw", {}), ensure_ascii=True),
                     created_at,
                     now,
+                    order.get("risk_notional"),
+                    order.get("exchange_updated_ms"),
+                    order.get("account_scope"),
+                    order.get("order_kind", "standard"),
+                    json.dumps(order.get("protection_context") or {}, ensure_ascii=True, allow_nan=False),
                 ),
             )
+
+    def save_order(self, order: dict[str, Any]) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            previous = connection.execute(
+                "SELECT * FROM orders WHERE client_order_id = ?", (order["client_order_id"],),
+            ).fetchone()
+            if previous and previous["status"] in TERMINAL_ORDER_STATUSES and previous["status"] != order["status"]:
+                return dict(previous)
+            self._write_order(connection, order, replace=True)
         return self.get_order(order["client_order_id"]) or order
+
+    def save_exchange_order(self, order: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        """Apply monotonic exchange snapshots atomically across REST and WS writers."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM orders WHERE client_order_id = ?", (order["client_order_id"],),
+            ).fetchone()
+            previous = dict(row) if row else None
+            if previous:
+                for field in ("inst_id", "exchange_order_id", "account_scope", "order_kind"):
+                    if previous.get(field) and order.get(field) and previous[field] != order[field]:
+                        raise OrderSnapshotConflict(f"order_{field}_mismatch")
+                old_status, new_status = previous["status"], order["status"]
+                old_time, new_time = previous["exchange_updated_ms"], order.get("exchange_updated_ms")
+                if old_time is not None and (new_time is None or new_time < old_time):
+                    return previous, False
+                if old_status in TERMINAL_ORDER_STATUSES and new_status != old_status:
+                    return previous, False
+                if old_status == "partially_filled" and new_status in {"unknown", "live", "pending", "submitted"}:
+                    return previous, False
+                if old_time == new_time and old_status == new_status and previous["raw_json"] == json.dumps(order.get("raw", {}), ensure_ascii=True):
+                    return previous, False
+            self._write_order(connection, order, replace=True)
+            if previous and previous["source"].startswith("okx-"):
+                connection.execute(
+                    """UPDATE orders SET side = ?, pos_side = ?, ord_type = ?, td_mode = ?,
+                       size = ?, price = ?, reduce_only = ?, stop_loss = ?, take_profit = ?
+                       WHERE client_order_id = ?""",
+                    (order["side"], order["pos_side"], order["ord_type"], order["td_mode"],
+                     order["size"], order.get("price"), int(bool(order.get("reduce_only"))),
+                     order.get("stop_loss"), order.get("take_profit"), order["client_order_id"]),
+                )
+            connection.execute("UPDATE execution_generation SET generation = generation + 1 WHERE singleton = 1")
+            result = connection.execute(
+                "SELECT * FROM orders WHERE client_order_id = ?", (order["client_order_id"],),
+            ).fetchone()
+            return dict(result), True
+
+    def execution_snapshot(self) -> tuple[int, list[dict[str, Any]]]:
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            generation = connection.execute(
+                "SELECT generation FROM execution_generation WHERE singleton = 1",
+            ).fetchone()[0]
+            placeholders = ",".join("?" for _ in ACTIVE_ORDER_STATUSES)
+            rows = connection.execute(
+                f"SELECT * FROM orders WHERE status IN ({placeholders})",
+                ACTIVE_ORDER_STATUSES,
+            ).fetchall()
+        return int(generation), [dict(row) for row in rows]
+
+    def claim_order(
+        self,
+        order: dict[str, Any],
+        *,
+        expected_generation: int | None = None,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Commit an intent before network I/O; one claimant wins across processes."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM orders WHERE client_order_id = ?",
+                (order["client_order_id"],),
+            ).fetchone()
+            if existing:
+                return False, dict(existing)
+            if expected_generation is not None:
+                current = connection.execute(
+                    "SELECT generation FROM execution_generation WHERE singleton = 1",
+                ).fetchone()[0]
+                if current != expected_generation:
+                    raise ExposureSnapshotChanged("execution_budget_snapshot_changed")
+            context = order.get("protection_context") or {}
+            if order["status"] != "preview":
+                if not order.get("reduce_only"):
+                    adjustment = connection.execute(
+                        """SELECT 1 FROM protection_adjustments WHERE account_scope = ? AND inst_id = ?
+                           AND status NOT IN ('complete', 'rejected', 'superseded') LIMIT 1""",
+                        (order.get("account_scope"), order["inst_id"]),
+                    ).fetchone()
+                    if adjustment:
+                        raise ExposureSnapshotChanged("protection_adjustment_pending")
+                    incident = connection.execute(
+                        """SELECT 1 FROM protection_incidents
+                           WHERE account_scope = ? AND inst_id = ?
+                             AND status IN ('open', 'review') LIMIT 1""",
+                        (order.get("account_scope"), order["inst_id"]),
+                    ).fetchone()
+                    if incident:
+                        raise ExposureSnapshotChanged("protection_incident_review_required")
+                    pending = connection.execute(
+                        """SELECT 1 FROM protection_handoffs WHERE account_scope = ? AND inst_id = ?
+                           AND status != 'complete' LIMIT 1""",
+                        (order.get("account_scope"), order["inst_id"]),
+                    ).fetchone()
+                    if pending:
+                        raise ExposureSnapshotChanged("protection_handoff_pending")
+                if context.get("kind") == "handoff":
+                    handoff = connection.execute(
+                        "SELECT * FROM protection_handoffs WHERE handoff_id = ?", (context.get("handoff_id"),),
+                    ).fetchone()
+                    if (
+                        not handoff or handoff["status"] != "ready"
+                        or handoff["account_scope"] != order.get("account_scope")
+                        or handoff["inst_id"] != order["inst_id"] or handoff["lot_id"] != context.get("lot_id")
+                        or handoff["close_sequence"] + 1 != context.get("close_sequence")
+                        or not order.get("reduce_only") or not order.get("source", "").startswith("protective-")
+                    ):
+                        raise ExposureSnapshotChanged("protection_handoff_changed")
+                    position = connection.execute(
+                        "SELECT * FROM positions WHERE position_key = ?", (handoff["position_key"],),
+                    ).fetchone()
+                    snapshot = connection.execute(
+                        """SELECT * FROM position_lot_snapshots WHERE account_scope = ? AND position_key = ?""",
+                        (handoff["account_scope"], handoff["position_key"]),
+                    ).fetchone()
+                    if not position or not snapshot or position["status"] != "open" or any(
+                        snapshot[left] != position[right] for left, right in (
+                            ("position_trade_id", "exchange_trade_id"), ("position_size", "size"),
+                            ("lifecycle_generation", "lifecycle_generation"),
+                        )
+                    ) or position["account_scope"] != handoff["account_scope"]:
+                        raise ExposureSnapshotChanged("protection_handoff_position_changed")
+                    allocation = json.loads(snapshot["snapshot_json"])
+                    lot = next((row for row in allocation.get("lots", []) if row["lot_id"] == handoff["lot_id"]), None)
+                    evidence = json.loads(handoff["evidence_json"])
+                    close_evidence = json.loads(handoff["native_evidence_json"] or handoff["evidence_json"])
+                    expected_context = {
+                        **close_evidence, "kind": "handoff", "handoff_id": handoff["handoff_id"],
+                        "lot_id": handoff["lot_id"], "close_sequence": handoff["close_sequence"] + 1,
+                        **({"native_settlement": json.loads(handoff["native_settlement_json"])}
+                           if handoff["native_settlement_json"] else {}),
+                    }
+                    if (
+                        allocation.get("status") != "verified" or allocation.get("policy_version") != LOT_RECONSTRUCTION_VERSION
+                        or allocation.get("execution_generation") != expected_generation
+                        or not lot or float(lot["remaining_size"]) != order["size"]
+                        or context.get("opening_order_id") != evidence["opening_order_id"]
+                        or context.get("opening_exchange_id") != evidence["opening_exchange_id"]
+                        or context != expected_context
+                        or position["exchange_trade_id"] != order.get("raw", {}).get("expected_position_trade_id")
+                        or (position["pos_side"], position["td_mode"]) != (order["pos_side"], order["td_mode"])
+                    ):
+                        raise ExposureSnapshotChanged("protection_handoff_lot_changed")
+                    connection.execute(
+                        """UPDATE protection_handoffs SET status = 'closing', close_sequence = close_sequence + 1,
+                           close_order_id = ?, version = version + 1, updated_at = ? WHERE handoff_id = ?""",
+                        (order["client_order_id"], _utc_now(), handoff["handoff_id"]),
+                    )
+            inserted = self._write_order(connection, order, replace=False).rowcount == 1
+            if inserted and order["status"] != "preview":
+                connection.execute(
+                    "UPDATE execution_generation SET generation = generation + 1 WHERE singleton = 1",
+                )
+            row = connection.execute(
+                "SELECT * FROM orders WHERE client_order_id = ?",
+                (order["client_order_id"],),
+            ).fetchone()
+        return inserted, dict(row)
+
+    def protection_handoff(self, handoff_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM protection_handoffs WHERE handoff_id = ?", (handoff_id,),
+            ).fetchone()
+        return self._row(row)
+
+    def protection_handoffs(self, account_scope: str, inst_id: str | None = None) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM protection_handoffs WHERE account_scope = ? AND status != 'complete'
+                   AND (? IS NULL OR inst_id = ?) ORDER BY created_at, handoff_id""",
+                (account_scope, inst_id, inst_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_protection_handoff(
+        self, record: dict[str, Any], position: dict[str, Any], *, expected_generation: int,
+    ) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                """SELECT 1 FROM protection_adjustments WHERE account_scope = ? AND inst_id = ?
+                   AND status NOT IN ('complete', 'rejected', 'superseded') LIMIT 1""",
+                (position["account_scope"], position["inst_id"]),
+            ).fetchone():
+                raise ExposureSnapshotChanged("protection_adjustment_pending")
+            generation = connection.execute(
+                "SELECT generation FROM execution_generation WHERE singleton = 1",
+            ).fetchone()[0]
+            current = connection.execute(
+                "SELECT * FROM positions WHERE position_key = ?", (position["position_key"],),
+            ).fetchone()
+            if generation != expected_generation or not current or current["status"] != "open" or any(
+                current[field] != position[field] for field in (
+                    "account_scope", "exchange_trade_id", "size", "lifecycle_generation",
+                )
+            ):
+                raise ExposureSnapshotChanged("protection_handoff_position_changed")
+            now = _utc_now()
+            connection.execute(
+                """INSERT OR IGNORE INTO protection_handoffs
+                   (handoff_id, account_scope, inst_id, position_key, lot_id, evidence_json,
+                    reason, trigger_price, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (record["handoff_id"], position["account_scope"], position["inst_id"], position["position_key"],
+                 record["lot_id"], json.dumps(record["evidence"], sort_keys=True, allow_nan=False),
+                 record["reason"], record["trigger_price"],
+                 "opening_cancel_pending" if record["evidence"]["kind"] == "attached" else "cancel_pending", now, now),
+            )
+            saved = connection.execute(
+                "SELECT * FROM protection_handoffs WHERE account_scope = ? AND lot_id = ?",
+                (position["account_scope"], record["lot_id"]),
+            ).fetchone()
+        return dict(saved)
+
+    def managed_opening_orders(self, account_scope: str, inst_id: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM orders WHERE account_scope = ? AND inst_id = ? AND order_kind = 'standard'
+                   AND reduce_only = 0 AND source NOT LIKE 'okx-%' AND source NOT LIKE 'protective-%'
+                   AND status IN ('filled', 'canceled', 'mmp_canceled') ORDER BY created_at, client_order_id""",
+                (account_scope, inst_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def protection_adjustments(self, account_scope: str, inst_id: str | None = None) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM protection_adjustments WHERE account_scope = ?
+                   AND status NOT IN ('complete', 'rejected', 'superseded')
+                   AND (? IS NULL OR inst_id = ?) ORDER BY created_at, adjustment_id""",
+                (account_scope, inst_id, inst_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def protection_adjustment(self, adjustment_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            return self._row(connection.execute(
+                "SELECT * FROM protection_adjustments WHERE adjustment_id = ?", (adjustment_id,),
+            ).fetchone())
+
+    def claim_protection_adjustment(
+        self, record: dict[str, Any], position: dict[str, Any], *, expected_generation: int,
+    ) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            generation = connection.execute(
+                "SELECT generation FROM execution_generation WHERE singleton = 1",
+            ).fetchone()[0]
+            current = connection.execute(
+                "SELECT * FROM positions WHERE position_key = ?", (position["position_key"],),
+            ).fetchone()
+            if generation != expected_generation or not current or any(
+                current[field] != position[field] for field in (
+                    "account_scope", "exchange_trade_id", "size", "lifecycle_generation", "status",
+                )
+            ):
+                raise ExposureSnapshotChanged("adjustment_position_changed")
+            if connection.execute(
+                """SELECT 1 FROM protection_handoffs WHERE account_scope = ? AND inst_id = ?
+                   AND status != 'complete' LIMIT 1""",
+                (position["account_scope"], position["inst_id"]),
+            ).fetchone():
+                raise ExposureSnapshotChanged("protection_handoff_pending")
+            active = connection.execute(
+                """SELECT 1 FROM protection_adjustments WHERE account_scope = ? AND inst_id = ?
+                   AND (status NOT IN ('complete', 'rejected', 'superseded')
+                        OR status = 'rejected' AND retry_after_ms > ?) LIMIT 1""",
+                (position["account_scope"], position["inst_id"], record["now_ms"]),
+            ).fetchone()
+            if active:
+                raise ExposureSnapshotChanged("protection_adjustment_pending")
+            self._verify_adjustment_lot(connection, record, current, expected_generation)
+            now = _utc_now()
+            try:
+                connection.execute(
+                    """INSERT INTO protection_adjustments
+                       (adjustment_id, account_scope, inst_id, position_key, opening_order_id, lot_id,
+                        evidence_json, target_size, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (record["adjustment_id"], position["account_scope"], position["inst_id"], position["position_key"],
+                     record["opening_order_id"], record.get("lot_id"), json.dumps(record["evidence"], sort_keys=True),
+                     record["target_size"], now, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ExposureSnapshotChanged("protection_adjustment_pending") from exc
+            row = connection.execute(
+                "SELECT * FROM protection_adjustments WHERE adjustment_id = ?", (record["adjustment_id"],),
+            ).fetchone()
+        return dict(row)
+
+    @staticmethod
+    def _verify_adjustment_lot(connection, record, position, generation):
+        from decimal import Decimal
+        if position["status"] == "closed" and position["size"] == 0:
+            if Decimal(record["target_size"]) != 0:
+                raise ExposureSnapshotChanged("adjustment_lot_changed")
+            return
+        snapshot = connection.execute(
+            """SELECT * FROM position_lot_snapshots WHERE account_scope = ? AND position_key = ?""",
+            (position["account_scope"], position["position_key"]),
+        ).fetchone()
+        if not snapshot or any(snapshot[left] != position[right] for left, right in (
+            ("position_trade_id", "exchange_trade_id"), ("position_size", "size"),
+            ("lifecycle_generation", "lifecycle_generation"),
+        )):
+            raise ExposureSnapshotChanged("adjustment_lot_changed")
+        allocation = json.loads(snapshot["snapshot_json"])
+        lots = [lot for lot in allocation.get("lots", []) if lot["opening_order_id"] == record["opening_order_id"]]
+        if (
+            allocation.get("status") != "verified" or allocation.get("policy_version") != LOT_RECONSTRUCTION_VERSION
+            or allocation.get("execution_generation") != generation or len(lots) > 1
+            or Decimal(lots[0]["remaining_size"] if lots else "0") != Decimal(record["target_size"])
+            or lots and lots[0]["lot_id"] != record["lot_id"]
+        ):
+            raise ExposureSnapshotChanged("adjustment_lot_changed")
+
+    def update_protection_adjustment(self, record: dict[str, Any], **changes: Any) -> dict[str, Any] | None:
+        if not changes or changes.keys() - {"status", "last_error", "attempts", "retry_after_ms"}:
+            raise ValueError("invalid_adjustment_update")
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE protection_adjustments SET " + ", ".join(f"{key} = ?" for key in changes)
+                + ", version = version + 1, updated_at = ? WHERE adjustment_id = ? AND version = ?"
+                + " AND status NOT IN ('complete', 'rejected', 'superseded')",
+                (*changes.values(), _utc_now(), record["adjustment_id"], record["version"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                "SELECT * FROM protection_adjustments WHERE adjustment_id = ?", (record["adjustment_id"],),
+            ).fetchone()
+        return dict(row)
+
+    def start_protection_adjustment(self, record, position, *, expected_generation, now_ms):
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT * FROM positions WHERE position_key = ?", (position["position_key"],),
+            ).fetchone()
+            generation = connection.execute(
+                "SELECT generation FROM execution_generation WHERE singleton = 1",
+            ).fetchone()[0]
+            if generation != expected_generation or not current or any(
+                current[key] != position[key] for key in (
+                    "account_scope", "size", "exchange_trade_id", "lifecycle_generation", "status",
+                )
+            ):
+                raise ExposureSnapshotChanged("adjustment_position_changed")
+            if connection.execute(
+                """SELECT 1 FROM protection_handoffs WHERE account_scope = ? AND inst_id = ?
+                   AND status != 'complete' LIMIT 1""", (record["account_scope"], record["inst_id"]),
+            ).fetchone():
+                raise ExposureSnapshotChanged("protection_handoff_pending")
+            self._verify_adjustment_lot(connection, record, current, expected_generation)
+            cursor = connection.execute(
+                """UPDATE protection_adjustments SET status = 'submitted', attempts = attempts + 1,
+                   retry_after_ms = ?, version = version + 1, updated_at = ?
+                   WHERE adjustment_id = ? AND version = ?
+                   AND (status = 'prepared' OR status IN ('submitted', 'accepted')
+                        AND retry_after_ms <= ?)""",
+                (now_ms + 30000, _utc_now(), record["adjustment_id"], record["version"], now_ms),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return dict(connection.execute(
+                "SELECT * FROM protection_adjustments WHERE adjustment_id = ?", (record["adjustment_id"],),
+            ).fetchone())
+
+    def bind_handoff_native(self, handoff: dict[str, Any], proof: dict[str, Any]) -> dict[str, Any] | None:
+        original = json.loads(handoff["evidence_json"])
+        if original["kind"] != "attached" or proof.get("kind") != "native" or any(
+            original[key] != proof.get(key) for key in (
+                "opening_order_id", "opening_exchange_id", "algo_client_id", "stop_loss", "take_profit",
+            )
+        ):
+            raise ValueError("handoff_native_binding_invalid")
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """UPDATE protection_handoffs SET native_evidence_json = ?, status = 'cancel_pending',
+                   cancel_after_ms = 0, version = version + 1, updated_at = ?
+                   WHERE handoff_id = ? AND version = ? AND native_evidence_json IS NULL
+                   AND close_sequence = 0 AND status IN ('opening_cancel_pending', 'native_pending', 'ready')""",
+                (json.dumps(proof, sort_keys=True, allow_nan=False), _utc_now(), handoff["handoff_id"], handoff["version"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                "SELECT * FROM protection_handoffs WHERE handoff_id = ?", (handoff["handoff_id"],),
+            ).fetchone()
+        return dict(row)
+
+    def settle_handoff_native(self, handoff: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any] | None:
+        proof = json.loads(handoff["native_evidence_json"] or handoff["evidence_json"])
+        if proof["kind"] != "native" or evidence.get("algo_id") != proof["algo_id"] or evidence.get("state") not in {"effective", "canceled"}:
+            raise ValueError("handoff_native_settlement_invalid")
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """UPDATE protection_handoffs SET native_settlement_json = ?, version = version + 1,
+                   last_error = NULL, updated_at = ? WHERE handoff_id = ? AND version = ?
+                   AND native_settlement_json IS NULL AND close_sequence = 0 AND status = 'native_executing'""",
+                (json.dumps(evidence, sort_keys=True, allow_nan=False), _utc_now(), handoff["handoff_id"], handoff["version"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                "SELECT * FROM protection_handoffs WHERE handoff_id = ?", (handoff["handoff_id"],),
+            ).fetchone()
+        return dict(row)
+
+    def update_protection_handoff(self, handoff: dict[str, Any], **changes: Any) -> dict[str, Any] | None:
+        allowed = {"status", "last_error", "cancel_attempts", "cancel_after_ms"}
+        if not changes or changes.keys() - allowed:
+            raise ValueError("invalid_handoff_update")
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE protection_handoffs SET " + ", ".join(f"{key} = ?" for key in changes)
+                + ", version = version + 1, updated_at = ? WHERE handoff_id = ? AND version = ? AND status != 'complete'",
+                (*changes.values(), _utc_now(), handoff["handoff_id"], handoff["version"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                "SELECT * FROM protection_handoffs WHERE handoff_id = ?", (handoff["handoff_id"],),
+            ).fetchone()
+        return dict(row)
+
+    def review_protection_record(
+        self, kind, record, position, *, expected_generation, allocation, status, resolution, note,
+        replacement=None,
+    ):
+        tables = {
+            "handoff": ("protection_handoffs", "handoff_id", {
+                "opening_cancel_pending", "native_pending", "cancel_pending", "native_cancel_pending",
+                "ready", "closing", "native_executing", "complete",
+            }),
+            "adjustment": ("protection_adjustments", "adjustment_id", {"prepared", "accepted", "complete", "superseded"}),
+        }
+        if kind not in tables or status not in tables[kind][2] or resolution not in {"resume", "position_closed"}:
+            raise ValueError("invalid_protection_review")
+        if not 3 <= len(note.strip()) <= 500:
+            raise ValueError("review_note_required")
+        if replacement is not None and (kind != "adjustment" or status != "superseded" or resolution != "resume"):
+            raise ValueError("invalid_protection_review_replacement")
+        table, key, _ = tables[kind]
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                f"SELECT * FROM {table} WHERE {key} = ? AND version = ? AND account_scope = ? AND status = 'review'",
+                (record[key], record["version"], record["account_scope"]),
+            ).fetchone()
+            generation = connection.execute("SELECT generation FROM execution_generation WHERE singleton = 1").fetchone()[0]
+            present = connection.execute("SELECT * FROM positions WHERE position_key = ?", (record["position_key"],)).fetchone()
+            if not current or generation != expected_generation or not present or any(
+                present[field] != position[field] for field in (
+                    "account_scope", "inst_id", "pos_side", "td_mode", "size", "status",
+                    "exchange_trade_id", "lifecycle_generation",
+                )
+            ):
+                raise ExposureSnapshotChanged("review_snapshot_changed")
+            if present["account_scope"] != record["account_scope"] or present["inst_id"] != record["inst_id"]:
+                raise ExposureSnapshotChanged("review_account_changed")
+            if present["status"] == "closed" and present["size"] == 0:
+                placeholders = ",".join("?" for _ in ACTIVE_ORDER_STATUSES)
+                if connection.execute(
+                    f"""SELECT 1 FROM orders WHERE account_scope = ? AND inst_id = ?
+                        AND order_kind = 'standard' AND status IN ({placeholders}) LIMIT 1""",
+                    (record["account_scope"], record["inst_id"], *ACTIVE_ORDER_STATUSES),
+                ).fetchone():
+                    raise ExposureSnapshotChanged("review_orders_pending")
+            else:
+                if resolution == "position_closed" or allocation is None:
+                    raise ExposureSnapshotChanged("review_position_not_closed")
+                saved = connection.execute(
+                    "SELECT * FROM position_lot_snapshots WHERE account_scope = ? AND position_key = ?",
+                    (record["account_scope"], record["position_key"]),
+                ).fetchone()
+                if not saved or json.loads(saved["snapshot_json"]) != allocation or any(
+                    saved[left] != present[right] for left, right in (
+                        ("position_trade_id", "exchange_trade_id"), ("position_size", "size"),
+                        ("lifecycle_generation", "lifecycle_generation"),
+                    )
+                ) or (
+                    allocation.get("status") != "verified"
+                    or allocation.get("policy_version") != LOT_RECONSTRUCTION_VERSION
+                    or allocation.get("execution_generation") != generation
+                ):
+                    raise ExposureSnapshotChanged("review_lot_changed")
+            now = _utc_now()
+            connection.execute(
+                f"""UPDATE {table} SET status = ?, last_error = NULL, version = version + 1, updated_at = ?
+                    WHERE {key} = ? AND version = ? AND status = 'review'""",
+                (status, now, record[key], record["version"]),
+            )
+            if replacement is not None:
+                self._verify_adjustment_lot(connection, replacement, present, generation)
+                if connection.execute(
+                    """SELECT 1 FROM protection_handoffs WHERE account_scope = ? AND inst_id = ?
+                       AND status != 'complete' LIMIT 1""", (record["account_scope"], record["inst_id"]),
+                ).fetchone():
+                    raise ExposureSnapshotChanged("protection_handoff_pending")
+                connection.execute(
+                    """INSERT INTO protection_adjustments
+                       (adjustment_id, account_scope, inst_id, position_key, opening_order_id,
+                        lot_id, evidence_json, target_size, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (replacement["adjustment_id"], record["account_scope"], record["inst_id"], record["position_key"],
+                     replacement["opening_order_id"], replacement["lot_id"],
+                     json.dumps(replacement["evidence"], sort_keys=True, allow_nan=False),
+                     replacement["target_size"], now, now),
+                )
+            connection.execute(
+                """INSERT INTO audit_events (event_type, severity, message, payload_json, created_at)
+                   VALUES ('protection_review_resolved', 'warning', 'Protection maintenance review completed', ?, ?)""",
+                (json.dumps({
+                    "kind": kind, "record_id": record[key], "inst_id": record["inst_id"],
+                    "reviewed_version": record["version"], "status": status, "resolution": resolution,
+                    "previous_error": record["last_error"], "note": note.strip(),
+                    "replacement_id": replacement["adjustment_id"] if replacement else None,
+                }), now),
+            )
+            return dict(connection.execute(f"SELECT * FROM {table} WHERE {key} = ?", (record[key],)).fetchone())
+
+    def finalize_submission(
+        self,
+        client_order_id: str,
+        status: str,
+        *,
+        raw: dict[str, Any],
+        exchange_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Do not overwrite a private-stream update that raced the HTTP response."""
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE orders SET status = ?, raw_json = ?,
+                    exchange_order_id = COALESCE(?, exchange_order_id), updated_at = ?
+                WHERE client_order_id = ? AND status IN ('preparing', 'submitting', 'submission_unknown')
+                """,
+                (status, json.dumps(raw, ensure_ascii=True), exchange_order_id,
+                 _utc_now(), client_order_id),
+            )
+        return self.get_order(client_order_id) or {}
 
     def list_orders(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._connection() as connection:
@@ -218,12 +1137,7 @@ class StateStore:
         reduce_only: bool = False,
     ) -> bool:
         """Check for an exchange order that has not reached a terminal state."""
-        active_statuses = (
-            "submitting",
-            "submitted",
-            "live",
-            "partially_filled",
-        )
+        active_statuses = ACTIVE_ORDER_STATUSES
         placeholders = ",".join("?" for _ in active_statuses)
         with self._connection() as connection:
             row = connection.execute(
@@ -238,6 +1152,139 @@ class StateStore:
                 (inst_id, int(reduce_only), *active_statuses),
             ).fetchone()
         return row is not None
+
+    def has_active_standard_close(self, inst_id: str, side: str) -> bool:
+        placeholders = ",".join("?" for _ in ACTIVE_ORDER_STATUSES)
+        with self._connection() as connection:
+            row = connection.execute(
+                f"""
+                SELECT 1 FROM orders
+                WHERE inst_id = ? AND side = ? AND reduce_only = 1
+                  AND order_kind = 'standard' AND status IN ({placeholders})
+                LIMIT 1
+                """,
+                (inst_id, side, *ACTIVE_ORDER_STATUSES),
+            ).fetchone()
+        return row is not None
+
+    def protection_orders(
+        self, inst_id: str, account_scope: str, pos_side: str, td_mode: str, trade_id: str,
+    ) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM orders
+                WHERE account_scope = ? AND inst_id = ? AND pos_side = ? AND td_mode = ?
+                  AND order_kind = 'standard' AND reduce_only = 0
+                  AND status IN ('partially_filled', 'filled')
+                  AND CASE WHEN json_valid(raw_json) THEN json_extract(raw_json, '$.tradeId') END = ?
+                LIMIT 2
+                """,
+                (account_scope, inst_id, pos_side, td_mode, trade_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def exchange_order(self, inst_id: str, account_scope: str, exchange_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM orders WHERE inst_id = ? AND account_scope = ?
+                   AND exchange_order_id = ? AND order_kind = 'standard' LIMIT 2""",
+                (inst_id, account_scope, exchange_id),
+            ).fetchall()
+        if len(rows) > 1:
+            raise OrderSnapshotConflict("exchange_order_identity_ambiguous")
+        return dict(rows[0]) if rows else None
+
+    def native_parent_orders(self, position: dict[str, Any], exchange_id: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM orders
+                   WHERE account_scope = ? AND inst_id = ? AND pos_side = ? AND td_mode = ?
+                     AND order_kind = 'algo' AND (
+                       CASE WHEN json_valid(raw_json) THEN json_extract(raw_json, '$.ordId') END = ?
+                       OR EXISTS (
+                         SELECT 1 FROM json_each(CASE WHEN json_valid(raw_json)
+                           THEN json_extract(raw_json, '$.ordIdList') ELSE '[]' END)
+                         WHERE value = ?
+                       )
+                     ) LIMIT 2""",
+                (position["account_scope"], position["inst_id"], position["pos_side"],
+                 position["td_mode"], exchange_id, exchange_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_position_lots(
+        self, position: dict[str, Any], snapshot: dict[str, Any], *, expected_generation: int,
+    ) -> bool:
+        if not position.get("account_scope") or not position.get("exchange_trade_id"):
+            return False
+        encoded = json.dumps(snapshot, ensure_ascii=True, sort_keys=True, allow_nan=False)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT * FROM positions WHERE position_key = ?", (position["position_key"],),
+            ).fetchone()
+            identity = ("account_scope", "inst_id", "pos_side", "td_mode", "exchange_trade_id", "size", "lifecycle_generation")
+            if not current or current["status"] != "open" or any(
+                current[field] != position[field] for field in identity
+            ):
+                return False
+            generation = connection.execute(
+                "SELECT generation FROM execution_generation WHERE singleton = 1",
+            ).fetchone()[0]
+            if generation != expected_generation:
+                return False
+            connection.execute(
+                """INSERT INTO position_lot_snapshots
+                   (account_scope, position_key, position_trade_id, position_size,
+                    lifecycle_generation, snapshot_json, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(account_scope, position_key) DO UPDATE SET
+                    position_trade_id = excluded.position_trade_id,
+                    position_size = excluded.position_size,
+                    lifecycle_generation = excluded.lifecycle_generation,
+                    snapshot_json = excluded.snapshot_json, updated_at = excluded.updated_at
+                   WHERE position_lot_snapshots.snapshot_json != excluded.snapshot_json
+                      OR position_lot_snapshots.position_trade_id != excluded.position_trade_id
+                      OR position_lot_snapshots.position_size != excluded.position_size
+                      OR position_lot_snapshots.lifecycle_generation != excluded.lifecycle_generation""",
+                (position["account_scope"], position["position_key"], position["exchange_trade_id"],
+                 position["size"], position["lifecycle_generation"], encoded, _utc_now()),
+            )
+        return True
+
+    def position_lots(self, position: dict[str, Any]) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            current = connection.execute(
+                "SELECT * FROM positions WHERE position_key = ?", (position["position_key"],),
+            ).fetchone()
+            if not current or current["status"] != "open" or any(
+                current[field] != position.get(field) for field in (
+                    "account_scope", "inst_id", "pos_side", "td_mode", "exchange_trade_id",
+                    "size", "lifecycle_generation", "status",
+                )
+            ):
+                return None
+            row = connection.execute(
+                """SELECT * FROM position_lot_snapshots
+                   WHERE account_scope = ? AND position_key = ?""",
+                (position.get("account_scope"), position["position_key"]),
+            ).fetchone()
+            generation = connection.execute(
+                "SELECT generation FROM execution_generation WHERE singleton = 1",
+            ).fetchone()[0]
+        if not row or position["status"] != "open" or any(row[left] != position[right] for left, right in (
+            ("position_trade_id", "exchange_trade_id"), ("position_size", "size"),
+            ("lifecycle_generation", "lifecycle_generation"),
+        )):
+            return None
+        snapshot = json.loads(row["snapshot_json"])
+        if snapshot.get("status") == "verified" and snapshot.get("policy_version") != LOT_RECONSTRUCTION_VERSION:
+            return None
+        if snapshot.get("status") == "verified" and snapshot.get("execution_generation") != generation:
+            return None
+        return snapshot
 
     def save_fill(self, fill: dict[str, Any]) -> dict[str, Any]:
         with self._connection() as connection:
@@ -285,6 +1332,169 @@ class StateStore:
             ).fetchone()
         return self._row(row)
 
+    def protection_incidents(
+        self, account_scope: str, inst_id: str | None = None, *, include_resolved: bool = False,
+    ) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM protection_incidents
+                   WHERE account_scope = ?
+                     AND (? IS NULL OR inst_id = ?)
+                     AND (? OR status IN ('open', 'review'))
+                   ORDER BY created_at, incident_id""",
+                (account_scope, inst_id, inst_id, include_resolved),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def protection_incident(self, incident_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            return self._row(connection.execute(
+                "SELECT * FROM protection_incidents WHERE incident_id = ?", (incident_id,),
+            ).fetchone())
+
+    def has_active_protection_incident(self, account_scope: str, inst_id: str) -> bool:
+        with self._connection() as connection:
+            return connection.execute(
+                """SELECT 1 FROM protection_incidents
+                   WHERE account_scope = ? AND inst_id = ? AND status IN ('open', 'review') LIMIT 1""",
+                (account_scope, inst_id),
+            ).fetchone() is not None
+
+    def record_protection_incident(self, record: dict[str, Any]) -> dict[str, Any]:
+        evidence = {
+            "inst_id": record["inst_id"],
+            "position_key": record.get("position_key"),
+            "exchange_order_id": record.get("exchange_order_id"),
+            "failure_code": record["failure_code"],
+            "failure_detail": record.get("failure_detail", ""),
+            "expected_protection_json": json.dumps(
+                record.get("expected_protection") or {}, sort_keys=True, allow_nan=False,
+            ),
+        }
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """SELECT * FROM protection_incidents
+                   WHERE account_scope = ? AND opening_order_id = ?
+                   ORDER BY CASE WHEN status IN ('open', 'review') THEN 0 ELSE 1 END,
+                            created_at DESC, rowid DESC
+                   LIMIT 1""",
+                (record["account_scope"], record["opening_order_id"]),
+            ).fetchone()
+            now = _utc_now()
+            # Polling the same historical failure is not a new incident or review revision.
+            if existing and all(existing[key] == value for key, value in evidence.items()):
+                return {**dict(existing), "changed": False}
+            if existing and existing["status"] in {"open", "review"}:
+                connection.execute(
+                    """UPDATE protection_incidents
+                       SET failure_code = ?, failure_detail = ?, expected_protection_json = ?,
+                           inst_id = ?, position_key = ?, exchange_order_id = ?,
+                           status = 'review', updated_at = ?, version = version + 1
+                       WHERE incident_id = ?""",
+                    (
+                        evidence["failure_code"], evidence["failure_detail"], evidence["expected_protection_json"],
+                        evidence["inst_id"], evidence["position_key"], evidence["exchange_order_id"],
+                        now, existing["incident_id"],
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM protection_incidents WHERE incident_id = ?",
+                    (existing["incident_id"],),
+                ).fetchone()
+                return {**dict(row), "changed": True}
+            incident_id = record.get("incident_id") or uuid4().hex
+            connection.execute(
+                """INSERT INTO protection_incidents
+                   (incident_id, account_scope, inst_id, position_key, opening_order_id,
+                    exchange_order_id, expected_protection_json, failure_code, failure_detail,
+                    status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
+                (
+                    incident_id, record["account_scope"], record["inst_id"], record.get("position_key"),
+                    record["opening_order_id"], record.get("exchange_order_id"),
+                    json.dumps(record.get("expected_protection") or {}, sort_keys=True, allow_nan=False),
+                    record["failure_code"], record.get("failure_detail", ""), now, now,
+                ),
+            )
+            return {**dict(connection.execute(
+                "SELECT * FROM protection_incidents WHERE incident_id = ?", (incident_id,),
+            ).fetchone()), "changed": True}
+
+    def resolve_protection_incident(
+        self, incident: dict[str, Any], *, resolution: str, note: str,
+    ) -> dict[str, Any] | None:
+        if resolution not in {"external_protection_verified", "position_closed"}:
+            raise ValueError("invalid_protection_incident_resolution")
+        if not 3 <= len(note.strip()) <= 500:
+            raise ValueError("protection_incident_note_required")
+        now = _utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                """SELECT * FROM protection_incidents
+                   WHERE incident_id = ? AND version = ? AND account_scope = ?
+                     AND status IN ('open', 'review')""",
+                (incident["incident_id"], incident["version"], incident["account_scope"]),
+            ).fetchone()
+            if current is None:
+                return None
+            if resolution == "position_closed":
+                position = connection.execute(
+                    "SELECT * FROM positions WHERE position_key = ?", (current["position_key"],),
+                ).fetchone()
+                if (
+                    position is None or position["account_scope"] != current["account_scope"]
+                    or position["inst_id"] != current["inst_id"]
+                    or position["status"] != "closed" or position["size"] != 0
+                ):
+                    raise ExposureSnapshotChanged("protection_incident_position_not_closed")
+                placeholders = ",".join("?" for _ in ACTIVE_ORDER_STATUSES)
+                if connection.execute(
+                    f"""SELECT 1 FROM orders WHERE account_scope = ? AND inst_id = ?
+                        AND order_kind = 'standard' AND status IN ({placeholders}) LIMIT 1""",
+                    (current["account_scope"], current["inst_id"], *ACTIVE_ORDER_STATUSES),
+                ).fetchone():
+                    raise ExposureSnapshotChanged("protection_incident_orders_pending")
+            cursor = connection.execute(
+                """UPDATE protection_incidents
+                   SET status = 'resolved', resolution = ?, resolution_note = ?,
+                       resolved_at = ?, updated_at = ?, version = version + 1
+                   WHERE incident_id = ? AND version = ? AND account_scope = ?
+                     AND status IN ('open', 'review')""",
+                (resolution, note.strip(), now, now, current["incident_id"],
+                 current["version"], current["account_scope"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            connection.execute(
+                """INSERT INTO audit_events (event_type, severity, message, payload_json, created_at)
+                   VALUES ('protection_incident_resolved', 'warning',
+                           'Protection incident was manually resolved', ?, ?)""",
+                (json.dumps({
+                    "incident_id": current["incident_id"], "inst_id": current["inst_id"],
+                    "resolution": resolution, "reviewed_version": current["version"],
+                }), now),
+            )
+            return dict(connection.execute(
+                "SELECT * FROM protection_incidents WHERE incident_id = ?",
+                (incident["incident_id"],),
+            ).fetchone())
+
+    def supersede_protection_incident(
+        self, account_scope: str, opening_order_id: str, *, reason: str,
+    ) -> int:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """UPDATE protection_incidents
+                   SET status = 'superseded', resolution = 'native_protection_found',
+                       resolution_note = ?, updated_at = ?, resolved_at = ?, version = version + 1
+                   WHERE account_scope = ? AND opening_order_id = ?
+                     AND status IN ('open', 'review')""",
+                (reason, _utc_now(), _utc_now(), account_scope, opening_order_id),
+            )
+        return cursor.rowcount
+
     def list_fills(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._connection() as connection:
             rows = connection.execute(
@@ -293,8 +1503,945 @@ class StateStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_chart_annotations(
+        self,
+        account_scope: str,
+        inst_id: str | None = None,
+        bar: str | None = None,
+        *,
+        limit: int = 2000,
+    ) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT annotation_id, inst_id, bar, annotation_json
+                   FROM chart_annotations
+                   WHERE account_scope = ?
+                     AND (? IS NULL OR inst_id = ?)
+                     AND (? IS NULL OR bar = ?)
+                   ORDER BY updated_at, annotation_id
+                   LIMIT ?""",
+                (
+                    account_scope,
+                    inst_id,
+                    inst_id,
+                    bar,
+                    bar,
+                    max(1, min(limit, 2000)),
+                ),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["annotation_json"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            result.append({
+                "id": row["annotation_id"],
+                "inst_id": row["inst_id"],
+                "bar": row["bar"],
+                **payload,
+            })
+        return result
+
+    def replace_chart_annotations(
+        self,
+        account_scope: str,
+        inst_id: str,
+        bar: str,
+        annotations: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        ids = [str(annotation["id"]) for annotation in annotations]
+        if len(ids) != len(set(ids)):
+            raise ValueError("chart_annotation_id_duplicate")
+        now = _utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for annotation_id in ids:
+                existing = connection.execute(
+                    """SELECT inst_id, bar FROM chart_annotations
+                       WHERE account_scope = ? AND annotation_id = ?""",
+                    (account_scope, annotation_id),
+                ).fetchone()
+                if existing and (
+                    existing["inst_id"] != inst_id or existing["bar"] != bar
+                ):
+                    raise ValueError("chart_annotation_id_conflict")
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                connection.execute(
+                    f"""DELETE FROM chart_annotations
+                        WHERE account_scope = ? AND inst_id = ? AND bar = ?
+                          AND annotation_id NOT IN ({placeholders})""",
+                    (account_scope, inst_id, bar, *ids),
+                )
+            else:
+                connection.execute(
+                    """DELETE FROM chart_annotations
+                       WHERE account_scope = ? AND inst_id = ? AND bar = ?""",
+                    (account_scope, inst_id, bar),
+                )
+            for annotation in annotations:
+                annotation_id = str(annotation["id"])
+                payload = {
+                    key: value for key, value in annotation.items() if key != "id"
+                }
+                encoded = json.dumps(
+                    payload,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                connection.execute(
+                    """INSERT INTO chart_annotations
+                       (account_scope, annotation_id, inst_id, bar, annotation_json,
+                        created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(account_scope, annotation_id) DO UPDATE SET
+                           inst_id = excluded.inst_id,
+                           bar = excluded.bar,
+                           annotation_json = excluded.annotation_json,
+                           updated_at = excluded.updated_at""",
+                    (
+                        account_scope,
+                        annotation_id,
+                        inst_id,
+                        bar,
+                        encoded,
+                        now,
+                        now,
+                    ),
+                )
+        return self.list_chart_annotations(account_scope, inst_id, bar)
+
+    def save_bill_snapshot(
+        self,
+        account_scope: str,
+        bills: list[dict[str, Any]],
+        summary: dict[str, Any],
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            previous = connection.execute(
+                "SELECT captured_at FROM account_bill_snapshots WHERE account_scope = ?",
+                (account_scope,),
+            ).fetchone()
+            if previous and previous["captured_at"] > summary["captured_at"]:
+                return
+            for bill in bills:
+                connection.execute(
+                    """
+                    INSERT INTO account_bills
+                        (account_scope, bill_id, timestamp_ms, currency, inst_id, kind, record_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(account_scope, bill_id) DO UPDATE SET
+                        timestamp_ms = excluded.timestamp_ms,
+                        currency = excluded.currency, inst_id = excluded.inst_id,
+                        kind = excluded.kind, record_json = excluded.record_json
+                    """,
+                    (
+                        account_scope, bill["bill_id"], bill["timestamp_ms"], bill["currency"],
+                        bill["inst_id"], bill["kind"], json.dumps(bill, ensure_ascii=True),
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO account_bill_snapshots (account_scope, captured_at, summary_json)
+                VALUES (?, ?, ?)
+                ON CONFLICT(account_scope) DO UPDATE SET
+                    captured_at = excluded.captured_at, summary_json = excluded.summary_json
+                """,
+                (account_scope, summary["captured_at"], json.dumps(summary, ensure_ascii=True)),
+            )
+
+    def bill_snapshot(self, account_scope: str, limit: int = 100) -> dict[str, Any]:
+        with self._connection() as connection:
+            snapshot = connection.execute(
+                "SELECT summary_json FROM account_bill_snapshots WHERE account_scope = ?",
+                (account_scope,),
+            ).fetchone()
+            rows = connection.execute(
+                """SELECT record_json FROM account_bills WHERE account_scope = ?
+                   ORDER BY timestamp_ms DESC, bill_id DESC LIMIT ?""",
+                (account_scope, max(1, min(limit, 500)) + 1),
+            ).fetchall()
+        selected_limit = max(1, min(limit, 500))
+        summary = json.loads(snapshot["summary_json"]) if snapshot else None
+        now = datetime.now(timezone.utc)
+        age = (now - datetime.fromisoformat(summary["captured_at"])).total_seconds() if summary else None
+        return {
+            "data": [json.loads(row["record_json"]) for row in rows[:selected_limit]],
+            "has_more": len(rows) > selected_limit,
+            "summary": summary,
+            "fresh": bool(summary and summary["day_utc"] == now.date().isoformat() and -5 <= age <= 45),
+        }
+
+    @staticmethod
+    def _expire_bill_imports(connection: sqlite3.Connection, scope: str, now_ms: int) -> None:
+        connection.execute(
+            """UPDATE account_bill_imports SET status = 'interrupted',
+               finished_at = ?, error = 'import_lease_expired'
+               WHERE account_scope = ? AND status = 'running' AND lease_until_ms <= ?""",
+            (datetime.fromtimestamp(now_ms / 1000, timezone.utc).isoformat(), scope, now_ms),
+        )
+
+    @staticmethod
+    def _bill_import(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {key: row[key] for key in row.keys() if key not in {"account_scope", "lease_until_ms"}}
+
+    def create_bill_import(self, scope: str, days: list[date], now_ms: int) -> dict[str, Any]:
+        job_id = uuid4().hex
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_bill_imports(connection, scope, now_ms)
+            if connection.execute(
+                "SELECT 1 FROM account_bill_imports WHERE account_scope = ? AND status = 'running'",
+                (scope,),
+            ).fetchone():
+                raise BillImportBusy("history_import_already_running")
+            connection.execute(
+                """INSERT INTO account_bill_imports
+                   (id, account_scope, start_day, end_day, status, total_days, started_at, lease_until_ms)
+                   VALUES (?, ?, ?, ?, 'running', ?, ?, ?)""",
+                (job_id, scope, days[0].isoformat(), days[-1].isoformat(), len(days),
+                 datetime.fromtimestamp(now_ms / 1000, timezone.utc).isoformat(), now_ms + 120_000),
+            )
+            return self._bill_import(connection.execute(
+                "SELECT * FROM account_bill_imports WHERE id = ?", (job_id,),
+            ).fetchone())
+
+    def touch_bill_import(self, job_id: str, scope: str, now_ms: int) -> None:
+        with self._connection() as connection:
+            updated = connection.execute(
+                """UPDATE account_bill_imports SET lease_until_ms = ?
+                   WHERE id = ? AND account_scope = ? AND status = 'running' AND lease_until_ms > ?""",
+                (now_ms + 120_000, job_id, scope, now_ms),
+            ).rowcount
+            if not updated:
+                raise BillImportLeaseLost("history_import_lease_lost")
+
+    def finish_bill_import(self, job_id: str, scope: str, status: str, error: str | None = None) -> None:
+        if status not in {"completed", "failed", "interrupted"}:
+            raise ValueError("invalid_import_terminal_status")
+        with self._connection() as connection:
+            connection.execute(
+                """UPDATE account_bill_imports SET status = ?, error = ?, finished_at = ?
+                   WHERE id = ? AND account_scope = ? AND status = 'running'
+                   AND (? != 'completed' OR completed_days = total_days)""",
+                (status, error, _utc_now(), job_id, scope, status),
+            )
+
+    def commit_bill_history_window(
+        self, job_id: str, scope: str, day: date,
+        records: list[dict[str, Any]], summary: dict[str, Any], now_ms: int,
+        *, archive_lease: tuple[str, str] | None = None,
+    ) -> None:
+        begin, end = day_ms(day), day_ms(day) + DAY_MS
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if archive_lease is not None:
+                self._require_archive_lease(connection, archive_lease[0], scope, archive_lease[1], now_ms)
+            job = connection.execute(
+                """SELECT * FROM account_bill_imports WHERE id = ? AND account_scope = ?
+                   AND status = 'running' AND lease_until_ms > ?""",
+                (job_id, scope, now_ms),
+            ).fetchone()
+            if job is None:
+                raise BillImportLeaseLost("history_import_lease_lost")
+            expected = date.fromisoformat(job["start_day"]).toordinal() + job["completed_days"]
+            if day.toordinal() != expected or day.isoformat() > job["end_day"]:
+                raise ValueError("history_window_out_of_order")
+            for record in records:
+                if not begin <= record["timestamp_ms"] < end:
+                    raise ValueError("history_bill_outside_window")
+                existing = connection.execute(
+                    "SELECT timestamp_ms FROM account_bill_history WHERE account_scope = ? AND bill_id = ?",
+                    (scope, record["bill_id"]),
+                ).fetchone()
+                if existing and existing["timestamp_ms"] != record["timestamp_ms"]:
+                    raise ValueError("history_bill_identity_conflict")
+            connection.execute(
+                "DELETE FROM account_bill_history WHERE account_scope = ? AND timestamp_ms >= ? AND timestamp_ms < ?",
+                (scope, begin, end),
+            )
+            connection.executemany(
+                "INSERT INTO account_bill_history (account_scope, bill_id, timestamp_ms, record_json) VALUES (?, ?, ?, ?)",
+                [(scope, record["bill_id"], record["timestamp_ms"], json.dumps(record, ensure_ascii=True, allow_nan=False))
+                 for record in records],
+            )
+            connection.execute(
+                """INSERT INTO account_bill_history_windows (account_scope, day_utc, captured_at, job_id, summary_json)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(account_scope, day_utc) DO UPDATE SET
+                       captured_at = excluded.captured_at, job_id = excluded.job_id, summary_json = excluded.summary_json""",
+                (scope, day.isoformat(), _utc_now(), job_id, json.dumps(summary, ensure_ascii=True)),
+            )
+            connection.execute(
+                """UPDATE account_bill_imports SET completed_days = completed_days + 1,
+                   rows_imported = rows_imported + ?, lease_until_ms = ? WHERE id = ?""",
+                (len(records), now_ms + 120_000, job_id),
+            )
+
+    def bill_import(self, scope: str, job_id: str | None = None) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            self._expire_bill_imports(connection, scope, int(datetime.now(timezone.utc).timestamp() * 1000))
+            if job_id:
+                row = connection.execute(
+                    "SELECT * FROM account_bill_imports WHERE account_scope = ? AND id = ?", (scope, job_id),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT * FROM account_bill_imports WHERE account_scope = ? ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                    (scope,),
+                ).fetchone()
+            return self._bill_import(row)
+
+    @staticmethod
+    def _bill_archive(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {key: row[key] for key in row.keys() if key not in {
+            "account_scope", "lease_owner", "lease_until_ms",
+        }}
+
+    def create_bill_archive(
+        self, scope: str, year: int, quarter: str, now_ms: int, *, retry: bool = False,
+    ) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM account_bill_archives WHERE account_scope = ? AND year = ? AND quarter = ?",
+                (scope, year, quarter),
+            ).fetchone()
+            if row:
+                if retry and row["state"] in {"completed", "failed", "canceled"}:
+                    connection.execute(
+                        """UPDATE account_bill_archives SET state = 'queued', requested_at_ms = NULL,
+                           next_attempt_ms = ?, lease_owner = NULL, lease_until_ms = 0,
+                           import_job_id = NULL, failures = 0, error = NULL, updated_at = ? WHERE id = ?""",
+                        (now_ms, _utc_now(), row["id"]),
+                    )
+                job_id = row["id"]
+            else:
+                job_id = uuid4().hex
+                connection.execute(
+                    """INSERT INTO account_bill_archives
+                       (id, account_scope, year, quarter, state, next_attempt_ms, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)""",
+                    (job_id, scope, year, quarter, now_ms, _utc_now(), _utc_now()),
+                )
+            return self._bill_archive(connection.execute(
+                "SELECT * FROM account_bill_archives WHERE id = ?", (job_id,),
+            ).fetchone())
+
+    def bill_archives(self, scope: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT a.*, i.completed_days, i.total_days, i.rows_imported
+                   FROM account_bill_archives a LEFT JOIN account_bill_imports i ON i.id = a.import_job_id
+                   WHERE a.account_scope = ? ORDER BY a.year DESC, a.quarter DESC LIMIT 100""",
+                (scope,),
+            ).fetchall()
+            return [self._bill_archive(row) for row in rows]
+
+    @staticmethod
+    def _require_archive_lease(connection, job_id: str, scope: str, owner: str, now_ms: int):
+        row = connection.execute(
+            """SELECT * FROM account_bill_archives WHERE id = ? AND account_scope = ?
+               AND lease_owner = ? AND lease_until_ms > ?
+               AND state NOT IN ('completed', 'failed', 'canceled')""",
+            (job_id, scope, owner, now_ms),
+        ).fetchone()
+        if row is None:
+            raise BillImportLeaseLost("archive_lease_lost")
+        return row
+
+    def claim_bill_archive(self, scope: str, owner: str, now_ms: int) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT * FROM account_bill_archives WHERE account_scope = ?
+                   AND state NOT IN ('completed', 'failed', 'canceled')
+                   AND next_attempt_ms <= ? AND lease_until_ms <= ?
+                   ORDER BY next_attempt_ms, created_at LIMIT 1""",
+                (scope, now_ms, now_ms),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                "UPDATE account_bill_archives SET lease_owner = ?, lease_until_ms = ? WHERE id = ?",
+                (owner, now_ms + 120_000, row["id"]),
+            )
+            return self._bill_archive(row)
+
+    def update_bill_archive(
+        self, job_id: str, scope: str, owner: str, now_ms: int, *,
+        state: str, next_attempt_ms: int | None = None, error: str | None = None,
+        requested_at_ms: int | None = None, import_job_id: str | None = None, failures: int = 0,
+        release: bool = False,
+    ) -> None:
+        if state not in {"queued", "requesting", "waiting", "downloading", "importing", "completed", "failed"}:
+            raise ValueError("archive_state_invalid")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = self._require_archive_lease(connection, job_id, scope, owner, now_ms)
+            linked = import_job_id or current["import_job_id"]
+            if state == "completed":
+                complete = connection.execute(
+                    """SELECT 1 FROM account_bill_imports WHERE id = ? AND account_scope = ?
+                       AND status = 'completed' AND completed_days = total_days""", (linked, scope),
+                ).fetchone()
+                if complete is None:
+                    raise ValueError("archive_import_incomplete")
+            connection.execute(
+                """UPDATE account_bill_archives SET state = ?, next_attempt_ms = ?, error = ?,
+                   requested_at_ms = ?, import_job_id = ?, updated_at = ?, failures = ?,
+                   lease_owner = ?, lease_until_ms = ? WHERE id = ?""",
+                (state, now_ms if next_attempt_ms is None else next_attempt_ms, error,
+                 requested_at_ms if requested_at_ms is not None else current["requested_at_ms"],
+                 linked, _utc_now(), failures,
+                 None if release else owner, 0 if release else now_ms + 120_000, job_id),
+            )
+
+    def touch_bill_archive(self, job_id: str, scope: str, owner: str, now_ms: int) -> None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_archive_lease(connection, job_id, scope, owner, now_ms)
+            connection.execute(
+                "UPDATE account_bill_archives SET lease_until_ms = ? WHERE id = ?",
+                (now_ms + 120_000, job_id),
+            )
+
+    def cancel_bill_archive(self, job_id: str, scope: str) -> bool:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM account_bill_archives WHERE id = ? AND account_scope = ?", (job_id, scope),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["state"] not in {"completed", "failed", "canceled"}:
+                connection.execute(
+                    """UPDATE account_bill_archives SET state = 'canceled', lease_owner = NULL,
+                       lease_until_ms = 0, updated_at = ? WHERE id = ?""", (_utc_now(), job_id),
+                )
+                connection.execute(
+                    """UPDATE account_bill_imports SET status = 'interrupted', error = 'archive_canceled',
+                       finished_at = ? WHERE id = ? AND status = 'running'""", (_utc_now(), row["import_job_id"]),
+                )
+            return True
+
+    def bill_history(
+        self, scope: str, days: list[date], *, limit: int = 100,
+        before_ts: int | None = None, before_id: str | None = None,
+        rate_scope: str | None = None,
+    ) -> dict[str, Any]:
+        begin, end = day_ms(days[0]), day_ms(days[-1]) + DAY_MS
+        clause = "account_scope = ? AND timestamp_ms >= ? AND timestamp_ms < ?"
+        params: list[Any] = [scope, begin, end]
+        if (before_ts is None) != (before_id is None):
+            raise ValueError("history_cursor_pair_required")
+        cursor_clause = "" if before_ts is None else " AND (timestamp_ms < ? OR (timestamp_ms = ? AND bill_id < ?))"
+        cursor_params = [] if before_ts is None else [before_ts, before_ts, before_id]
+        limit = max(1, min(limit, 500))
+        with self._connection() as connection:
+            # Read rows, counts and coverage from one SQLite snapshot.
+            connection.execute("BEGIN")
+            rows = connection.execute(
+                f"SELECT record_json FROM account_bill_history WHERE {clause}{cursor_clause} ORDER BY timestamp_ms DESC, bill_id DESC LIMIT ?",
+                [*params, *cursor_params, limit + 1],
+            ).fetchall()
+            total = connection.execute(f"SELECT COUNT(*) FROM account_bill_history WHERE {clause}", params).fetchone()[0]
+            windows = connection.execute(
+                """SELECT day_utc, captured_at, summary_json FROM account_bill_history_windows
+                   WHERE account_scope = ? AND day_utc >= ? AND day_utc <= ? ORDER BY day_utc""",
+                (scope, days[0].isoformat(), days[-1].isoformat()),
+            ).fetchall()
+            baselines = {
+                row["target_ms"]: self._equity_baseline(row)
+                for row in connection.execute(
+                    """SELECT * FROM account_equity_baselines
+                       WHERE account_scope = ? AND target_ms >= ? AND target_ms <= ? ORDER BY target_ms""",
+                    (scope, begin, end),
+                )
+            }
+            valuation = None
+            if rate_scope is not None:
+                if total > 100_000:
+                    valuation = {"status": "range_too_large", "usd": None, "net_return": None}
+                else:
+                    valuation_records = [
+                        json.loads(row["record_json"]) for row in connection.execute(
+                            f"SELECT record_json FROM account_bill_history WHERE {clause}", params,
+                        )
+                    ]
+                    rates = {}
+                    for key in required_rates(valuation_records):
+                        rate = connection.execute(
+                            """SELECT rate FROM historical_fx_rates
+                               WHERE market_scope = ? AND currency = ? AND candle_ms = ?""", (rate_scope, *key),
+                        ).fetchone()
+                        if rate is not None:
+                            rates[key] = rate["rate"]
+                    valuation = value_history(valuation_records, days, {row["day_utc"] for row in windows}, rates)
+            performance = self._account_performance(connection, scope, rate_scope, days, baselines) if rate_scope else None
+        data = [json.loads(row["record_json"]) for row in rows[:limit]]
+        if valuation is not None:
+            valued_rows = valuation.pop("rows", {})
+            for record in data:
+                record["historical_valuation"] = valued_rows.get(record["bill_id"])
+        covered = {row["day_utc"] for row in windows}
+        missing = [day.isoformat() for day in days if day.isoformat() not in covered]
+        return {
+            "data": data, "total": total,
+            "next_cursor": {"timestamp_ms": data[-1]["timestamp_ms"], "bill_id": data[-1]["bill_id"]} if len(rows) > limit else None,
+            "coverage": {
+                "start_day": days[0].isoformat(), "end_day": days[-1].isoformat(),
+                "complete": not missing, "completed_days": len(covered), "total_days": len(days),
+                "missing_days": missing, "last_imported_at": max((row["captured_at"] for row in windows), default=None),
+            },
+            "summary": combine_history_windows([json.loads(row["summary_json"]) for row in windows]),
+            "equity_baselines": {
+                "policy": BASELINE_POLICY, "capture_window_ms": CAPTURE_WINDOW_MS,
+                "currency": "USD", "required": len(days) + 1, "captured": len(baselines),
+                "data": [
+                    baselines.get(target) or {
+                        "target_ms": target, "day_utc": datetime.fromtimestamp(target / 1000, timezone.utc).date().isoformat(),
+                        "equity_usd": None, "status": "missing",
+                    } for target in range(begin, end + 1, DAY_MS)
+                ],
+            },
+            **({"valuation": valuation} if valuation is not None else {}),
+            **({"performance": performance} if performance is not None else {}),
+        }
+
+    def schedule_performance(
+        self, scope: str, market_scope: str, days: list[date], now_ms: int, *, retry: bool = False,
+    ) -> dict[str, int]:
+        result = {"scheduled": 0, "missing_baselines": 0}
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for day in days:
+                target = day_ms(day)
+                pair = connection.execute(
+                    """SELECT * FROM account_equity_baselines WHERE account_scope = ?
+                       AND target_ms IN (?, ?) ORDER BY target_ms""", (scope, target, target + DAY_MS),
+                ).fetchall()
+                if len(pair) != 2:
+                    result["missing_baselines"] += 1
+                    continue
+                _, end = observation_bounds(*(self._equity_baseline(row) for row in pair))
+                existing = connection.execute(
+                    """SELECT id, state FROM account_performance_intervals
+                       WHERE account_scope = ? AND market_scope = ? AND target_ms = ?""",
+                    (scope, market_scope, target),
+                ).fetchone()
+                due = max(now_ms, end + 300_000)
+                if existing is None:
+                    connection.execute(
+                        """INSERT INTO account_performance_intervals
+                           (id, account_scope, market_scope, target_ms, state, next_attempt_ms, updated_at)
+                           VALUES (?, ?, ?, ?, 'queued', ?, ?)""",
+                        (uuid4().hex, scope, market_scope, target, due, _utc_now()),
+                    )
+                    result["scheduled"] += 1
+                elif retry and existing["state"] in {"completed", "failed", "canceled"}:
+                    connection.execute(
+                        """UPDATE account_performance_intervals SET state = 'queued', attempts = 0,
+                           next_attempt_ms = ?, error = NULL, report_json = NULL, evidence_json = NULL,
+                           lease_owner = NULL, lease_until_ms = 0, revision = revision + 1, updated_at = ? WHERE id = ?""",
+                        (due, _utc_now(), existing["id"]),
+                    )
+                    result["scheduled"] += 1
+        return result
+
+    def performance_updates(self, scope: str, market_scope: str | None) -> dict[str, int]:
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT COUNT(*) AS intervals, COALESCE(SUM(revision), 0) AS revision,
+                   COALESCE(SUM(state IN ('queued', 'running', 'retry_wait')), 0) AS pending
+                   FROM account_performance_intervals WHERE account_scope = ? AND market_scope = ?""",
+                (scope, market_scope),
+            ).fetchone()
+            return dict(row)
+
+    def claim_performance(self, scope: str, market_scope: str, owner: str, now_ms: int) -> dict | None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT * FROM account_performance_intervals WHERE account_scope = ? AND market_scope = ?
+                   AND ((state IN ('queued', 'retry_wait') AND next_attempt_ms <= ?)
+                        OR (state = 'running' AND lease_until_ms <= ?))
+                   ORDER BY next_attempt_ms, target_ms LIMIT 1""", (scope, market_scope, now_ms, now_ms),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """UPDATE account_performance_intervals SET state = 'running', attempts = attempts + 1,
+                   lease_owner = ?, lease_until_ms = ?, revision = revision + 1, updated_at = ? WHERE id = ?""",
+                (owner, now_ms + 60_000, _utc_now(), row["id"]),
+            )
+            pair = connection.execute(
+                """SELECT * FROM account_equity_baselines WHERE account_scope = ?
+                   AND target_ms IN (?, ?) ORDER BY target_ms""", (scope, row["target_ms"], row["target_ms"] + DAY_MS),
+            ).fetchall()
+            return {**dict(row), "attempts": row["attempts"] + 1,
+                    "baselines": [self._equity_baseline(item) for item in pair]}
+
+    @staticmethod
+    def _owned_performance(connection, job_id: str, scope: str, owner: str, now_ms: int):
+        row = connection.execute(
+            """SELECT * FROM account_performance_intervals WHERE id = ? AND account_scope = ?
+               AND state = 'running' AND lease_owner = ? AND lease_until_ms > ?""",
+            (job_id, scope, owner, now_ms),
+        ).fetchone()
+        if row is None:
+            raise PerformanceLeaseLost("performance_lease_lost")
+        return row
+
+    def touch_performance(self, job_id: str, scope: str, owner: str, now_ms: int) -> None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._owned_performance(connection, job_id, scope, owner, now_ms)
+            connection.execute(
+                "UPDATE account_performance_intervals SET lease_until_ms = ? WHERE id = ?", (now_ms + 60_000, job_id),
+            )
+
+    def complete_performance(
+        self, job_id: str, scope: str, owner: str, now_ms: int, report: dict, evidence: dict,
+    ) -> None:
+        encoded_report = json.dumps(report, separators=(",", ":"), allow_nan=False)
+        encoded_evidence = json.dumps(evidence, separators=(",", ":"), allow_nan=False)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            job = self._owned_performance(connection, job_id, scope, owner, now_ms)
+            pair = connection.execute(
+                """SELECT * FROM account_equity_baselines WHERE account_scope = ?
+                   AND target_ms IN (?, ?) ORDER BY target_ms""", (scope, job["target_ms"], job["target_ms"] + DAY_MS),
+            ).fetchall()
+            if [self._equity_baseline(row) for row in pair] != [report["start"], report["end"]]:
+                raise ValueError("performance_baselines_changed")
+            if evidence["market_scope"] != job["market_scope"]:
+                raise PerformanceLeaseLost("performance_market_changed")
+            connection.execute(
+                """UPDATE account_performance_intervals SET state = 'completed', error = NULL, report_json = ?,
+                   evidence_json = ?, lease_owner = NULL, lease_until_ms = 0, revision = revision + 1,
+                   updated_at = ? WHERE id = ?""", (encoded_report, encoded_evidence, _utc_now(), job_id),
+            )
+
+    def defer_performance(
+        self, job_id: str, scope: str, owner: str, now_ms: int, *, retry: bool, error: str | None = None,
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                job = self._owned_performance(connection, job_id, scope, owner, now_ms)
+            except PerformanceLeaseLost:
+                return
+            delay = min(15_000, 1000 * 2 ** min(job["attempts"], 4))
+            connection.execute(
+                """UPDATE account_performance_intervals SET state = ?, error = ?, next_attempt_ms = ?,
+                   lease_owner = NULL, lease_until_ms = 0, revision = revision + 1, updated_at = ? WHERE id = ?""",
+                ("retry_wait" if retry else "failed", error, now_ms + delay, _utc_now(), job_id),
+            )
+
+    def cancel_performance(self, scope: str, market_scope: str, days: list[date]) -> int:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """UPDATE account_performance_intervals SET state = 'canceled', lease_owner = NULL,
+                   lease_until_ms = 0, revision = revision + 1, updated_at = ?
+                   WHERE account_scope = ? AND market_scope = ? AND target_ms >= ? AND target_ms <= ?
+                   AND state IN ('queued', 'running', 'retry_wait')""",
+                (_utc_now(), scope, market_scope, day_ms(days[0]), day_ms(days[-1])),
+            )
+            return cursor.rowcount
+
+    def _account_performance(self, connection, scope: str, market_scope: str, days: list[date], baselines: dict) -> dict:
+        stored = {row["target_ms"]: row for row in connection.execute(
+            """SELECT target_ms, state, attempts, next_attempt_ms, error, report_json, updated_at
+               FROM account_performance_intervals WHERE account_scope = ? AND market_scope = ?
+               AND target_ms >= ? AND target_ms <= ?""",
+            (scope, market_scope, day_ms(days[0]), day_ms(days[-1])),
+        )}
+        daily = []
+        for day in days:
+            target = day_ms(day)
+            row = stored.get(target)
+            entry = {"day_utc": day.isoformat(), "target_ms": target, "status": "missing_interval",
+                     "pnl_usd": None, "cash_flow_usd": None, "return_pct": None}
+            if target not in baselines or target + DAY_MS not in baselines:
+                entry["status"] = "missing_baselines"
+            elif row:
+                entry.update(job_state=row["state"], attempts=row["attempts"], updated_at=row["updated_at"],
+                             next_attempt_ms=row["next_attempt_ms"], error=row["error"], status=row["state"])
+                if row["state"] == "completed" and row["report_json"]:
+                    report = json.loads(row["report_json"])
+                    entry.update(report)
+            daily.append(entry)
+        return summarize_performance(daily)
+
+    @staticmethod
+    def _valuation_job(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {key: row[key] for key in row.keys() if key not in {
+            "account_scope", "market_scope", "lease_owner", "lease_until_ms",
+        }}
+
+    def create_bill_valuation(self, scope: str, market_scope: str, days: list[date]) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                "SELECT * FROM account_bill_valuations WHERE account_scope = ? AND state IN ('queued', 'running')", (scope,),
+            ).fetchone()
+            if active:
+                if (active["start_day"], active["end_day"], active["market_scope"]) == (
+                    days[0].isoformat(), days[-1].isoformat(), market_scope,
+                ):
+                    return self._valuation_job(active)
+                raise BillImportBusy("valuation_already_running")
+            covered = connection.execute(
+                """SELECT COUNT(*) FROM account_bill_history_windows
+                   WHERE account_scope = ? AND day_utc >= ? AND day_utc <= ?""",
+                (scope, days[0].isoformat(), days[-1].isoformat()),
+            ).fetchone()[0]
+            if covered != len(days):
+                raise ValueError("valuation_history_incomplete")
+            job_id, now = uuid4().hex, _utc_now()
+            connection.execute(
+                """INSERT INTO account_bill_valuations
+                   (id, account_scope, market_scope, start_day, end_day, state, total_days, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)""",
+                (job_id, scope, market_scope, days[0].isoformat(), days[-1].isoformat(), len(days), now, now),
+            )
+            return self._valuation_job(connection.execute("SELECT * FROM account_bill_valuations WHERE id = ?", (job_id,)).fetchone())
+
+    def bill_valuation(self, scope: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            return self._valuation_job(connection.execute(
+                "SELECT * FROM account_bill_valuations WHERE account_scope = ? ORDER BY created_at DESC, rowid DESC LIMIT 1", (scope,),
+            ).fetchone())
+
+    def claim_bill_valuation(self, scope: str, market_scope: str, owner: str, now_ms: int) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT * FROM account_bill_valuations WHERE account_scope = ? AND market_scope = ?
+                   AND (state = 'queued' OR (state = 'running' AND lease_until_ms <= ?))
+                   ORDER BY created_at LIMIT 1""", (scope, market_scope, now_ms),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """UPDATE account_bill_valuations SET state = 'running', lease_owner = ?,
+                   lease_until_ms = ?, updated_at = ? WHERE id = ?""", (owner, now_ms + 30_000, _utc_now(), row["id"]),
+            )
+            return {**self._valuation_job(row), "state": "running"}
+
+    @staticmethod
+    def _owned_valuation(connection, job_id: str, scope: str, owner: str, now_ms: int):
+        row = connection.execute(
+            """SELECT * FROM account_bill_valuations WHERE id = ? AND account_scope = ?
+               AND state = 'running' AND lease_owner = ? AND lease_until_ms > ?""",
+            (job_id, scope, owner, now_ms),
+        ).fetchone()
+        if row is None:
+            raise ValuationLeaseLost("valuation_lease_lost")
+        return row
+
+    def touch_bill_valuation(self, job_id: str, scope: str, owner: str, now_ms: int) -> None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._owned_valuation(connection, job_id, scope, owner, now_ms)
+            connection.execute(
+                "UPDATE account_bill_valuations SET lease_until_ms = ? WHERE id = ?", (now_ms + 30_000, job_id),
+            )
+
+    def valuation_day(self, scope: str, day: date) -> tuple[list[dict[str, Any]], str]:
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            window = connection.execute(
+                "SELECT captured_at FROM account_bill_history_windows WHERE account_scope = ? AND day_utc = ?",
+                (scope, day.isoformat()),
+            ).fetchone()
+            if window is None:
+                raise ValueError("valuation_history_incomplete")
+            rows = connection.execute(
+                """SELECT record_json FROM account_bill_history WHERE account_scope = ?
+                   AND timestamp_ms >= ? AND timestamp_ms < ? LIMIT 100001""", (scope, day_ms(day), day_ms(day) + DAY_MS),
+            ).fetchall()
+            if len(rows) > 100_000:
+                raise ValueError("valuation_day_too_large")
+            return [json.loads(row["record_json"]) for row in rows], window["captured_at"]
+
+    def historical_rate(self, market_scope: str, currency: str, candle_ms: int) -> str | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT rate FROM historical_fx_rates WHERE market_scope = ? AND currency = ? AND candle_ms = ?",
+                (market_scope, currency, candle_ms),
+            ).fetchone()
+            return row["rate"] if row else None
+
+    def save_historical_rate(
+        self, market_scope: str, currency: str, candle_ms: int, rate: str,
+        *, lease: tuple[str, str, str, int] | None = None,
+    ) -> None:
+        from .account_ledger import amount
+        from .historical_valuation import rate_key
+
+        rate_key(currency, candle_ms + MINUTE_MS)
+        if candle_ms % MINUTE_MS or amount(rate, "historical_rate") <= 0:
+            raise ValueError("historical_rate_invalid")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if lease is not None:
+                job = self._owned_valuation(connection, *lease)
+                if job["market_scope"] != market_scope:
+                    raise ValuationLeaseLost("valuation_market_changed")
+            connection.execute(
+                """INSERT INTO historical_fx_rates (market_scope, currency, candle_ms, rate, captured_at)
+                   VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""", (market_scope, currency, candle_ms, rate, _utc_now()),
+            )
+
+    def complete_valuation_day(
+        self, job_id: str, scope: str, owner: str, day: date, captured_at: str,
+        loaded: int, missing: int, now_ms: int,
+    ) -> None:
+        from datetime import timedelta
+
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            job = self._owned_valuation(connection, job_id, scope, owner, now_ms)
+            expected = date.fromisoformat(job["start_day"]) + timedelta(days=job["completed_days"])
+            window = connection.execute(
+                "SELECT captured_at FROM account_bill_history_windows WHERE account_scope = ? AND day_utc = ?",
+                (scope, day.isoformat()),
+            ).fetchone()
+            if day != expected or window is None or window["captured_at"] != captured_at:
+                raise ValueError("valuation_history_changed")
+            done = job["completed_days"] + 1 == job["total_days"]
+            state = ("partial" if job["rates_missing"] + missing else "completed") if done else "running"
+            connection.execute(
+                """UPDATE account_bill_valuations SET completed_days = completed_days + 1,
+                   rates_loaded = rates_loaded + ?, rates_missing = rates_missing + ?, state = ?,
+                   lease_until_ms = ?, updated_at = ? WHERE id = ?""",
+                (loaded, missing, state, now_ms + 30_000, _utc_now(), job_id),
+            )
+
+    def finish_bill_valuation(self, job_id: str, scope: str, owner: str, state: str, error: str | None = None) -> None:
+        if state not in {"queued", "failed"}:
+            raise ValueError("valuation_state_invalid")
+        with self._connection() as connection:
+            connection.execute(
+                """UPDATE account_bill_valuations SET state = ?, error = ?, lease_owner = NULL,
+                   lease_until_ms = 0, updated_at = ? WHERE id = ? AND account_scope = ?
+                   AND lease_owner = ? AND state = 'running'""", (state, error, _utc_now(), job_id, scope, owner),
+            )
+
+    def cancel_bill_valuation(self, job_id: str, scope: str) -> bool:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT state FROM account_bill_valuations WHERE id = ? AND account_scope = ?", (job_id, scope),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["state"] in {"queued", "running"}:
+                connection.execute(
+                    """UPDATE account_bill_valuations SET state = 'canceled', lease_owner = NULL,
+                       lease_until_ms = 0, updated_at = ? WHERE id = ?""", (_utc_now(), job_id),
+                )
+            return True
+
+    def save_equity_snapshot(
+        self, scope: str, captured_at_ms: int, source: str,
+        balance: list[dict[str, Any]],
+    ) -> bool:
+        if not scope or type(captured_at_ms) is not int or captured_at_ms <= 0 or source not in {"private_stream", "rest_reconcile"}:
+            raise ValueError("equity_snapshot_identity_invalid")
+        total = total_equity(balance)
+        encoded = json.dumps(balance, separators=(",", ":"), sort_keys=True, allow_nan=False)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO account_equity_snapshots
+                   (account_scope, captured_at_ms, source, equity_usd, balance_json)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (scope, captured_at_ms, source, str(total), encoded),
+            )
+        return cursor.rowcount == 1
+
+    @staticmethod
+    def _equity_baseline(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {
+            "day_utc": datetime.fromtimestamp(row["target_ms"] / 1000, timezone.utc).date().isoformat(),
+            "target_ms": row["target_ms"], "request_started_ms": row["request_started_ms"],
+            "received_at_ms": row["received_at_ms"], "equity_usd": row["equity_usd"],
+            "status": "captured",
+        }
+
+    def save_equity_baseline(
+        self, scope: str, target_ms: int, request_started_ms: int, received_at_ms: int,
+        balance: list[dict[str, Any]],
+    ) -> bool:
+        if not isinstance(scope, str) or not scope:
+            raise ValueError("equity_baseline_scope_invalid")
+        baseline_window(target_ms, request_started_ms, received_at_ms)
+        equity = total_equity(balance)
+        encoded = json.dumps(balance, separators=(",", ":"), sort_keys=True, allow_nan=False)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """INSERT INTO account_equity_baselines
+                   (account_scope, target_ms, request_started_ms, received_at_ms, equity_usd, balance_json)
+                   VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
+                (scope, target_ms, request_started_ms, received_at_ms, equity, encoded),
+            )
+        return cursor.rowcount == 1
+
+    def equity_baseline(self, scope: str, target_ms: int | None = None) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT * FROM account_equity_baselines WHERE account_scope = ?"""
+                + (" AND target_ms = ?" if target_ms is not None else "")
+                + " ORDER BY target_ms DESC LIMIT 1",
+                (scope, target_ms) if target_ms is not None else (scope,),
+            ).fetchone()
+        return self._equity_baseline(row)
+
+    def equity_snapshots(
+        self, scope: str, start_ms: int, end_ms: int, limit: int = 10_000,
+    ) -> list[dict[str, Any]]:
+        if start_ms <= 0 or end_ms <= start_ms:
+            raise ValueError("equity_snapshot_window_invalid")
+        limit = max(1, min(limit, 10_000))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT captured_at_ms, source, equity_usd, balance_json
+                   FROM account_equity_snapshots
+                   WHERE account_scope = ? AND captured_at_ms >= ? AND captured_at_ms <= ?
+                   ORDER BY captured_at_ms, source LIMIT ?""",
+                (scope, start_ms, end_ms, limit + 1),
+            ).fetchall()
+        if len(rows) > limit:
+            raise ValueError("equity_snapshot_window_too_large")
+        return [{
+            "captured_at_ms": row["captured_at_ms"], "source": row["source"],
+            "equity_usd": row["equity_usd"], "balance": json.loads(row["balance_json"]),
+        } for row in rows]
+
     def pnl_summary(self, limit: int = 500) -> dict[str, Any]:
         fills = self.list_fills(limit)
+        currency, valuation = self._fill_report_currency(fills)
+        if valuation not in {"single_currency", "empty"}:
+            return {
+                "fills": len(fills), "currency": None, "valuation_status": valuation,
+                "basis": "fills_only_excludes_funding",
+                "realized_pnl": None, "fees": None, "net_pnl": None, "by_instrument": {},
+            }
         realized_pnl = sum(float(item.get("realized_pnl") or 0) for item in fills)
         fees = sum(float(item.get("fee") or 0) for item in fills)
         by_instrument: dict[str, dict[str, float | int]] = {}
@@ -309,11 +2456,37 @@ class StateStore:
             bucket["fees"] += float(item.get("fee") or 0)
         return {
             "fills": len(fills),
+            "currency": currency,
+            "valuation_status": valuation,
+            "basis": "fills_only_excludes_funding",
             "realized_pnl": round(realized_pnl, 8),
             "fees": round(fees, 8),
             "net_pnl": round(realized_pnl + fees, 8),
             "by_instrument": by_instrument,
         }
+
+    @staticmethod
+    def _fill_report_currency(fills: list[dict[str, Any]]) -> tuple[str | None, str]:
+        currencies: set[str] = set()
+        for fill in fills:
+            parts = str(fill.get("inst_id") or "").split("-")
+            if len(parts) != 3 or parts[-1] != "SWAP" or parts[1] not in {"USD", "USDT", "USDC"}:
+                return None, "unresolved_currency"
+            settlement = parts[0] if parts[1] == "USD" else parts[1]
+            currencies.add(settlement)
+            try:
+                pnl, fee = float(fill.get("realized_pnl") or 0), float(fill.get("fee") or 0)
+            except (ValueError, TypeError):
+                return None, "invalid_amount"
+            if not math.isfinite(pnl) or not math.isfinite(fee):
+                return None, "invalid_amount"
+            if fee:
+                if not fill.get("fee_ccy"):
+                    return None, "unresolved_currency"
+                currencies.add(str(fill["fee_ccy"]))
+        if len(currencies) > 1:
+            return None, "mixed_currency"
+        return next(iter(currencies), None), "single_currency" if currencies else "empty"
 
     def performance_report(
         self,
@@ -322,12 +2495,22 @@ class StateStore:
         limit: int = 500,
     ) -> dict[str, Any]:
         """Build realized performance metrics from the durable fill ledger."""
-        if initial_equity <= 0:
-            raise ValueError("initial_equity must be greater than zero")
+        if not math.isfinite(initial_equity) or initial_equity <= 0:
+            raise ValueError("initial_equity must be finite and greater than zero")
         fills = sorted(
             self.list_fills(limit),
             key=lambda item: str(item.get("filled_at") or ""),
         )
+        currency, valuation = self._fill_report_currency(fills)
+        if valuation not in {"single_currency", "empty"}:
+            return {
+                "fills": len(fills), "currency": None, "valuation_status": valuation,
+                "basis": "fills_only_excludes_funding",
+                "initial_equity": initial_equity, "ending_equity": None,
+                "realized_pnl": None, "fees": None, "net_pnl": None, "return_pct": None,
+                "max_drawdown": None, "max_drawdown_pct": None,
+                "daily": {}, "by_strategy": {}, "equity_curve": [],
+            }
         orders = {
             str(item["client_order_id"]): item
             for item in self.list_orders(500)
@@ -393,6 +2576,9 @@ class StateStore:
 
         return {
             "fills": len(fills),
+            "currency": currency,
+            "valuation_status": valuation,
+            "basis": "fills_only_excludes_funding",
             "initial_equity": round(initial_equity, 8),
             "ending_equity": round(equity, 8),
             "realized_pnl": round(
@@ -420,15 +2606,30 @@ class StateStore:
                 """
                 INSERT INTO positions (
                     position_key, inst_id, pos_side, size, entry_price, mark_price,
-                    notional, stop_loss, take_profit, unrealized_pnl, status, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    notional, stop_loss, take_profit, unrealized_pnl, status, updated_at,
+                    td_mode, account_scope, exchange_trade_id, protection_order_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(position_key) DO UPDATE SET
+                    lifecycle_generation = positions.lifecycle_generation + CASE
+                        WHEN excluded.status = 'open' AND excluded.size != 0 AND (
+                            positions.status != 'open' OR positions.size = 0
+                            OR positions.account_scope IS NOT excluded.account_scope
+                            OR positions.protection_order_id IS NOT excluded.protection_order_id
+                            OR (positions.pos_side = 'net' AND (
+                                (positions.size < 0 AND excluded.size > 0)
+                                OR (positions.size > 0 AND excluded.size < 0)
+                            ))
+                        ) THEN 1 ELSE 0 END,
                     size = excluded.size,
                     entry_price = excluded.entry_price,
                     mark_price = excluded.mark_price,
                     notional = excluded.notional,
                     stop_loss = excluded.stop_loss,
                     take_profit = excluded.take_profit,
+                    td_mode = excluded.td_mode,
+                    account_scope = excluded.account_scope,
+                    exchange_trade_id = excluded.exchange_trade_id,
+                    protection_order_id = excluded.protection_order_id,
                     unrealized_pnl = excluded.unrealized_pnl,
                     status = excluded.status,
                     updated_at = excluded.updated_at
@@ -446,6 +2647,10 @@ class StateStore:
                     position.get("unrealized_pnl", 0),
                     position.get("status", "open"),
                     now,
+                    position.get("td_mode", ""),
+                    position.get("account_scope"),
+                    position.get("exchange_trade_id"),
+                    position.get("protection_order_id"),
                 ),
             )
         return self.get_position(position_key) or position
@@ -536,6 +2741,91 @@ class StateStore:
                 )
             return int(cursor.rowcount)
 
+    @staticmethod
+    def _tradingview_summary(row) -> dict[str, Any]:
+        result = json.loads(row["result_json"])
+        return {
+            "alert_id": row["alert_id"], "inst_id": row["inst_id"], "action": row["action"],
+            "dry_run": bool(row["dry_run"]), "status": row["status"],
+            "created_at": row["created_at"], "updated_at": row["updated_at"],
+            "execution_accepted": result.get("accepted"),
+            "client_order_id": result.get("client_order_id") or json.loads(row["instruction_json"]).get("client_order_id"),
+            "reasons": result.get("reasons", []),
+        }
+
+    def enqueue_tradingview_alert(
+        self, alert_id: str, fingerprint: str, instruction: dict[str, Any],
+    ) -> tuple[bool, dict[str, Any]]:
+        now = _utc_now()
+        with self._connection(timeout=1) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM tradingview_alerts WHERE alert_id = ?", (alert_id,),
+            ).fetchone()
+            if existing:
+                if existing["fingerprint"] != fingerprint:
+                    raise TradingViewAlertConflict("alert_id_payload_conflict")
+                return False, self._tradingview_summary(existing)
+            pending = connection.execute(
+                "SELECT COUNT(*) FROM tradingview_alerts WHERE status IN ('queued', 'processing')",
+            ).fetchone()[0]
+            if pending >= 1000:
+                raise TradingViewQueueFull("tradingview_queue_full")
+            signal = instruction["signal"]
+            connection.execute(
+                """INSERT INTO tradingview_alerts
+                    (alert_id, fingerprint, inst_id, action, dry_run, instruction_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (alert_id, fingerprint, signal["inst_id"], signal["action"], int(instruction["dry_run"]),
+                 json.dumps(instruction, allow_nan=False), now, now),
+            )
+            return True, self._tradingview_summary(connection.execute(
+                "SELECT * FROM tradingview_alerts WHERE alert_id = ?", (alert_id,),
+            ).fetchone())
+
+    def claim_tradingview_alert(self, owner: str, now_ms: int) -> dict[str, Any] | None:
+        with self._connection(timeout=1) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            # A process may have exited after submitting an order. Never
+            # automatically replay an interrupted instruction.
+            connection.execute(
+                """UPDATE tradingview_alerts SET status = 'interrupted', updated_at = ?,
+                    result_json = ? WHERE status = 'processing' AND deadline_ms <= ?""",
+                (_utc_now(), json.dumps({"reasons": ["processing_interrupted"]}), now_ms),
+            )
+            row = connection.execute(
+                "SELECT * FROM tradingview_alerts WHERE status = 'queued' ORDER BY created_at, rowid LIMIT 1",
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """UPDATE tradingview_alerts SET status = 'processing', owner = ?, deadline_ms = ?,
+                    updated_at = ? WHERE alert_id = ? AND status = 'queued'""",
+                (owner, now_ms + 120_000, _utc_now(), row["alert_id"]),
+            )
+            return {"alert_id": row["alert_id"], **json.loads(row["instruction_json"])}
+
+    def finish_tradingview_alert(
+        self, alert_id: str, owner: str, status: str, result: dict[str, Any],
+    ) -> bool:
+        if status not in {"preview", "submitted", "observed", "rejected", "expired", "interrupted", "unconfirmed"}:
+            raise ValueError("invalid_tradingview_result_status")
+        with self._connection(timeout=1) as connection:
+            updated = connection.execute(
+                """UPDATE tradingview_alerts SET status = ?, result_json = ?, updated_at = ?
+                    WHERE alert_id = ? AND owner = ? AND status = 'processing'""",
+                (status, json.dumps(result, allow_nan=False), _utc_now(), alert_id, owner),
+            )
+            return updated.rowcount == 1
+
+    def list_tradingview_alerts(self, limit: int = 30) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM tradingview_alerts ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (max(1, min(limit, 100)),),
+            ).fetchall()
+            return [self._tradingview_summary(row) for row in rows]
+
     def add_audit(
         self,
         event_type: str,
@@ -603,6 +2893,50 @@ class StateStore:
             item["report"] = json.loads(item.pop("report_json"))
             result.append(item)
         return result
+
+    def analysis_index(
+        self,
+        limit: int = 20,
+        *,
+        before_id: int | None = None,
+        inst_id: str | None = None,
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        for column, value, operator in (
+            ("id", before_id, "<"),
+            ("inst_id", inst_id, "="),
+            ("source", source, "="),
+        ):
+            if value is not None:
+                clauses.append(f"{column} {operator} ?")
+                parameters.append(value)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        page_size = max(1, min(limit, 50))
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""SELECT id, inst_id, source, bias, created_at FROM analyses
+                    {where} ORDER BY id DESC LIMIT ?""",
+                (*parameters, page_size + 1),
+            ).fetchall()
+        page = [dict(row) for row in rows[:page_size]]
+        return {
+            "data": page,
+            "next_before_id": page[-1]["id"] if len(rows) > page_size else None,
+        }
+
+    def get_analysis(self, analysis_id: int) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM analyses WHERE id = ?", (analysis_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["signal"] = json.loads(item.pop("signal_json"))
+        item["report"] = json.loads(item.pop("report_json"))
+        return item
 
     def save_strategy(
         self,

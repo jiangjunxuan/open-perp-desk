@@ -4,13 +4,13 @@ import hashlib
 import hmac
 import json
 import os
-import ssl
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
-import certifi
 from websockets.asyncio.client import connect
+
+from .okx_websocket import OkxAuthenticationError, OkxSubscriptionError, decode_message, socket_messages, websocket_tls
 
 
 class OkxAlgoOrderStream:
@@ -34,6 +34,16 @@ class OkxAlgoOrderStream:
         self.last_error: str | None = None
         self.orders: dict[str, dict[str, Any]] = {}
         self._task: asyncio.Task[None] | None = None
+        self.on_update: Callable[[], None] | None = None
+
+    def _notify_update(self) -> None:
+        if self.on_update is None:
+            return
+        try:
+            self.on_update()
+        except Exception:
+            # Stream transport must not be terminated by an observer callback.
+            return
 
     @property
     def configured(self) -> bool:
@@ -89,7 +99,7 @@ class OkxAlgoOrderStream:
                 async with connect(
                     self.url,
                     proxy=self.proxy_url,
-                    ssl=ssl.create_default_context(cafile=certifi.where()),
+                    ssl=websocket_tls(self.url, self.proxy_url),
                     ping_interval=20,
                     ping_timeout=20,
                     close_timeout=5,
@@ -98,14 +108,16 @@ class OkxAlgoOrderStream:
                     self.connected = True
                     self.authenticated = False
                     self.last_error = None
+                    self._notify_update()
                     delay = 1.0
                     await socket.send(json.dumps(self.login_message()))
-                    async for raw in socket:
+                    async for raw in socket_messages(socket):
                         self.consume(raw)
-                        try:
-                            message = json.loads(raw)
-                        except (TypeError, json.JSONDecodeError):
-                            message = {}
+                        message = decode_message(raw)
+                        if message.get("event") == "error":
+                            raise OkxSubscriptionError()
+                        if message.get("event") == "login" and str(message.get("code", "")) != "0":
+                            raise OkxAuthenticationError()
                         if (
                             message.get("event") == "login"
                             and str(message.get("code", "")) == "0"
@@ -117,17 +129,16 @@ class OkxAlgoOrderStream:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                self.last_error = type(exc).__name__
+            finally:
                 self.connected = False
                 self.authenticated = False
-                self.last_error = type(exc).__name__
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 30.0)
+                self._notify_update()
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30.0)
 
     def consume(self, raw: str | bytes) -> None:
-        try:
-            message = json.loads(raw)
-        except (TypeError, json.JSONDecodeError):
-            return
+        message = decode_message(raw)
 
         if message.get("event") in {"subscribe", "channel-conn-count"}:
             return
@@ -135,12 +146,22 @@ class OkxAlgoOrderStream:
             self.authenticated = str(message.get("code", "")) == "0"
             if not self.authenticated:
                 self.last_error = "login_failed"
+            else:
+                self.last_error = None
+            self._notify_update()
             return
 
-        argument = message.get("arg") or {}
+        argument = message.get("arg")
+        if not isinstance(argument, dict):
+            return
         if argument.get("channel") != "orders-algo":
             return
-        for item in message.get("data") or []:
+        rows = message.get("data")
+        if not isinstance(rows, list):
+            return
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
             order_id = str(
                 item.get("algoId")
                 or item.get("ordId")
@@ -150,8 +171,9 @@ class OkxAlgoOrderStream:
             )
             if order_id:
                 self.orders[order_id] = item
-        if message.get("data"):
+        if any(isinstance(item, dict) for item in rows):
             self.last_message_at = datetime.now(timezone.utc).isoformat()
+            self._notify_update()
 
     def snapshot(self) -> dict[str, Any]:
         return {

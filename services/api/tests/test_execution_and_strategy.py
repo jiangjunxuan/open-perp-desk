@@ -13,6 +13,7 @@ from app.automation_worker import AutomationWorker
 from app.backtest import BacktestEngine
 from app.okx_trade import OkxTradeClient
 from app.okx_account import OkxAccountError
+from app.position_protection import attached_algo_client_id
 from app.pushplus import PushPlusClient
 from app.risk_engine import RiskEngine, RiskLimits
 from app.safety_control import SafetyController
@@ -21,7 +22,8 @@ from app.strategy_engine import StrategyEngine
 from app.strategy_engine import DEFAULT_STRATEGY_CONFIG
 from app.trading_signal import TradeSignal
 from app import main as api_main
-from app.ai_analysis import TradingAgentsAdapter, _tradingagents_ticker
+from app.ai_analysis import TradingAgentsAdapter
+from app.ai_runner import _tradingagents_ticker
 
 
 def candles(count: int = 30) -> list[list[str]]:
@@ -459,6 +461,7 @@ class ExecutionEngineTests(unittest.TestCase):
             FakeTradeClient(),
             FakePushPlus(),
             self.safety,
+            private_stream_ready=lambda: True,
         )
         self.signal = TradeSignal(
             inst_id="BTC-USDT-SWAP",
@@ -636,6 +639,7 @@ class StateStoreFillTests(unittest.TestCase):
                     "fill_price": 99,
                     "fill_size": 1,
                     "fee": -1,
+                    "fee_ccy": "USDT",
                     "realized_pnl": -20,
                     "filled_at": "2026-01-01T02:00:00Z",
                 }
@@ -746,9 +750,9 @@ class CancelOrderRouteTests(unittest.TestCase):
             result = asyncio.run(api_main.cancel_stored_order("client-1"))
 
         self.assertTrue(result["accepted"])
-        self.assertEqual(store.order["status"], "canceled")
+        self.assertEqual(store.order["status"], "canceling")
         self.assertEqual(trade.args, ("BTC-USDT-SWAP", "exchange-1"))
-        self.assertEqual(store.audits[0][0], "order_canceled")
+        self.assertEqual(store.audits[0][0], "order_cancel_requested")
 
     def test_cancel_route_rejects_empty_exchange_result(self) -> None:
         class EmptyResultTrade(self.FakeTrade):
@@ -971,6 +975,18 @@ class OrderTimestampAccountClient(FakeAccountClient):
 
 
 class ProtectedPositionAccountClient(FakeAccountClient):
+    account_scope = "protected-fixture"
+
+    async def pending_algo_orders(self, **_kwargs):
+        return [{
+            "algoId": "native-entry-1", "algoClOrdId": attached_algo_client_id("entry-1"),
+            "instId": "BTC-USDT-SWAP", "posSide": "long", "tdMode": "isolated",
+            "side": "sell", "state": "live", "ordType": "oco", "sz": "1",
+            "slTriggerPx": "49000", "slTriggerPxType": "mark", "slOrdPx": "-1",
+            "tpTriggerPx": "52000", "tpTriggerPxType": "mark", "tpOrdPx": "-1",
+            "uTime": "1767225660000",
+        }]
+
     async def positions(self):
         return [{
             "instId": "BTC-USDT-SWAP",
@@ -980,6 +996,7 @@ class ProtectedPositionAccountClient(FakeAccountClient):
             "avgPx": "50000",
             "markPx": "50010",
             "upl": "0",
+            "tradeId": "entry-trade",
         }]
 
 
@@ -1076,7 +1093,7 @@ class AccountSyncTests(unittest.TestCase):
         self.assertEqual(order["created_at"], "2026-01-01T00:00:00+00:00")
         self.assertEqual(order["updated_at"], "2026-01-01T00:01:00+00:00")
 
-    def test_position_sync_restores_local_protective_levels(self) -> None:
+    def test_position_sync_restores_verified_native_protective_levels(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(str(Path(directory) / "state.sqlite3"))
             store.save_order(
@@ -1086,7 +1103,7 @@ class AccountSyncTests(unittest.TestCase):
                     "status": "filled",
                     "inst_id": "BTC-USDT-SWAP",
                     "side": "buy",
-                    "pos_side": "net",
+                    "pos_side": "long",
                     "ord_type": "market",
                     "td_mode": "isolated",
                     "size": 1,
@@ -1094,6 +1111,12 @@ class AccountSyncTests(unittest.TestCase):
                     "take_profit": 52000,
                     "source": "structured-technical",
                     "created_at": "2026-01-01T00:00:00+00:00",
+                    "account_scope": "protected-fixture",
+                    "raw": {
+                        "ordId": "exchange-1", "clOrdId": "entry-1",
+                        "instId": "BTC-USDT-SWAP", "posSide": "long", "tdMode": "isolated",
+                        "side": "buy", "tradeId": "entry-trade", "accFillSz": "1",
+                    },
                 }
             )
             synchronizer = AccountSynchronizer(
@@ -1125,7 +1148,7 @@ class AccountSyncTests(unittest.TestCase):
         self.assertIn("protect-history-1", orders)
         self.assertEqual(orders["protect-pending-1"]["stop_loss"], 49000)
         self.assertEqual(orders["protect-pending-1"]["take_profit"], 52000)
-        self.assertEqual(orders["protect-history-1"]["source"], "okx-algo-stream")
+        self.assertEqual(orders["protect-history-1"]["source"], "okx-algo-rest")
 
     def test_disconnected_private_stream_does_not_reapply_cached_state(self) -> None:
         class CachedButDisconnectedStream:

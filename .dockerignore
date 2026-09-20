@@ -1,4 +1,16 @@
 .git
+.env
+.env.*
+**/.env
+**/.env.*
+**/data/
+**/backups/
+**/*.sqlite3
+**/*.sqlite3-*
+backups
+.openperpdesk-deploy.lock
+**/._*
+**/.DS_Store
 .venv
 venv
 node_modules
@@ -6,5 +18,6 @@ work
 outputs
 data
 *.sqlite3
+*.sqlite3-*
 __pycache__
 *.py[cod]

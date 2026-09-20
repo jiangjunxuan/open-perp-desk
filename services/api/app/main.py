@@ -1,14 +1,16 @@
 import asyncio
 import os
 import secrets
+import sqlite3
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Path as RoutePath, Query
-from pydantic import BaseModel, Field
+from fastapi import Depends, FastAPI, Header, HTTPException, Path as RoutePath, Query, Request
+from pydantic import BaseModel, ConfigDict, Field
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse
 
 from .okx_account import OkxAccountClient, OkxAccountError
 from .okx_algo_stream import OkxAlgoOrderStream
@@ -16,18 +18,33 @@ from .okx_account_stream import OkxAccountStream
 from .okx_market import OkxMarketClient, OkxMarketError
 from .okx_market_stream import OkxMarketStream
 from .okx_trade import OkxTradeClient, OkxTradeError, OrderRequest
-from .pushplus import PushPlusClient
+from .pushplus import PushPlusClient, PushPlusError
 from .risk_engine import RiskEngine
 from .execution_engine import ExecutionEngine
+from .order_preflight import OrderPreflight
+from .position_lots import positions_with_lots
+from .protection_handoff import HANDOFF_LABELS, HandoffError, handoff_summaries
+from .protection_incident import incident_summaries
+from .protection_review import ProtectionReviewer, ProtectionReviewError
 from .ai_analysis import AIAnalysisError, TradingAgentsAdapter
 from .account_sync import AccountSynchronizer
+from .account_history import AccountHistoryImporter
+from .account_valuation import AccountValuationWorker
+from .account_performance import AccountPerformanceWorker
+from .quarterly_history import QuarterlyHistoryImporter
+from .historical_ledger import archive_first_day, history_days
 from .account_reconciler import AccountReconciler
+from .equity_baseline import EquityBaselineSampler
 from .automation_worker import AutomationWorker
 from .backtest import BacktestEngine
-from .state_store import StateStore
+from .state_store import BillImportBusy, ExposureSnapshotChanged, OrderSnapshotConflict, StateStore, TradingViewAlertConflict, TradingViewQueueFull
 from .safety_control import SafetyController
 from .strategy_engine import StrategyEngine
 from .trading_signal import TradeSignal
+from . import tradingview
+from .tradingview_worker import TradingViewWorker
+from .private_connection import PrivateConnectionCheck, PrivateProbeError
+from .realtime import control_events, private_events
 
 
 def _symbols() -> list[str]:
@@ -40,10 +57,16 @@ market_stream = OkxMarketStream(_symbols())
 account_client = OkxAccountClient()
 account_stream = OkxAccountStream()
 algo_stream = OkxAlgoOrderStream()
+private_connection_check = PrivateConnectionCheck()
 pushplus_client = PushPlusClient()
 risk_engine = RiskEngine()
 trade_client = OkxTradeClient()
 state_store = StateStore()
+account_history = AccountHistoryImporter(state_store, account_client)
+quarterly_history = QuarterlyHistoryImporter(state_store, account_client)
+account_valuation = AccountValuationWorker(state_store, account_client, market_client)
+equity_baseline = EquityBaselineSampler(state_store, account_client)
+account_performance = AccountPerformanceWorker(state_store, account_client, market_client)
 safety_controller = SafetyController(state_store)
 strategy_engine = StrategyEngine()
 backtest_engine = BacktestEngine(strategy_engine)
@@ -54,14 +77,34 @@ execution_engine = ExecutionEngine(
     trade_client,
     pushplus_client,
     safety_controller,
+    preflight=OrderPreflight(account_client, market_client, state_store),
+)
+tradingview_worker = TradingViewWorker(
+    state_store, execution_engine, market_data_fresh=lambda: market_stream.fresh,
 )
 account_sync = AccountSynchronizer(
     state_store,
     account_client,
     account_stream,
     algo_stream,
+    notifier=execution_engine.notify_event,
 )
-account_reconciler = AccountReconciler(account_sync, state_store)
+execution_engine.private_stream_ready = account_sync.private_stream_ready
+account_reconciler = AccountReconciler(
+    account_sync,
+    state_store,
+    notifier=execution_engine.notify_event,
+)
+
+
+def _account_stream_ready() -> bool:
+    return bool(
+        getattr(
+            account_stream,
+            "account_ready",
+            account_stream.connected and account_stream.authenticated,
+        )
+    )
 automation_worker = AutomationWorker(
     market_client,
     account_client,
@@ -72,22 +115,40 @@ automation_worker = AutomationWorker(
     state_store,
     safety_controller,
     market_data_fresh=lambda: market_stream.fresh,
+    notifier=execution_engine.notify_event,
 )
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    account_stream.on_update = account_reconciler.notify_stream
+    algo_stream.on_update = account_reconciler.notify_stream
     await market_stream.start()
     await account_stream.start()
     await algo_stream.start()
     await account_reconciler.start()
+    await equity_baseline.start()
+    await quarterly_history.start()
+    await account_valuation.start()
+    await account_performance.start()
     await automation_worker.start()
-    yield
-    await automation_worker.stop()
-    await account_reconciler.stop()
-    await account_stream.stop()
-    await algo_stream.stop()
-    await market_stream.stop()
+    await tradingview_worker.start()
+    try:
+        yield
+    finally:
+        await private_connection_check.close()
+        await tradingview_worker.close()
+        await equity_baseline.stop()
+        await account_performance.close()
+        await account_valuation.close()
+        await quarterly_history.close()
+        await account_history.close()
+        await tradingagents.close()
+        await automation_worker.stop()
+        await account_reconciler.stop()
+        await account_stream.stop()
+        await algo_stream.stop()
+        await market_stream.stop()
 
 
 app = FastAPI(
@@ -129,7 +190,6 @@ def _readiness_payload() -> dict[str, object]:
     checks = {
         "state_store": {
             "ok": state_store_ready,
-            "path": str(state_store.path),
         },
         "market_stream": {
             "ok": market_fresh,
@@ -174,6 +234,7 @@ def health_metrics() -> dict[str, object]:
             "configured": account_stream.configured,
             "connected": account_stream.connected,
             "authenticated": account_stream.authenticated,
+            "account_ready": _account_stream_ready(),
             "last_message_at": account_stream.last_message_at,
             "last_error": account_stream.last_error,
         },
@@ -184,8 +245,11 @@ def health_metrics() -> dict[str, object]:
             "last_message_at": algo_stream.last_message_at,
             "last_error": algo_stream.last_error,
         },
+        "private_stream": account_sync.private_stream_status(),
         "automation_worker": automation_worker.snapshot(),
         "account_reconciler": account_reconciler.snapshot(),
+        "equity_baseline": equity_baseline.snapshot(),
+        "quarterly_history": quarterly_history.snapshot(),
         "execution": {
             "enabled": trade_client.enabled,
             "live_allowed": trade_client.live_gate.allowed,
@@ -223,16 +287,23 @@ def system_status() -> dict[str, object]:
             "account_readonly_configured": account_client.configured,
             "account_stream_configured": account_stream.configured,
             "tradingagents_configured": tradingagents.configured,
+            "tradingview": {**tradingview.status(), "worker": tradingview_worker.snapshot()},
         },
         "market_stream": {
             "connected": market_stream.connected,
             "fresh": market_stream.fresh,
             "last_message_at": market_stream.last_message_at,
             "last_error": market_stream.last_error,
+            "candles_connected": market_stream.candles_connected,
+            "candles_fresh": market_stream.candles_fresh,
+            "candles_last_message_at": market_stream.candles_last_message_at,
+            "candles_last_error": market_stream.candles_last_error,
         },
         "account_stream": {
+            "configured": account_stream.configured,
             "connected": account_stream.connected,
             "authenticated": account_stream.authenticated,
+            "account_ready": _account_stream_ready(),
             "last_message_at": account_stream.last_message_at,
             "last_error": account_stream.last_error,
         },
@@ -243,10 +314,12 @@ def system_status() -> dict[str, object]:
             "last_message_at": algo_stream.last_message_at,
             "last_error": algo_stream.last_error,
         },
-        "state_store": {"path": str(state_store.path)},
+        "private_stream": account_sync.private_stream_status(),
+        "state_store": {"ok": state_store.path.exists()},
         "automation_worker": automation_worker.snapshot(),
         "account_reconciler": account_reconciler.snapshot(),
         "live_safety": trade_client.live_gate.snapshot(),
+        "quarterly_history": quarterly_history.snapshot(),
         "safety_control": safety_controller.snapshot(),
         "safety": {
             "live_orders_allowed": trade_client.live_gate.allowed,
@@ -310,6 +383,143 @@ async def market_overview(
 @app.get("/api/v1/market/stream")
 def market_stream_snapshot() -> dict[str, Any]:
     return market_stream.snapshot()
+
+
+@app.get("/api/v1/market/events")
+async def market_events(
+    bar: Literal["1m", "15m", "1H", "4H"] = "15m",
+) -> StreamingResponse:
+    return StreamingResponse(
+        market_stream.events(bar),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
+
+
+class ChartAnnotationPoint(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    time: int = Field(gt=0, le=8640000000000000)
+    price: float = Field(gt=0)
+
+
+class ChartAnnotationEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    type: Literal["horizontal", "trend", "text"]
+    time: int | None = Field(default=None, gt=0, le=8640000000000000)
+    price: float | None = Field(default=None, gt=0)
+    start: ChartAnnotationPoint | None = None
+    end: ChartAnnotationPoint | None = None
+    text: str | None = Field(default=None, max_length=80)
+
+
+class ChartAnnotationBatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    annotations: list[ChartAnnotationEntry] = Field(default_factory=list, max_length=200)
+
+
+def _normalized_chart_annotation(item: ChartAnnotationEntry) -> dict[str, object]:
+    data = item.model_dump(exclude={"id"}, exclude_none=True, mode="json")
+    kind = data.get("type")
+    expected: dict[str, set[str]] = {
+        "horizontal": {"type", "price"},
+        "trend": {"type", "start", "end"},
+        "text": {"type", "time", "price", "text"},
+    }
+    if kind not in expected or set(data) != expected[kind]:
+        raise HTTPException(status_code=422, detail="invalid_chart_annotation_shape")
+    if kind == "text":
+        text = str(data["text"]).strip()
+        if not text:
+            raise HTTPException(status_code=422, detail="chart_annotation_text_required")
+        data["text"] = text
+    return {"id": item.id, **data}
+
+
+@app.get("/api/v1/market/annotations")
+def market_annotations(
+    inst_id: str = Query(
+        default="BTC-USDT-SWAP",
+        min_length=9,
+        max_length=40,
+        pattern=r"^[A-Z0-9]+-[A-Z0-9]+-SWAP$",
+    ),
+    bar: Literal["1m", "15m", "1H", "4H"] = "15m",
+    _: None = Depends(require_admin_token),
+) -> dict[str, object]:
+    return {
+        "data": state_store.list_chart_annotations(
+            account_client.account_scope,
+            inst_id,
+            bar,
+        )
+    }
+
+
+@app.put("/api/v1/market/annotations")
+def replace_market_annotations(
+    request: ChartAnnotationBatchRequest,
+    inst_id: str = Query(
+        default="BTC-USDT-SWAP",
+        min_length=9,
+        max_length=40,
+        pattern=r"^[A-Z0-9]+-[A-Z0-9]+-SWAP$",
+    ),
+    bar: Literal["1m", "15m", "1H", "4H"] = "15m",
+    _: None = Depends(require_admin_token),
+) -> dict[str, object]:
+    annotations = [_normalized_chart_annotation(item) for item in request.annotations]
+    try:
+        saved = state_store.replace_chart_annotations(
+            account_client.account_scope,
+            inst_id,
+            bar,
+            annotations,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"data": saved}
+
+
+@app.get("/api/v1/system/events")
+async def system_events() -> StreamingResponse:
+    return StreamingResponse(
+        control_events(system_status, analysis_status),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/v1/account/events")
+async def account_events(
+    x_admin_token: str | None = Header(default=None),
+    _: None = Depends(require_admin_token),
+) -> StreamingResponse:
+    def authorized() -> bool:
+        expected = os.getenv("ADMIN_API_TOKEN", "").strip()
+        return bool(expected and x_admin_token and secrets.compare_digest(x_admin_token, expected))
+
+    return StreamingResponse(
+        private_events(
+            state_store, account_stream, account_client, authorized,
+            lambda: market_client.rate_scope, private_connection_check.snapshot,
+        ),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/v1/account/connection-check")
+def private_connection_status(_: None = Depends(require_admin_token)) -> dict[str, object]:
+    return {"data": private_connection_check.snapshot()}
+
+
+@app.post("/api/v1/account/connection-check", status_code=202)
+async def start_private_connection_check(_: None = Depends(require_admin_token)) -> dict[str, object]:
+    try:
+        return {"data": private_connection_check.start()}
+    except PrivateProbeError as error:
+        raise HTTPException(status_code=409, detail=error.code) from None
 
 
 @app.get("/api/v1/account/overview")
@@ -463,7 +673,7 @@ async def run_worker_once(
 def stored_positions(
     _: None = Depends(require_admin_token),
 ) -> dict[str, object]:
-    return {"data": state_store.list_positions()}
+    return {"data": positions_with_lots(state_store, account_scope=account_client.account_scope)}
 
 
 @app.get("/api/v1/orders")
@@ -474,6 +684,114 @@ def stored_orders(
     return {"data": state_store.list_orders(limit)}
 
 
+@app.get("/api/v1/protection/handoffs")
+def stored_protection_handoffs(_: None = Depends(require_admin_token)) -> dict[str, object]:
+    return {"data": handoff_summaries(state_store, account_client.account_scope)}
+
+
+@app.get("/api/v1/protection/adjustments")
+def stored_protection_adjustments(_: None = Depends(require_admin_token)) -> dict[str, object]:
+    from .protection_adjustment import adjustment_summaries
+    return {"data": adjustment_summaries(state_store, account_client.account_scope)}
+
+
+@app.get("/api/v1/protection/incidents")
+def stored_protection_incidents(_: None = Depends(require_admin_token)) -> dict[str, object]:
+    return {"data": incident_summaries(state_store, account_client.account_scope)}
+
+
+class ProtectionReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    expected_version: int = Field(ge=0, strict=True)
+    resolution: Literal["resume", "position_closed"]
+    note: str = Field(min_length=3, max_length=500)
+
+
+@app.post("/api/v1/protection/{kind}/{record_id}/review")
+async def review_protection(
+    request: ProtectionReviewRequest,
+    kind: Literal["handoffs", "adjustments"],
+    record_id: str = RoutePath(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"),
+    _: None = Depends(require_admin_token),
+) -> dict[str, object]:
+    record = (state_store.protection_handoff if kind == "handoffs" else state_store.protection_adjustment)(record_id)
+    if not record or record["account_scope"] != account_client.account_scope:
+        raise HTTPException(status_code=404, detail="Protection maintenance record not found.")
+    singular = "handoff" if kind == "handoffs" else "adjustment"
+    try:
+        async with asyncio.timeout(45):
+            resolved = await ProtectionReviewer(state_store, account_sync).review(
+                singular, record, expected_version=request.expected_version,
+                resolution=request.resolution, note=request.note,
+            )
+    except (ProtectionReviewError, ExposureSnapshotChanged, HandoffError, OrderSnapshotConflict) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception:
+        raise HTTPException(status_code=502, detail="Protection review evidence unavailable.") from None
+    from .protection_adjustment import ADJUSTMENT_LABELS, adjustment_summaries
+    label = (HANDOFF_LABELS if kind == "handoffs" else ADJUSTMENT_LABELS).get(resolved["status"], "待核对")
+    await execution_engine.notify_event(
+        "protection_review_resolved", "OpenPerpDesk 保护维护复核完成",
+        f"{record['inst_id']} 的保护维护已复核，状态：{label}。复核接口未发出交易请求。",
+        payload={"kind": singular, "record_id": record_id, "status": resolved["status"]}, severity="warning",
+    )
+    return {
+        "accepted": True, "trading_performed": False,
+        "data": handoff_summaries(state_store, account_client.account_scope) if kind == "handoffs"
+        else adjustment_summaries(state_store, account_client.account_scope),
+    }
+
+
+class ProtectionIncidentResolutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    resolution: Literal["external_protection_verified", "position_closed"]
+    note: str = Field(min_length=3, max_length=500)
+    expected_version: int = Field(ge=0, strict=True)
+
+
+@app.post("/api/v1/protection/incidents/{incident_id}/resolve")
+async def resolve_protection_incident(
+    request: ProtectionIncidentResolutionRequest,
+    incident_id: str = RoutePath(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"),
+    _: None = Depends(require_admin_token),
+) -> dict[str, object]:
+    incident = state_store.protection_incident(incident_id)
+    if not incident or incident["account_scope"] != account_client.account_scope:
+        raise HTTPException(status_code=404, detail="Protection incident not found.")
+    if incident["version"] != request.expected_version or incident["status"] not in {"open", "review"}:
+        raise HTTPException(status_code=409, detail="Protection incident changed; refresh before resolving.")
+    if request.resolution == "position_closed":
+        if not account_client.configured:
+            raise HTTPException(status_code=503, detail="OKX private credentials are not configured.")
+        try:
+            async with asyncio.timeout(30):
+                snapshot = await account_sync.sync_rest()
+        except Exception:
+            raise HTTPException(status_code=502, detail="Account reconciliation failed; incident remains locked.") from None
+        if snapshot.get("errors"):
+            raise HTTPException(status_code=409, detail="Account snapshot is incomplete; incident remains locked.")
+        if account_client.account_scope != incident["account_scope"]:
+            raise HTTPException(status_code=409, detail="Account changed; incident remains locked.")
+    try:
+        resolved = state_store.resolve_protection_incident(
+            incident, resolution=request.resolution, note=request.note,
+        )
+    except ExposureSnapshotChanged as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if resolved is None:
+        raise HTTPException(status_code=409, detail="Protection incident changed; refresh before resolving.")
+    await execution_engine.notify_event(
+        "protection_incident_resolved",
+        "OpenPerpDesk 保护事故已解除",
+        f"{resolved['inst_id']} 的附带保护事故已由管理员复核解除：{request.resolution}。",
+        payload={"incident_id": incident_id, "resolution": request.resolution},
+        severity="warning",
+    )
+    return {"accepted": True, "data": incident_summaries(state_store, account_client.account_scope)}
+
+
 @app.get("/api/v1/fills")
 def stored_fills(
     limit: int = Query(default=100, ge=1, le=500),
@@ -482,12 +800,178 @@ def stored_fills(
     return {"data": state_store.list_fills(limit)}
 
 
+@app.get("/api/v1/account/bills")
+def account_bills(
+    limit: int = Query(default=100, ge=1, le=500),
+    _: None = Depends(require_admin_token),
+) -> dict[str, Any]:
+    return {
+        "configured": account_client.configured,
+        **state_store.bill_snapshot(account_client.account_scope, limit),
+    }
+
+
 @app.get("/api/v1/performance/pnl")
 def performance_pnl(
     limit: int = Query(default=500, ge=1, le=500),
     _: None = Depends(require_admin_token),
 ) -> dict[str, object]:
     return {"data": state_store.pnl_summary(limit)}
+
+
+class BillImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    start_day: date
+    end_day: date
+
+
+class BillArchiveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    year: int = Field(ge=2021, strict=True)
+    quarter: Literal["Q1", "Q2", "Q3", "Q4"]
+    retry: bool = False
+
+
+@app.post("/api/v1/account/bills/archives", status_code=202)
+async def request_bill_archive(
+    request: BillArchiveRequest, _: None = Depends(require_admin_token),
+) -> dict[str, Any]:
+    try:
+        return {"job": await quarterly_history.request(request.year, request.quarter, retry=request.retry)}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except OkxAccountError as exc:
+        raise HTTPException(status_code=503, detail="OKX read-only credentials are not configured") from exc
+
+
+@app.get("/api/v1/account/bills/archives")
+def bill_archives(_: None = Depends(require_admin_token)) -> dict[str, Any]:
+    return {"data": state_store.bill_archives(account_client.account_scope)}
+
+
+@app.post("/api/v1/account/bills/archives/{job_id}/cancel")
+def cancel_bill_archive(
+    job_id: str = RoutePath(min_length=32, max_length=32, pattern=r"^[a-f0-9]+$"),
+    _: None = Depends(require_admin_token),
+) -> dict[str, Any]:
+    if not state_store.cancel_bill_archive(job_id, account_client.account_scope):
+        raise HTTPException(status_code=404, detail="Bill archive not found")
+    return {"data": state_store.bill_archives(account_client.account_scope)}
+
+
+@app.post("/api/v1/account/bills/imports", status_code=202)
+async def import_account_bills(
+    request: BillImportRequest, _: None = Depends(require_admin_token),
+) -> dict[str, Any]:
+    try:
+        return {"job": await account_history.start(request.start_day, request.end_day)}
+    except BillImportBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except OkxAccountError as exc:
+        raise HTTPException(status_code=503, detail="OKX read-only credentials are not configured") from exc
+
+
+@app.get("/api/v1/account/bills/imports")
+def latest_bill_import(_: None = Depends(require_admin_token)) -> dict[str, Any]:
+    return {"job": state_store.bill_import(account_client.account_scope)}
+
+
+@app.get("/api/v1/account/bills/imports/{job_id}")
+def bill_import_status(
+    job_id: str = RoutePath(min_length=32, max_length=32, pattern=r"^[a-f0-9]+$"),
+    _: None = Depends(require_admin_token),
+) -> dict[str, Any]:
+    job = state_store.bill_import(account_client.account_scope, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Bill import not found")
+    return {"job": job}
+
+
+@app.get("/api/v1/account/bills/history")
+def historical_account_bills(
+    start_day: date, end_day: date,
+    limit: int = Query(default=100, ge=1, le=500),
+    before_ts: int | None = Query(default=None, gt=0),
+    before_id: str | None = Query(default=None, min_length=1, max_length=128),
+    _: None = Depends(require_admin_token),
+) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    try:
+        days = history_days(start_day, end_day, now=now)
+        report = state_store.bill_history(
+            account_client.account_scope, days, limit=limit, before_ts=before_ts, before_id=before_id,
+            rate_scope=market_client.rate_scope,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"configured": account_client.configured, "archive_first_day": archive_first_day(now).isoformat(), **report}
+
+
+@app.post("/api/v1/account/bills/valuation", status_code=202)
+async def request_bill_valuation(
+    request: BillImportRequest, _: None = Depends(require_admin_token),
+) -> dict[str, Any]:
+    try:
+        days = history_days(request.start_day, request.end_day, now=datetime.now(timezone.utc))
+        job = await asyncio.to_thread(
+            state_store.create_bill_valuation, account_client.account_scope, market_client.rate_scope, days,
+        )
+    except BillImportBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    account_valuation.notify()
+    return {"job": job}
+
+
+@app.post("/api/v1/account/performance/collect", status_code=202)
+async def collect_account_performance(
+    request: BillImportRequest, _: None = Depends(require_admin_token),
+) -> dict[str, Any]:
+    if not account_client.configured:
+        raise HTTPException(status_code=503, detail="OKX read-only credentials are not configured")
+    now = datetime.now(timezone.utc)
+    try:
+        days = history_days(request.start_day, request.end_day, now=now, importing=True)
+        result = await asyncio.to_thread(
+            state_store.schedule_performance, account_client.account_scope, market_client.rate_scope,
+            days, int(now.timestamp() * 1000), retry=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    account_performance.notify()
+    return result
+
+
+@app.post("/api/v1/account/performance/cancel")
+async def cancel_account_performance(
+    request: BillImportRequest, _: None = Depends(require_admin_token),
+) -> dict[str, int]:
+    try:
+        days = history_days(request.start_day, request.end_day, now=datetime.now(timezone.utc))
+        count = await asyncio.to_thread(
+            state_store.cancel_performance, account_client.account_scope, market_client.rate_scope, days,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"canceled": count}
+
+
+@app.get("/api/v1/account/bills/valuation")
+def latest_bill_valuation(_: None = Depends(require_admin_token)) -> dict[str, Any]:
+    return {"job": state_store.bill_valuation(account_client.account_scope)}
+
+
+@app.post("/api/v1/account/bills/valuation/{job_id}/cancel")
+def cancel_bill_valuation(
+    job_id: str = RoutePath(min_length=32, max_length=32, pattern=r"^[a-f0-9]+$"),
+    _: None = Depends(require_admin_token),
+) -> dict[str, Any]:
+    if not state_store.cancel_bill_valuation(job_id, account_client.account_scope):
+        raise HTTPException(status_code=404, detail="Valuation not found")
+    return {"job": state_store.bill_valuation(account_client.account_scope)}
 
 
 @app.get("/api/v1/performance/report")
@@ -538,14 +1022,25 @@ class SafetyReasonRequest(BaseModel):
 
 @app.get("/api/v1/safety/status")
 def safety_status() -> dict[str, object]:
-    return safety_controller.snapshot()
+    snapshot = safety_controller.snapshot()
+    execution_enabled = trade_client.enabled
+    live_execution_allowed = trade_client.live_gate.allowed
+    return {
+        **snapshot,
+        "execution_enabled": execution_enabled,
+        "live_execution_allowed": live_execution_allowed,
+        "order_submission_allowed": (
+            snapshot["execution_allowed"] and execution_enabled
+        ),
+    }
 
 
 @app.post("/api/v1/safety/emergency-stop")
-def emergency_stop(
+async def emergency_stop(
     request: SafetyReasonRequest,
     _: None = Depends(require_admin_token),
 ) -> dict[str, object]:
+    trade_client.live_gate.lock()
     safety_controller.stop(request.reason)
     state_store.add_audit(
         "emergency_stop",
@@ -553,11 +1048,18 @@ def emergency_stop(
         severity="warning",
         payload={"reason": request.reason},
     )
+    await execution_engine.notify_event(
+        "emergency_stop",
+        "OpenPerpDesk 已触发急停",
+        f"新订单已停止放行，实盘闸门已回锁：{request.reason}。",
+        payload={"reason": request.reason},
+        severity="warning",
+    )
     return safety_controller.snapshot()
 
 
 @app.post("/api/v1/safety/resume")
-def resume_trading(
+async def resume_trading(
     request: SafetyReasonRequest,
     _: None = Depends(require_admin_token),
 ) -> dict[str, object]:
@@ -567,14 +1069,23 @@ def resume_trading(
         "Emergency stop released",
         payload={"reason": request.reason},
     )
+    await execution_engine.notify_event(
+        "emergency_resume",
+        "OpenPerpDesk 已解除急停",
+        f"急停闸门已解除，实盘仍需独立人工解锁：{request.reason}。",
+        payload={"reason": request.reason},
+    )
     return safety_controller.snapshot()
 
 
 @app.post("/api/v1/safety/live/unlock")
-def unlock_live(
+async def unlock_live(
     request: LiveUnlockRequest,
     _: None = Depends(require_admin_token),
 ) -> dict[str, object]:
+    if safety_controller.emergency_stopped:
+        trade_client.live_gate.lock()
+        raise HTTPException(status_code=423, detail="Live safety unlock is blocked while emergency stop is active.")
     unlocked = trade_client.live_gate.unlock(request.phrase)
     if not unlocked:
         raise HTTPException(status_code=403, detail="Live safety unlock rejected.")
@@ -583,19 +1094,35 @@ def unlock_live(
         "Live safety gate unlocked in process memory",
         severity="warning",
     )
-    return {"unlocked": True, "live_safety": trade_client.live_gate.snapshot()}
+    # The gate remains process-local and is still fail-closed after restart.
+    await execution_engine.notify_event(
+        "live_safety_unlocked",
+        "OpenPerpDesk 实盘闸门已解锁",
+        "实盘安全闸门已在当前进程内人工解锁。",
+        severity="warning",
+    )
+    snapshot = trade_client.live_gate.snapshot()
+    return {"unlocked": snapshot["unlocked"], "live_safety": snapshot}
 
 
 @app.post("/api/v1/safety/live/lock")
-def lock_live(
+async def lock_live(
     _: None = Depends(require_admin_token),
 ) -> dict[str, object]:
     trade_client.live_gate.lock()
     state_store.add_audit("live_safety_locked", "Live safety gate locked")
-    return {"unlocked": False, "live_safety": trade_client.live_gate.snapshot()}
+    await execution_engine.notify_event(
+        "live_safety_locked",
+        "OpenPerpDesk 实盘闸门已锁定",
+        "实盘安全闸门已锁定，后续实盘订单将被阻止。",
+        severity="warning",
+    )
+    snapshot = trade_client.live_gate.snapshot()
+    return {"unlocked": snapshot["unlocked"], "live_safety": snapshot}
 
 
 class RiskEvaluateRequest(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
     signal: TradeSignal
     account_equity: float = Field(gt=0.0)
     daily_pnl_pct: float
@@ -606,6 +1133,7 @@ class AnalysisRequest(BaseModel):
     inst_id: str = Field(default="BTC-USDT-SWAP", min_length=9, max_length=40)
     bar: str = Field(default="15m", pattern=r"^[0-9]+[mHhDWMw]$")
     limit: int = Field(default=100, ge=20, le=300)
+    run_mode: Literal["fast", "full"] | None = None
     strategy_id: str = Field(
         default="structured-technical",
         min_length=1,
@@ -615,6 +1143,7 @@ class AnalysisRequest(BaseModel):
 
 
 class BacktestRequest(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
     inst_id: str = Field(default="BTC-USDT-SWAP", min_length=9, max_length=40)
     bar: str = Field(default="15m", pattern=r"^[0-9]+[mHhDWMw]$")
     limit: int = Field(default=300, ge=30, le=300)
@@ -641,11 +1170,16 @@ def _strategy_config(strategy_id: str) -> dict[str, object]:
 def analysis_status() -> dict[str, object]:
     return {
         "structured_strategy": {"available": True, "source": "structured-technical"},
-        "tradingagents": {
-            "enabled": tradingagents.enabled,
-            "configured": tradingagents.configured,
-        },
+        "tradingagents": tradingagents.status(),
     }
+
+
+@app.post("/api/v1/analysis/ai/check")
+async def check_ai_runtime(_: None = Depends(require_admin_token)) -> dict[str, object]:
+    try:
+        return {"data": await tradingagents.check_ready()}
+    except AIAnalysisError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
 
 async def _ai_market_context(
@@ -750,6 +1284,8 @@ async def run_ai_analysis(
     _: None = Depends(require_admin_token),
 ) -> dict[str, object]:
     try:
+        if tradingagents.configuration_error:
+            raise AIAnalysisError(tradingagents.configuration_error)
         market_context = await _ai_market_context(
             request.inst_id,
             request.bar,
@@ -758,10 +1294,16 @@ async def run_ai_analysis(
         analysis = await tradingagents.analyze(
             request.inst_id,
             market_context=market_context,
+            run_mode=request.run_mode,
         )
     except AIAnalysisError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    state_store.save_analysis(
+        state_store.add_audit(
+            "ai_analysis_failed",
+            "TradingAgents research did not complete",
+            payload={"inst_id": request.inst_id, "code": exc.code},
+        )
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    saved = state_store.save_analysis(
         {
             "inst_id": request.inst_id,
             "source": "TradingAgents",
@@ -773,9 +1315,9 @@ async def run_ai_analysis(
     state_store.add_audit(
         "ai_analysis_completed",
         "TradingAgents analysis completed",
-        payload={"inst_id": request.inst_id},
+        payload={"inst_id": request.inst_id, "mode": analysis.get("mode")},
     )
-    return {"data": analysis}
+    return {"data": {**analysis, "id": saved["id"], "created_at": saved["created_at"]}}
 
 
 @app.get("/api/v1/analysis")
@@ -786,13 +1328,101 @@ def analysis_history(
     return {"data": state_store.list_analyses(limit)}
 
 
+@app.get("/api/v1/analysis/history")
+def analysis_index(
+    limit: int = Query(default=20, ge=1, le=50),
+    before_id: int | None = Query(default=None, ge=1),
+    inst_id: str | None = Query(default=None, min_length=1, max_length=64),
+    source: str | None = Query(default=None, min_length=1, max_length=64),
+    _: None = Depends(require_admin_token),
+) -> dict[str, object]:
+    return state_store.analysis_index(
+        limit, before_id=before_id, inst_id=inst_id, source=source
+    )
+
+
+@app.get("/api/v1/analysis/{analysis_id}")
+def analysis_detail(
+    analysis_id: int,
+    _: None = Depends(require_admin_token),
+) -> dict[str, object]:
+    record = state_store.get_analysis(analysis_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Analysis not found.")
+    return {"data": record}
+
+
 class SignalExecutionRequest(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
     signal: TradeSignal
     account_equity: float = Field(gt=0.0)
     daily_pnl_pct: float
     current_notional: float = Field(default=0.0, ge=0.0)
     size: float = Field(default=1.0, gt=0.0)
     dry_run: bool = False
+
+
+@app.post("/api/v1/integrations/tradingview/webhook", status_code=202)
+async def tradingview_webhook(
+    request: Request,
+    x_tradingview_token: str | None = Header(default=None),
+) -> dict[str, object]:
+    """Receive a TradingView alert without exposing the private admin API."""
+    if not tradingview.enabled():
+        raise HTTPException(status_code=404, detail="tradingview_integration_disabled")
+    if not tradingview.configured():
+        raise HTTPException(status_code=503, detail="tradingview_secret_not_configured")
+    async def bounded_body() -> bytes:
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > tradingview.MAX_BODY_BYTES:
+                raise HTTPException(status_code=413, detail="payload_too_large")
+            body.extend(chunk)
+        return bytes(body)
+
+    try:
+        body = await asyncio.wait_for(bounded_body(), 1)
+    except TimeoutError as exc:
+        raise HTTPException(status_code=408, detail="webhook_body_timeout") from exc
+    try:
+        payload = tradingview.parse_body(body)
+    except tradingview.TradingViewWebhookError as exc:
+        raise HTTPException(status_code=422, detail=exc.code) from exc
+    if not tradingview.verify_secret(payload, x_tradingview_token):
+        raise HTTPException(status_code=401, detail="invalid_tradingview_secret")
+    try:
+        signal, size, side, alert_id = tradingview.to_signal(payload, body=body)
+        context = tradingview.numeric_context()
+    except tradingview.TradingViewWebhookError as exc:
+        raise HTTPException(status_code=422, detail=exc.code) from exc
+    dry_run = tradingview.execution_dry_run(payload)
+    try:
+        created, receipt = await asyncio.to_thread(
+            state_store.enqueue_tradingview_alert, alert_id,
+            tradingview.instruction_fingerprint(payload, signal, size, side),
+            {
+                "signal": signal.model_dump(mode="json"), "context": context,
+                "size": size, "side": side, "dry_run": dry_run,
+                "execution_scope": tradingview_worker.execution_scope(),
+                "client_order_id": execution_engine.client_order_id(signal, f"tradingview:{alert_id}") if not dry_run else None,
+            },
+        )
+    except TradingViewAlertConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TradingViewQueueFull as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except sqlite3.OperationalError as exc:
+        raise HTTPException(status_code=503, detail="tradingview_inbox_unavailable") from exc
+    tradingview_worker.notify()
+    return {"accepted": True, "idempotent": not created, **receipt}
+
+
+@app.get("/api/v1/integrations/tradingview/alerts")
+def tradingview_alerts(
+    limit: int = Query(default=30, ge=1, le=100),
+    _: None = Depends(require_admin_token),
+) -> dict[str, object]:
+    return {"data": state_store.list_tradingview_alerts(limit)}
 
 
 @app.post("/api/v1/execution/signals")
@@ -883,10 +1513,12 @@ async def cancel_stored_order(
             status_code=409,
             detail="Order has no exchange order ID and cannot be canceled.",
         )
-    if order.get("status") in {"canceled", "filled", "failed", "rejected"}:
+    if order.get("status") in {"canceled", "filled", "failed", "rejected", "effective", "triggered", "expired", "order_failed", "mmp_canceled"}:
         return {"accepted": False, "idempotent": True, "order": order}
+    is_algo = order.get("order_kind") == "algo"
     try:
-        response = await trade_client.cancel_order(
+        cancel = trade_client.cancel_algo_order if is_algo else trade_client.cancel_order
+        response = await cancel(
             str(order["inst_id"]),
             exchange_order_id,
         )
@@ -897,22 +1529,36 @@ async def cancel_stored_order(
     cancel_succeeded = (
         bool(response_row)
         and str(response_row.get("sCode", "0")) == "0"
+        and str(response_row.get("algoId" if is_algo else "ordId")) == exchange_order_id
     )
     updated = {
         **order,
-        "status": "canceled" if cancel_succeeded else "cancel_failed",
+        "status": "canceling" if cancel_succeeded else "cancel_failed",
         "raw": response,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     saved = state_store.save_order(updated)
     state_store.add_audit(
-        "order_canceled" if saved["status"] == "canceled" else "order_cancel_failed",
+        "order_cancel_requested" if cancel_succeeded else "order_cancel_failed",
         "Stored order cancellation requested",
-        severity="info" if saved["status"] == "canceled" else "warning",
+        severity="info" if cancel_succeeded else "warning",
         payload={"client_order_id": client_order_id},
     )
+    await execution_engine.notify_event(
+        "order_cancel_requested" if cancel_succeeded else "order_cancel_failed",
+        "OpenPerpDesk 撤单结果",
+        (
+            f"{order['inst_id']} 客户端订单 {client_order_id} "
+            f"{'撤单请求已受理，最终状态以交易所回报为准' if cancel_succeeded else '撤单请求未确认'}。"
+        ),
+        payload={
+            "client_order_id": client_order_id,
+            "status": saved["status"],
+        },
+        severity="info" if cancel_succeeded else "warning",
+    )
     return {
-        "accepted": saved["status"] == "canceled",
+        "accepted": cancel_succeeded,
         "idempotent": False,
         "order": saved,
         "exchange": response,
@@ -964,7 +1610,7 @@ def notifications_status() -> dict[str, object]:
 
 class NotificationTestRequest(BaseModel):
     title: str = Field(default="OpenPerpDesk 测试通知", min_length=1, max_length=80)
-    content: str = Field(default="PushPlus 通知链路测试成功。", min_length=1, max_length=2000)
+    content: str = Field(default="来自 OpenPerpDesk 的通知链路测试，请核对微信是否收到。", min_length=1, max_length=2000)
 
 
 @app.post("/api/v1/notifications/test")
@@ -974,13 +1620,27 @@ async def notification_test(
 ) -> dict[str, object]:
     try:
         result = await execution_engine.notify(request.title, request.content)
+        if result.get("accepted") is not True or result.get("delivery_confirmed") is not False:
+            raise PushPlusError("pushplus_acceptance_unknown")
+    except PushPlusError as exc:
+        state_store.add_audit(
+            "notification_test_unconfirmed" if exc.acceptance_unknown else "notification_test_rejected",
+            "PushPlus test request was not confirmed" if exc.acceptance_unknown else "PushPlus test request was rejected",
+            severity="warning", payload={"error": exc.code, "acceptance_unknown": exc.acceptance_unknown},
+        )
+        raise HTTPException(status_code=503 if exc.code == "pushplus_unconfigured" else 502, detail=exc.code) from None
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        state_store.add_audit(
+            "notification_test_unconfirmed", "PushPlus test request was not confirmed",
+            severity="warning", payload={"error": type(exc).__name__, "acceptance_unknown": True},
+        )
+        raise HTTPException(status_code=502, detail="pushplus_acceptance_unknown") from None
     state_store.add_audit(
-        "notification_sent",
-        "PushPlus test notification sent",
+        "notification_accepted",
+        "PushPlus accepted the test request; WeChat delivery is unverified",
+        payload={"message_id": result.get("message_id"), "delivery_confirmed": False},
     )
-    return {"sent": True, "result": result}
+    return {"accepted": True, "delivery_confirmed": False, "result": result}
 
 
 _module_path = Path(__file__).resolve()
