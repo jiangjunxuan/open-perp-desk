@@ -123,7 +123,8 @@ class ProtectiveMarkWorkerTests(unittest.IsolatedAsyncioTestCase):
             "signal": signal.model_dump(mode="json"), "report": {},
         }))
         self.engine = ExecutionEngine(
-            self.store, RiskEngine(RiskLimits()), SimpleNamespace(enabled=False),
+            self.store, RiskEngine(RiskLimits()),
+            SimpleNamespace(enabled=False, trading_mode="demo", demo=True),
             SimpleNamespace(configured=False),
         )
         self.engine.submit_signal = AsyncMock(return_value={"accepted": True, "idempotent": False})

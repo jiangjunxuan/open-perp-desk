@@ -259,6 +259,30 @@ class TradingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(paths.count("/api/v5/trade/cancel-algos"), 1)
         self.assertEqual(self.exchange.errors, [])
 
+    async def test_worker_control_inherits_safe_preview_from_invalid_startup_value(self):
+        await self.api.request("PUT", "/strategies/structured-technical", {
+            "name": "Local preview acceptance strategy", "enabled": True, "config": {},
+        })
+        for value in ("", "tru"):
+            with self.subTest(value=value):
+                await self.api.stop()
+                self.api.environment["AUTO_TRADING_DRY_RUN"] = value
+                await self.api.start()
+                started = await self.api.request("POST", "/worker/control", {"enabled": True})
+                self.assertTrue(started["dry_run"])
+                try:
+                    async def completed():
+                        return (await self.api.request("GET", "/worker/status"))["run_count"] >= 1
+                    await eventually(completed)
+                finally:
+                    await self.api.request("POST", "/worker/control", {"enabled": False})
+                orders = (await self.api.request("GET", "/orders"))["data"]
+                self.assertTrue(orders)
+                self.assertTrue(all(row["status"] == "preview" for row in orders))
+                self.assertEqual(self.exchange.order_submissions, [])
+                self.assertEqual(self.exchange.posts, [])
+                self.assertEqual(self.exchange.errors, [])
+
     async def test_worker_dry_run_execution_and_protective_close(self):
         await self.api.request("PUT", "/strategies/structured-technical", {
             "name": "Local acceptance strategy", "enabled": True, "config": {},

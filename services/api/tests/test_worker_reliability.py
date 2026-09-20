@@ -1,11 +1,15 @@
 import asyncio
+import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from app.automation_worker import AutomationWorker
+from app.live_safety import LiveSafetyGate
 from app.okx_account import OkxAccountError
+from app.okx_trade import OkxTradeClient
 from app.state_store import StateStore
 
 
@@ -24,6 +28,49 @@ class WorkerReliabilityTests(unittest.IsolatedAsyncioTestCase):
         worker.enabled = True
         worker.dry_run = True
         return worker
+
+    def test_only_explicit_false_disables_startup_dry_run(self):
+        for value in (None, "", " ", "tru", "0", "off", "FALSEE", "true", "TRUE", " true ", "false", "FALSE", " false "):
+            with self.subTest(value=value), patch.dict(os.environ, {}, clear=True):
+                if value is not None:
+                    os.environ["AUTO_TRADING_DRY_RUN"] = value
+                worker = AutomationWorker(
+                    object(), object(), object(), object(), object(), object(), self.store,
+                )
+                expected = value is None or value.strip().lower() != "false"
+                self.assertEqual(worker.dry_run, expected)
+                self.assertEqual(worker.snapshot()["dry_run"], expected)
+
+    async def test_worker_rejects_live_execution_even_with_unlocked_live_client(self):
+        with patch.dict(os.environ, {
+            "EXECUTION_ENABLED": "true", "TRADING_MODE": "live", "OKX_DEMO": "false",
+            "LIVE_TRADING_ENABLED": "true", "LIVE_UNLOCK_PHRASE": "fixture-unlock",
+            "OKX_API_KEY": "fixture-key", "OKX_SECRET_KEY": "fixture-secret",
+            "OKX_PASSPHRASE": "fixture-passphrase",
+        }, clear=True):
+            gate = LiveSafetyGate()
+            self.assertTrue(gate.unlock("fixture-unlock"))
+            client = OkxTradeClient(live_gate=gate)
+            self.assertTrue(client.enabled)
+            sync = SimpleNamespace(sync_stream=Mock())
+            worker = self.worker(sync=sync)
+            worker.execution = SimpleNamespace(trade_client=client)
+            worker.dry_run = False
+            result = await worker.run_once()
+            self.assertFalse(result["ran"])
+            self.assertEqual(result["reason"], "Demo execution is disabled")
+            sync.sync_stream.assert_not_called()
+
+    async def test_enabled_demo_client_reaches_strategy_check(self):
+        worker = self.worker()
+        worker.execution = SimpleNamespace(trade_client=SimpleNamespace(
+            enabled=True, demo=True, trading_mode="demo",
+        ))
+        worker.dry_run = False
+        with patch.object(self.store, "get_strategy", return_value=None) as lookup:
+            result = await worker.run_once()
+        self.assertEqual(result["reason"], "strategy_not_found:structured-technical")
+        lookup.assert_called_once_with("structured-technical")
 
     async def test_partial_account_snapshot_stops_cycle_before_any_market_or_order(self):
         class Account:

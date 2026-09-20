@@ -56,7 +56,7 @@ class AutomationWorker:
         self.market_data_fresh = market_data_fresh or (lambda: True)
         self.notifier = notifier
         self.enabled = os.getenv("AUTO_TRADING_ENABLED", "false").lower() == "true"
-        self.dry_run = os.getenv("AUTO_TRADING_DRY_RUN", "true").lower() == "true"
+        self.dry_run = os.getenv("AUTO_TRADING_DRY_RUN", "true").strip().lower() != "false"
         self.strategy_id = os.getenv(
             "AUTO_TRADING_STRATEGY_ID",
             "structured-technical",
@@ -128,8 +128,10 @@ class AutomationWorker:
             return {"ran": False, "reason": "AUTO_TRADING_ENABLED is false"}
         if not self.safety.execution_allowed:
             return {"ran": False, "reason": "emergency stop is active"}
-        if not self.dry_run and not self.execution.trade_client.enabled:
-            return {"ran": False, "reason": "Demo execution is disabled"}
+        if not self.dry_run:
+            client = self.execution.trade_client
+            if not client.enabled or client.trading_mode != "demo" or client.demo is not True:
+                return {"ran": False, "reason": "Demo execution is disabled"}
         strategy_record = self.store.get_strategy(self.strategy_id)
         if not strategy_record:
             return {
