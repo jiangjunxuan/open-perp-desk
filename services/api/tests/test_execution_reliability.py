@@ -66,6 +66,7 @@ class ExecutionReliabilityTests(unittest.IsolatedAsyncioTestCase):
         return ExecutionEngine(
             self.store, RiskEngine(RiskLimits()), trade, DisabledPushPlus(),
             preflight=LifecyclePreflight(self.store),
+            private_stream_ready=lambda: True,
         )
 
     async def submit(self, engine=None, **kwargs):

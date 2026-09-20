@@ -117,6 +117,35 @@ class LocalExchange:
 
 
 class WebSocketTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_private_observers_receive_connect_login_data_and_disconnect(self):
+        exchange = LocalExchange()
+        async with serve(exchange.handler, "127.0.0.1", 0) as server:
+            with patch.dict(os.environ, exchange.environment(server.sockets[0].getsockname()[1]), clear=True):
+                account, algo = OkxAccountStream(), OkxAlgoOrderStream()
+            account_events, algo_events = [], []
+            account.on_update = lambda: account_events.append((
+                account.connected, account.authenticated, len(account.balance),
+            ))
+            algo.on_update = lambda: algo_events.append((
+                algo.connected, algo.authenticated, len(algo.orders),
+            ))
+            try:
+                await asyncio.gather(account.start(), algo.start())
+                await wait_for(lambda: account.account_ready and algo.orders)
+                self.assertIn((True, False, 0), account_events)
+                self.assertIn((True, True, 0), account_events)
+                self.assertIn((True, True, 1), account_events)
+                self.assertIn((True, False, 0), algo_events)
+                self.assertIn((True, True, 0), algo_events)
+                self.assertIn((True, True, 1), algo_events)
+                await asyncio.gather(*(socket.close() for socket in list(exchange.sockets.values())))
+                await wait_for(lambda: not account.connected and not algo.connected)
+                self.assertEqual(account_events[-1], (False, False, 0))
+                self.assertEqual(algo_events[-1][:2], (False, False))
+            finally:
+                await asyncio.gather(account.stop(), algo.stop())
+            self.assertEqual(exchange.errors, [])
+
     async def test_real_sockets_login_subscribe_and_cache_four_streams(self):
         exchange = LocalExchange()
         async with serve(exchange.handler, "127.0.0.1", 0) as server:

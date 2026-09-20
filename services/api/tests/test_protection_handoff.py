@@ -46,6 +46,7 @@ class ProtectionHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.engine = ExecutionEngine(
             self.store, RiskEngine(), self.trade, SimpleNamespace(configured=False),
             preflight=OrderPreflight(self.account, self.market, self.store),
+            private_stream_ready=lambda: True,
         )
         self.manager = ProtectionHandoff(self.store, self.sync, self.engine)
 

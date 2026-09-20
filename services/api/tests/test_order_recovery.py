@@ -558,7 +558,10 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
             inst_id="BTC-USDT-SWAP", action="open_long", confidence=.9,
             leverage=2, position_pct=5, entry_price=100, stop_loss=95, take_profit=110,
         )
-        engine = ExecutionEngine(self.store, RiskEngine(), Trade(), SimpleNamespace(configured=False), preflight=Preflight())
+        engine = ExecutionEngine(
+            self.store, RiskEngine(), Trade(), SimpleNamespace(configured=False),
+            preflight=Preflight(), private_stream_ready=lambda: True,
+        )
         with self.assertRaises(TimeoutError):
             await engine.submit_signal(signal, account_equity=1000, daily_pnl_pct=0)
         local_id = self.store.list_orders()[0]["client_order_id"]
@@ -619,7 +622,10 @@ class Trade:
             connection.execute("CREATE TABLE crash_drill_sends (client_id TEXT)")
             connection.execute("INSERT INTO crash_drill_sends VALUES (?)", (order.cl_ord_id,))
         os._exit(23)
-engine = ExecutionEngine(store, RiskEngine(), Trade(), SimpleNamespace(configured=False), preflight=Preflight())
+engine = ExecutionEngine(
+    store, RiskEngine(), Trade(), SimpleNamespace(configured=False),
+    preflight=Preflight(), private_stream_ready=lambda: True,
+)
 asyncio.run(engine.submit_signal(signal, account_equity=1000, daily_pnl_pct=0))
 """
         process = await asyncio.to_thread(

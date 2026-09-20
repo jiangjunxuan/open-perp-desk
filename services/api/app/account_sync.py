@@ -85,6 +85,45 @@ class AccountSynchronizer:
         self._position_times: dict[str, int] = {}
         self._rest_lock = asyncio.Lock()
 
+    def private_stream_status(self) -> dict[str, Any]:
+        """Return a secret-free readiness view for both authenticated streams."""
+        account_configured = getattr(self.account_stream, "configured", False) is True
+        account_connected = getattr(self.account_stream, "connected", False) is True
+        account_authenticated = getattr(self.account_stream, "authenticated", False) is True
+        algo_configured = getattr(self.algo_stream, "configured", False) is True
+        algo_connected = getattr(self.algo_stream, "connected", False) is True
+        algo_authenticated = getattr(self.algo_stream, "authenticated", False) is True
+        configured = account_configured and algo_configured
+        ready = bool(
+            configured
+            and account_connected
+            and account_authenticated
+            and algo_connected
+            and algo_authenticated
+        )
+        if ready:
+            reason_code = None
+        elif not configured:
+            reason_code = "private_stream_not_configured"
+        elif not account_connected or not account_authenticated:
+            reason_code = "account_stream_not_ready"
+        elif not algo_connected or not algo_authenticated:
+            reason_code = "algo_stream_not_ready"
+        else:
+            reason_code = "private_stream_not_ready"
+        return {
+            "configured": configured,
+            "ready": ready,
+            "account_connected": account_connected,
+            "account_authenticated": account_authenticated,
+            "algo_connected": algo_connected,
+            "algo_authenticated": algo_authenticated,
+            "reason_code": reason_code,
+        }
+
+    def private_stream_ready(self) -> bool:
+        return bool(self.private_stream_status()["ready"])
+
     @staticmethod
     def _validate_local_order(order: dict[str, Any], item: dict[str, Any]) -> None:
         if order["source"].startswith("okx-"):

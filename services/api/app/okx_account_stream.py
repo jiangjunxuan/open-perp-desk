@@ -41,6 +41,15 @@ class OkxAccountStream:
         self._task: asyncio.Task[None] | None = None
         self.on_update: Callable[[], None] | None = None
 
+    def _notify_update(self) -> None:
+        if self.on_update is None:
+            return
+        try:
+            self.on_update()
+        except Exception:
+            # Stream transport must not be terminated by an observer callback.
+            return
+
     @property
     def configured(self) -> bool:
         return all((self.api_key, self.secret_key, self.passphrase))
@@ -113,6 +122,7 @@ class OkxAccountStream:
                     self.authenticated = False
                     self.balance = []
                     self.last_error = None
+                    self._notify_update()
                     delay = 1.0
                     await socket.send(json.dumps(self.login_message()))
                     async for raw in socket_messages(socket):
@@ -137,6 +147,7 @@ class OkxAccountStream:
                 self.connected = False
                 self.authenticated = False
                 self.balance = []
+                self._notify_update()
             await asyncio.sleep(delay)
             delay = min(delay * 2, 30.0)
 
@@ -151,6 +162,7 @@ class OkxAccountStream:
             else:
                 self.authenticated = False
                 self.last_error = "login_failed"
+            self._notify_update()
             return
 
         if message.get("event") in {"subscribe", "channel-conn-count"}:
@@ -199,8 +211,8 @@ class OkxAccountStream:
                     and fill_price > 0
                 ):
                     self.fills[trade_id] = item
-        if channel in {"positions", "orders"} and self.on_update is not None:
-            self.on_update()
+        if channel in {"account", "positions", "orders"}:
+            self._notify_update()
 
     @staticmethod
     def _position_key(position: dict[str, Any]) -> str:

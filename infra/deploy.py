@@ -89,6 +89,12 @@ def validate_config(config: dict, *, recovery: bool = False) -> dict:
     if booleans["AUTO_TRADING_ENABLED"] and not booleans["AUTO_TRADING_DRY_RUN"]:
         if not booleans["EXECUTION_ENABLED"] or mode == "live":
             failures.append("Non-dry-run automation requires enabled Demo execution")
+    try:
+        private_stream_grace = float(environment.get("PRIVATE_STREAM_ALERT_GRACE_SECONDS", "30"))
+        if not math.isfinite(private_stream_grace) or not 0 <= private_stream_grace <= 3600:
+            raise ValueError
+    except ValueError:
+        failures.append("PRIVATE_STREAM_ALERT_GRACE_SECONDS must be finite and between 0 and 3600")
     if booleans["TRADINGAGENTS_ENABLED"] and not environment.get("TRADINGAGENTS_PATH", "").strip():
         failures.append("TradingAgents requires TRADINGAGENTS_PATH")
     prebuilt = environment.get("OPENPERPDESK_USE_PREBUILT_IMAGES", "false").strip().lower()

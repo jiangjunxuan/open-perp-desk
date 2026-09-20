@@ -89,6 +89,7 @@ account_sync = AccountSynchronizer(
     algo_stream,
     notifier=execution_engine.notify_event,
 )
+execution_engine.private_stream_ready = account_sync.private_stream_ready
 account_reconciler = AccountReconciler(
     account_sync,
     state_store,
@@ -244,6 +245,7 @@ def health_metrics() -> dict[str, object]:
             "last_message_at": algo_stream.last_message_at,
             "last_error": algo_stream.last_error,
         },
+        "private_stream": account_sync.private_stream_status(),
         "automation_worker": automation_worker.snapshot(),
         "account_reconciler": account_reconciler.snapshot(),
         "equity_baseline": equity_baseline.snapshot(),
@@ -312,6 +314,7 @@ def system_status() -> dict[str, object]:
             "last_message_at": algo_stream.last_message_at,
             "last_error": algo_stream.last_error,
         },
+        "private_stream": account_sync.private_stream_status(),
         "state_store": {"ok": state_store.path.exists()},
         "automation_worker": automation_worker.snapshot(),
         "account_reconciler": account_reconciler.snapshot(),

@@ -57,6 +57,26 @@ the already-public market and system-status information.
 REST candle history loads on entry, interval changes, manual refresh and
 reconnection to repair gaps; there is no 15-second market refresh timer.
 Periodic account reconciliation remains separate from display updates.
+An independent reconciler task monitors account and algo-channel connectivity
+and authentication, even while REST reconciliation is waiting. Observers wake
+it on connection, login and disconnect events; a one-second check enforces
+`PRIVATE_STREAM_ALERT_GRACE_SECONDS` (30 seconds by default). It attempts one
+outage notification after the grace period and one recovery notification per
+incident within the process. A disabled notifier is silent; failed delivery is
+audited and does not create a per-tick or per-opening retry storm. Restarting
+the process starts a new observation window.
+
+The execution engine requires an explicitly ready callback for non-Dry-Run
+openings, including worker and TradingView requests. Missing state or callback
+errors fail closed. The check runs before and after preflight, and again after
+leverage preparation. This gate is immediate, independent of notification
+grace. Existing idempotent results remain readable without sending again.
+Close actions and Dry Run bypass only this new gate, not emergency stop,
+execution settings, position verification or native-protection safeguards.
+When existing browser account/market/safety prerequisites still hold but the
+algo channel is unavailable, the UI shows "仅可平仓" and retains close controls.
+Unknown backend readiness cannot enable opening controls.
+
 Position reconciliation distinguishes a newly received WebSocket message from
 a replayed cache entry. An older known exchange update time cannot replace a
 newer position, and a REST request cannot overwrite or close a position changed
@@ -104,6 +124,13 @@ time/price anchors, persistence, corrupt-storage recovery and mobile layouts.
 `infra/okx-private-smoke.py` is the deployment-time read-only probe for private
 REST, account WebSocket and native algo-order WebSocket authentication. It
 reports counts only and refuses live mode unless explicitly allowed.
+`services/api/tests/test_private_stream_health.py` covers grace, repeat outages,
+partial recovery, task cancellation/restart, disabled/failed notifications,
+missing readiness and disconnects during preflight/leverage preparation. Its
+loopback API process test disconnects the algo socket, observes pushed status,
+rejects opening attempts and checks one outage/recovery notification pair
+without exchange mutations. Browser fixtures also verify the actual close
+button through analysis rendering, status updates and availability refresh.
 
 Private fixtures are not real OKX Demo acceptance. Actual private credentials,
 model-provider connectivity, PushPlus WeChat receipt, prolonged operation and

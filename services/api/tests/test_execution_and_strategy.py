@@ -461,6 +461,7 @@ class ExecutionEngineTests(unittest.TestCase):
             FakeTradeClient(),
             FakePushPlus(),
             self.safety,
+            private_stream_ready=lambda: True,
         )
         self.signal = TradeSignal(
             inst_id="BTC-USDT-SWAP",

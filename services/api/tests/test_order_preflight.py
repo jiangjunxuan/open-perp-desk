@@ -117,6 +117,7 @@ class OrderPreflightTests(unittest.IsolatedAsyncioTestCase):
         self.engine = ExecutionEngine(
             self.store, RiskEngine(), self.trade, SimpleNamespace(configured=False),
             preflight=self.preflight,
+            private_stream_ready=lambda: True,
         )
         self.signal = TradeSignal(
             inst_id="BTC-USDT-SWAP", action="open_long", confidence=0.9,

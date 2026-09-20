@@ -1186,7 +1186,7 @@ function renderAnalysis(analysis) {
     state.submitting
     || !state.token
     || !analysis?.signal
-    || !executionGateOpen(state.status)
+    || !executionGateOpen(state.status, signal.action)
   );
 }
 
@@ -1197,6 +1197,7 @@ const executionReasons = {
   exchange_preflight_required: "交易所校验尚未配置",
   execution_disabled: "服务器执行开关已关闭",
   emergency_stop_active: "急停已触发",
+  private_stream_not_ready: "私有账户推送未就绪，已禁止新开仓",
   private_account_not_configured: "OKX 私有账户未配置",
   exchange_preflight_data_unavailable: "交易所校验数据读取失败",
   account_snapshot_empty: "账户快照为空",
@@ -1313,7 +1314,7 @@ function updatePrivateActionAvailability() {
     || state.status?.safety_control?.execution_allowed !== true;
   $("#lock-live").disabled = !unlocked;
   $("#execute-signal").disabled = !unlocked || state.submitting
-    || !state.analysis?.signal || !executionGateOpen(state.status);
+    || !state.analysis?.signal || !executionGateOpen(state.status, state.analysis.signal.action);
   document.querySelectorAll("button[aria-busy='true']").forEach((button) => {
     button.disabled = true;
   });
@@ -1988,7 +1989,7 @@ async function loadActivity() {
   }
 }
 
-function executionGateOpen(status) {
+function executionGateOpen(status, action = "open_long") {
   return status?.execution_enabled === true
     && !state.marketPaused
     && state.marketFeedState === "open"
@@ -1997,6 +1998,7 @@ function executionGateOpen(status) {
     && state.controlSnapshotFresh
     && state.privateFeedState === "open"
     && state.privateAccountReady
+    && (action === "close" || status.private_stream?.ready === true)
     && status.risk_engine_ready === true
     && status.safety_control?.emergency_stopped !== true
     && status.safety_control?.execution_allowed === true
@@ -2087,12 +2089,14 @@ function applyStatus(status) {
   const worker = status.automation_worker || {};
   const workerLabel = worker.running ? "运行中" : worker.enabled ? "已启用" : "待命";
   const gateOpen = executionGateOpen(status);
+  const closeOnly = !gateOpen && executionGateOpen(status, "close");
   document.querySelectorAll("[data-lot-execution]").forEach(element => {
     element.textContent = `分单本地执行：${lotExecutionLabel(status)}`;
   });
   const executionLabel = status.safety_control?.emergency_stopped
     ? "急停已触发"
-    : gateOpen ? mode === "LIVE" ? "实盘执行已解锁" : "模拟盘执行已启用" : "执行已锁定";
+    : gateOpen ? mode === "LIVE" ? "实盘执行已解锁" : "模拟盘执行已启用"
+      : closeOnly ? "仅可平仓" : "执行已锁定";
   setText("#trading-mode", modeLabel);
   const environment = status.environment || "development";
   setText("#top-environment", ({ development: "开发环境", production: "生产环境", test: "测试环境" })[environment] || environment);
@@ -2181,10 +2185,10 @@ function applyStatus(status) {
     "#execution-note",
     status.safety_control?.emergency_stopped
       ? "急停已触发"
-      : gateOpen ? "风险闸门已打开" : "等待执行条件满足",
+      : gateOpen ? "风险闸门已打开" : closeOnly ? "私有订单推送未就绪，新开仓已暂停" : "等待执行条件满足",
   );
-  setState("#ticket-lock-label", status.safety_control?.emergency_stopped ? "急停已触发" : gateOpen ? `${modeLabel}执行已启用` : "执行已锁定", gateOpen ? "good" : "warning");
-  setState("#metric-risk", status.safety_control?.emergency_stopped ? "已急停" : gateOpen ? "已启用" : "已锁定", status.safety_control?.emergency_stopped ? "danger" : gateOpen ? "good" : "warning");
+  setState("#ticket-lock-label", status.safety_control?.emergency_stopped ? "急停已触发" : gateOpen ? `${modeLabel}执行已启用` : closeOnly ? "仅可平仓" : "执行已锁定", gateOpen ? "good" : "warning");
+  setState("#metric-risk", status.safety_control?.emergency_stopped ? "已急停" : gateOpen ? "已启用" : closeOnly ? "仅可平仓" : "已锁定", status.safety_control?.emergency_stopped ? "danger" : gateOpen ? "good" : "warning");
   setText(
     "#metric-risk-note",
     status.safety?.live_orders_allowed ? "实盘已解锁" : "实盘默认禁止",
@@ -2207,7 +2211,7 @@ function applyStatus(status) {
   $("#execute-signal").disabled = (
     state.submitting
     || !state.analysis?.signal
-    || !gateOpen
+    || !executionGateOpen(status, state.analysis.signal.action)
     || !state.token
   );
 }
@@ -2928,7 +2932,7 @@ async function testNotification() {
 
 async function submitSignal(dryRun) {
   if (state.submitting) return;
-  if (!dryRun && !executionGateOpen(state.status)) {
+  if (!dryRun && !executionGateOpen(state.status, state.analysis?.signal?.action)) {
     setMessage("行情或执行连接未就绪，禁止提交新订单。", "error");
     return;
   }
@@ -2955,7 +2959,7 @@ async function submitSignal(dryRun) {
   }
   const mode = state.status?.trading_mode === "live" ? "实盘" : "模拟盘";
   if (!dryRun && (!window.confirm(`确认提交 OKX ${mode}订单？\n${payload.signal.inst_id} · ${payload.signal.action} · ${payload.size} 张`)
-      || !executionGateOpen(state.status))) return;
+      || !executionGateOpen(state.status, payload.signal.action))) return;
   state.submitting = true;
   const draftRevision = state.draftRevision;
   const button = dryRun ? "#preview-signal" : "#execute-signal";

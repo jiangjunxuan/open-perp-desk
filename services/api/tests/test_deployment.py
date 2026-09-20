@@ -234,6 +234,15 @@ class DeploymentConfigTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(deploy.DeploymentError):
                 deploy.validate_config(model)
 
+    def test_private_stream_alert_grace_must_be_finite_and_bounded(self):
+        for value in ("-1", "3601", "nan", "inf"):
+            model = configuration()
+            model["services"]["api"]["environment"]["PRIVATE_STREAM_ALERT_GRACE_SECONDS"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(
+                deploy.DeploymentError, "PRIVATE_STREAM_ALERT_GRACE_SECONDS",
+            ):
+                deploy.validate_config(model)
+
     def test_short_local_admin_token_is_development_only(self):
         model = configuration()
         model["services"]["api"]["environment"]["ADMIN_API_TOKEN"] = "admin"

@@ -36,6 +36,15 @@ class OkxAlgoOrderStream:
         self._task: asyncio.Task[None] | None = None
         self.on_update: Callable[[], None] | None = None
 
+    def _notify_update(self) -> None:
+        if self.on_update is None:
+            return
+        try:
+            self.on_update()
+        except Exception:
+            # Stream transport must not be terminated by an observer callback.
+            return
+
     @property
     def configured(self) -> bool:
         return all((self.api_key, self.secret_key, self.passphrase))
@@ -99,6 +108,7 @@ class OkxAlgoOrderStream:
                     self.connected = True
                     self.authenticated = False
                     self.last_error = None
+                    self._notify_update()
                     delay = 1.0
                     await socket.send(json.dumps(self.login_message()))
                     async for raw in socket_messages(socket):
@@ -123,6 +133,7 @@ class OkxAlgoOrderStream:
             finally:
                 self.connected = False
                 self.authenticated = False
+                self._notify_update()
             await asyncio.sleep(delay)
             delay = min(delay * 2, 30.0)
 
@@ -135,6 +146,9 @@ class OkxAlgoOrderStream:
             self.authenticated = str(message.get("code", "")) == "0"
             if not self.authenticated:
                 self.last_error = "login_failed"
+            else:
+                self.last_error = None
+            self._notify_update()
             return
 
         argument = message.get("arg")
@@ -159,8 +173,7 @@ class OkxAlgoOrderStream:
                 self.orders[order_id] = item
         if any(isinstance(item, dict) for item in rows):
             self.last_message_at = datetime.now(timezone.utc).isoformat()
-            if self.on_update is not None:
-                self.on_update()
+            self._notify_update()
 
     def snapshot(self) -> dict[str, Any]:
         return {

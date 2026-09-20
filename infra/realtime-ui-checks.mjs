@@ -238,6 +238,7 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
       const allowed = {
         ...state.status, execution_enabled: true, risk_engine_ready: true, trading_mode: "demo",
         safety_control: {execution_allowed: true, emergency_stopped: false},
+        private_stream: {configured: true, ready: true},
       };
       state.privateFeedState = "open";
       state.privateAccountReady = true;
@@ -297,6 +298,30 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
       applyStatus({...allowed, account_stream: {configured: true, connected: true, authenticated: true, account_ready: true}});
       const accountRecoveryShowsReady = $("#top-execution").textContent === "模拟盘执行已启用"
         && $("#state-account-stream").textContent === "在线";
+      applyStatus({...allowed, private_stream: {configured: true, ready: false}});
+      const privateStreamDisconnectLocksNewOrders = !executionGateOpen(state.status)
+        && $("#execute-signal").disabled;
+      const algoOutageDoesNotAddCloseLock = executionGateOpen(state.status, "close");
+      const closeOnlyLabelsMatch = ["#top-execution", "#mobile-execution", "#ticket-lock-label", "#metric-risk"]
+        .every(selector => $(selector).textContent === "仅可平仓");
+      const unknownPrivateStreamLocksNewOrders = [undefined, null, {}, {ready: "true"}].every(
+        private_stream => !executionGateOpen({...allowed, private_stream}),
+      );
+      const closeStillRequiresSafety = !executionGateOpen({
+        ...allowed, safety_control: {emergency_stopped: true, execution_allowed: false},
+      }, "close");
+      const originalAnalysis = state.analysis;
+      const outageStatus = state.status;
+      renderAnalysis({signal: {inst_id: state.symbol, action: "close"}});
+      const closeButtonAvailableOnRender = !$("#execute-signal").disabled;
+      applyStatus(outageStatus);
+      const closeButtonAvailableOnStatus = !$("#execute-signal").disabled;
+      updatePrivateActionAvailability();
+      const closeButtonAvailableOnRefresh = !$("#execute-signal").disabled;
+      renderAnalysis({signal: {inst_id: state.symbol, action: "open_long"}});
+      const openingButtonStaysBlocked = $("#execute-signal").disabled;
+      renderAnalysis(originalAnalysis);
+      applyStatus(allowed);
       let resolvePerformance;
       api = () => new Promise(resolve => { resolvePerformance = resolve; });
       const latePerformance = refreshLivePerformance();
@@ -335,7 +360,11 @@ export async function checkRealtime({ evaluate, command, origin, screenshot }) {
       return { disconnected, wrongPeriodIgnored, realPriceUpdated, disconnectedQuoteCleared,
         pauseRejectsPendingSnapshot, noSnapshotFallback, auxiliaryDataCleared, privateDataCleared, marketDisconnectLocksExecution,
         offlineAccountIgnored, privateHeartbeatCannotUnlock, privateLoginCannotUnlock, restCannotRestoreDisconnectedAccount,
-        accountLoginShowsWaiting, accountRecoveryShowsReady, privateDisconnectUpdatesGateLabels,
+        accountLoginShowsWaiting, accountRecoveryShowsReady, privateStreamDisconnectLocksNewOrders,
+        algoOutageDoesNotAddCloseLock, closeOnlyLabelsMatch, unknownPrivateStreamLocksNewOrders, closeStillRequiresSafety,
+        closeButtonAvailableOnRender, closeButtonAvailableOnStatus, closeButtonAvailableOnRefresh,
+        openingButtonStaysBlocked,
+        privateDisconnectUpdatesGateLabels,
         stalePerformanceRejected, disconnectedLedgerIgnored, emptyBalanceCleared, confirmedZeroPositionPnl,
         disconnectedExecutionLocked, reconnectingExecutionLocked, heartbeatCannotUnlock,
         freshControlStatusAccepted, staleStatusRejected, accountUpdated, adjustedEquityNotTotal, zeroEquityPreserved,

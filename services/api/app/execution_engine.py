@@ -3,7 +3,7 @@ import hashlib
 import json
 import math
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from .okx_trade import OkxOrderRejected, OkxTradeClient, OrderRequest
 from .order_preflight import OrderPreflight, PreflightError, PreparedExecution
@@ -30,6 +30,7 @@ class ExecutionEngine:
         pushplus: PushPlusClient,
         safety: SafetyController | None = None,
         preflight: OrderPreflight | None = None,
+        private_stream_ready: Callable[[], bool] | None = None,
     ) -> None:
         self.store = store
         self.risk_engine = risk_engine
@@ -37,6 +38,22 @@ class ExecutionEngine:
         self.pushplus = pushplus
         self.safety = safety or SafetyController(store)
         self.preflight = preflight
+        self.private_stream_ready = private_stream_ready
+
+    def _private_stream_is_ready(self) -> bool:
+        if self.private_stream_ready is None:
+            return False
+        try:
+            return self.private_stream_ready() is True
+        except Exception:
+            return False
+
+    def _opening_stream_blocked(self, signal: TradeSignal, *, dry_run: bool) -> bool:
+        return (
+            not dry_run
+            and signal.action in {"open_long", "open_short"}
+            and not self._private_stream_is_ready()
+        )
 
     @staticmethod
     def client_order_id(
@@ -128,6 +145,9 @@ class ExecutionEngine:
             replay_side = existing["side"] if signal.action == "close" and side_override is None else side
             return self._existing_result(existing, dry_run=dry_run, size=size, side=replay_side)
 
+        if self._opening_stream_blocked(signal, dry_run=dry_run):
+            return await self._preflight_rejection(signal, "private_stream_not_ready")
+
         prepared: PreparedExecution | None = None
         if not dry_run or (self.preflight and self.preflight.configured):
             if self.preflight is None:
@@ -159,6 +179,8 @@ class ExecutionEngine:
             market_data_fresh = market_data_fresh and -5 <= age <= 30
         if not self.safety.execution_allowed:
             return await self._preflight_rejection(signal, "emergency_stop_active")
+        if self._opening_stream_blocked(signal, dry_run=dry_run):
+            return await self._preflight_rejection(signal, "private_stream_not_ready")
         if not dry_run and signal.source.startswith("protective-") and (
             not expected_protection or expected_protection.get("kind") != "handoff"
         ):
@@ -270,6 +292,16 @@ class ExecutionEngine:
                 raise OkxOrderRejected("Signal expired during preparation")
             if prepared and datetime.now(timezone.utc).timestamp() - prepared.market_timestamp > 30:
                 raise OkxOrderRejected("Market snapshot expired during preparation")
+            if self._opening_stream_blocked(signal, dry_run=dry_run):
+                saved = self.store.finalize_submission(
+                    client_order_id,
+                    "rejected",
+                    raw={**record["raw"], "error": "private_stream_not_ready"},
+                )
+                return {
+                    **await self._preflight_rejection(signal, "private_stream_not_ready"),
+                    "order": saved,
+                }
             self.store.finalize_submission(
                 client_order_id, "submitting", raw=record["raw"],
             )
@@ -342,16 +374,20 @@ class ExecutionEngine:
             "exchange": response,
         }
 
-    async def _preflight_rejection(self, signal: TradeSignal, reason: str) -> dict[str, Any]:
+    async def _preflight_rejection(
+        self, signal: TradeSignal, reason: str,
+    ) -> dict[str, Any]:
         self.store.add_audit(
             "execution_preflight_rejected", "Execution preflight did not approve the order",
             severity="warning", payload={"inst_id": signal.inst_id, "reason": reason},
         )
-        await self.notify_event(
-            "execution_preflight_rejected", "OpenPerpDesk 发单校验未通过",
-            f"{signal.inst_id}：{reason}，未发单。",
-            payload={"inst_id": signal.inst_id, "reason": reason}, severity="warning",
-        )
+        # The reconciler owns grace/dedup for stream outage notifications.
+        if reason != "private_stream_not_ready":
+            await self.notify_event(
+                "execution_preflight_rejected", "OpenPerpDesk 发单校验未通过",
+                f"{signal.inst_id}：{reason}，未发单。",
+                payload={"inst_id": signal.inst_id, "reason": reason}, severity="warning",
+            )
         return {"accepted": False, "idempotent": False, "reasons": [reason]}
 
     def protective_exit(
