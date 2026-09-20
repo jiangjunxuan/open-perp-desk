@@ -6,7 +6,7 @@ OpenPerpDesk 是一个开源的 AI 辅助永续合约交易后台。它运行在
 主要组成：
 
 - TradingAgents：研究分析和多智能体市场研判
-- OKX 官方 agent skills 或 API 适配层：行情和交易能力
+- OKX REST/WebSocket 适配层：行情和交易能力
 - 独立风控引擎：每一笔订单都必须经过审核
 - PushPlus：微信通知
 - 高信息密度、专业交易终端风格的 Web 界面
@@ -33,6 +33,8 @@ OpenPerpDesk 是一个开源的 AI 辅助永续合约交易后台。它运行在
 - 结构化策略、风控预检、Demo 订单预览、止盈止损参数和本地保护兜底已实现
 - 自动策略 Worker、历史回测、急停/恢复和审计落盘已实现，自动交易默认关闭
 - Worker 周期不会并发运行；已配置账户的权益或快照读取失败时不回退到模拟余额
+- Worker 只有显式 `AUTO_TRADING_DRY_RUN=false` 才退出预览；每个执行周期独立限制为 Demo，
+  不因实盘客户端已人工解锁而允许这个自动 Worker 实盘下单
 - 发单预检使用交易所权益、完整当日账单、真实合约名义金额和待成交敞口；
   跨请求通过原子额度代次防止重复占用同一份预算
 - 开仓前设置并确认杠杆，持仓模式与保证金模式由交易所账户和持仓快照核验
@@ -215,28 +217,28 @@ REST/WebSocket/PushPlus 测试服务。不会读取现有交易凭据或连接�
 报告写入 `outputs/trading-flow-verification.json`。
 本地协议测试服务不是交易所撮合引擎，结果不代表真实 OKX Demo 或微信送达已验收。
 
-本次工作树验证结果：
+验证基线（2026-09-20，代码提交 `e310145`）：
 
-- 当前提交 `71fccf3` 的 push 与 pull request 两次 CI 均通过；本轮功能专项
-  Python 测试 71/71、Node 实时与外观测试 13/13 通过，同一工作树较早的完整
-  API 回归 839/839 通过。
-- TradingView 专项现有 39 项通过：快速接收、持久化排队、异步风控执行、
-  并发去重、参数冲突、过期、跨账户拒绝、进程崩溃不重发与私有 SSE。
-  回执基于订单账本区分明确拒单和结果未知，包含真实 API 子进程回归；
-  与执行幂等和订单恢复专项合计 86 项通过。
-  数据库备份恢复专项 17 项通过，包含恢复后不重放旧告警。
-- Compose 已显式传递全部 TradingView 配置；部署预检校验独立密钥、
-  白名单、数值和执行开关，Dry Run 配置错误时保持禁用执行。
-- 中文告警面板：10 项交互检查、深浅色共 10 组尺寸检查通过，页面不展示密钥；
-  本机协议浏览器验收无交易所变更请求。这不代表真实 TradingView 告警已验收。
-- Demo 交易闭环：9 个场景全部通过，覆盖幂等发单、成交、原生保护、
-  Worker、急停、进程崩溃恢复和禁止重复发单。
+- 本地完整 API 回归 864/864 通过，耗时 1054.539 秒。该代码提交的 PR CI
+  `35513825611` 与 push CI `35513823217` 均已完成并成功，覆盖 API、Web、
+  浏览器、Compose 和 TradingAgents 镜像五项任务；不代表后续提交已经通过。
+- 本机协议测试覆盖 Demo 发单、成交、原生保护、Worker、急停、重复请求、
+  进程中断及响应丢失恢复。浏览器样本覆盖中文操作、深浅主题和电脑/手机尺寸，
+  并核对没有向测试交易所发出变更请求；这些不是实际 OKX 撮合或真实账户验收。
+- TradingView 已在目标 HTTPS 入口开启只接收模式，脚本请求的持久回执、
+  私有 SSE、去重和拒绝路径通过，订单为零。平台实际生成的 Alert 仍未验证。
 - TradingAgents：真实图和结构化协议通过本地模型夹具；目标服务器上的真实模型
   `fast` 与 `full` 研究也已通过只读验收，均带 OKX 公共行情证据且不会授权执行。
-- 实时 SSE：市场事件约 250ms 更新、系统心跳约 5 秒、私有未认证请求返回
-  401；断流时页面清空当前旧快照并锁定执行。
-- Docker/宝塔 HTTPS、公开实时行情、服务端 SOCKS5 代理和目标服务器容器已验收；
-  真实 OKX 私有流、PushPlus 微信送达、TradingView Alert 和实际回滚演练仍未完成。
+- Docker/宝塔 HTTPS、公开实时行情、服务端 SOCKS5、同镜像重启、API 崩溃自动恢复、
+  生产当前快照恢复和旧/新镜像切换均有目标环境证据。它们在没有私有交易的状态下执行，
+  不能证明真实在途订单或宿主机断电恢复。
+- Worker 安全补丁已上线，API 为 `release-e310145-worker-safety`、Web 为
+  `release-43f98c8`。26 张表逐表摘要、配置范围、独立公网 SSE 和新异机备份核对通过。
+  详细范围及 digest 见 [`2026-09-20 验收记录第 13 节`](docs/DEPLOYMENT_ACCEPTANCE_2026-09-20.md#13-自动-worker-安全补丁与维护基线更新)。
+
+尚缺真实 OKX Demo 私有流、订单/成交/原生保护与对账、季度文件及跨日权益观测、
+延长 Demo 运行、PushPlus 微信收信、TradingView 平台告警和批准维护窗口内的宿主机
+断电恢复。默认继续关闭执行和自动交易，不把上述测试基线作为实盘批准。
 
 ## 目录结构
 
@@ -253,9 +255,11 @@ docker-compose.yml
 只持久化 API 的 SQLite 数据卷；Web 通过 Nginx 反代到 API。实盘默认被独立
 安全闸门锁定，不能把“页面可访问”视为“交易已启用”。目标服务器构建、宝塔 HTTPS、
 公开 SSE、服务端 SOCKS5 代理和真实模型研究的 2026-09-19 验收记录见
-[`docs/DEPLOYMENT_ACCEPTANCE_2026-09-19.md`](docs/DEPLOYMENT_ACCEPTANCE_2026-09-19.md)。
-真实 OKX Demo 私有 WebSocket、订单状态/成交回报、PushPlus token、TradingView Alert
-和实际恢复/回滚仍需要在目标环境逐项验收。
+[`docs/DEPLOYMENT_ACCEPTANCE_2026-09-19.md`](docs/DEPLOYMENT_ACCEPTANCE_2026-09-19.md)；
+生产重启、恢复、回滚及最新安全补丁记录见
+[`docs/DEPLOYMENT_ACCEPTANCE_2026-09-20.md`](docs/DEPLOYMENT_ACCEPTANCE_2026-09-20.md)。
+真实 OKX Demo 私有账户与在途交易、PushPlus 微信送达、TradingView 平台告警及
+宿主机断电仍须单独验收，不能由无私有交易的恢复/回滚演练代替。
 
 部署命令入口为 `infra/openperpdesk.sh`，主机需要 Python 3.11+ 和 Compose v2。
 `preflight` 校验 Compose 最终解析配置；`backup` 生成含 WAL 提交数据的一致性快照及
