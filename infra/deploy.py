@@ -15,10 +15,12 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
+DEMO_LIFECYCLE_CONFIRMATION = "OPENPERPDESK_OKX_DEMO_LIFECYCLE"
 sys.path.insert(0, str(ROOT / "services" / "api"))
 from app.database_maintenance import (  # noqa: E402
     MaintenanceError, assert_restore_environment, file_digest,
@@ -348,6 +350,101 @@ class Deployment:
                 raise ValueError("stale report")
         except (ValueError, TypeError, KeyError) as error:
             raise DeploymentError("Private smoke returned invalid or incomplete evidence; no report was published.") from error
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_json(output, report)
+        print(json.dumps(report, ensure_ascii=True, indent=2))
+        return report
+
+    def demo_lifecycle_smoke(
+        self, *, confirmation: str, timeout: float = 120,
+        inst_id: str = "BTC-USDT-SWAP", side: str = "long",
+    ) -> dict:
+        if confirmation != DEMO_LIFECYCLE_CONFIRMATION:
+            raise DeploymentError("Exact OKX Demo lifecycle confirmation is required.")
+        if not 30 <= timeout <= 300 or not math.isfinite(timeout):
+            raise DeploymentError("Demo lifecycle timeout must be between 30 and 300 seconds.")
+        if not re.fullmatch(r"[A-Z0-9]{2,20}-(?:USDT|USDC|USD)-SWAP", inst_id):
+            raise DeploymentError("Demo lifecycle instrument must be an OKX perpetual instrument.")
+        if side not in {"long", "short"}:
+            raise DeploymentError("Demo lifecycle side must be long or short.")
+        environment = effective_environment(self.config())
+        expected = {
+            "TRADING_MODE": "demo",
+            "OKX_DEMO": "true",
+            "EXECUTION_ENABLED": "true",
+            "LIVE_TRADING_ENABLED": "false",
+            "AUTO_TRADING_ENABLED": "false",
+            "AUTO_TRADING_DRY_RUN": "true",
+        }
+        if any(environment.get(name, "").strip().lower() != value for name, value in expected.items()):
+            raise DeploymentError(
+                "Demo lifecycle smoke requires enabled Demo execution, locked live mode, "
+                "and a disabled Dry Run automation worker."
+            )
+        if environment.get("TRADINGVIEW_ENABLED", "false").strip().lower() != "false":
+            raise DeploymentError("Disable TradingView before Demo lifecycle smoke.")
+        if not all(environment.get(name, "").strip() for name in (
+            "ADMIN_API_TOKEN", "OKX_API_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE",
+        )):
+            raise DeploymentError("Demo lifecycle smoke requires administrator and OKX Demo credentials.")
+        output = self.root / "outputs/okx-demo-lifecycle-verification.json"
+        output.unlink(missing_ok=True)
+        started = datetime.now(timezone.utc)
+        with (self.root / "infra/okx-demo-lifecycle-smoke.py").open("rb") as program:
+            result = self.compose(
+                "exec", "-T", "api", "python", "-",
+                "--origin", "http://127.0.0.1:8000",
+                "--inst-id", inst_id,
+                "--side", side,
+                "--timeout", str(timeout),
+                "--confirm", confirmation,
+                "--output", "-",
+                stdin=program, timeout=timeout + 90,
+            )
+        try:
+            report = json.loads(result.stdout)
+            fields = {
+                "checked_at", "scope", "instrument", "side", "size", "demo",
+                "proxy_configured", "private_stream_verified", "algo_stream_verified",
+                "dry_run_verified", "exchange_preflight_verified", "open_fill_verified",
+                "native_protection_verified", "close_fill_verified", "position_flat_verified",
+                "protection_terminal_verified", "cleanup_completed", "emergency_stopped",
+                "worker_disabled", "live_execution_allowed", "order_lifecycle_verified",
+                "trading_performed", "real_funds_used", "elapsed_seconds",
+            }
+            if not isinstance(report, dict) or set(report) != fields:
+                raise ValueError("unexpected report fields")
+            if report["scope"] != "okx_demo_order_lifecycle":
+                raise ValueError("invalid scope")
+            if report["instrument"] != inst_id or report["side"] != side:
+                raise ValueError("instrument or side mismatch")
+            positive_decimal = Decimal(str(report["size"]))
+            if not positive_decimal.is_finite() or positive_decimal <= 0:
+                raise ValueError("invalid size")
+            true_flags = {
+                "demo", "private_stream_verified", "algo_stream_verified",
+                "dry_run_verified", "exchange_preflight_verified", "open_fill_verified",
+                "native_protection_verified", "close_fill_verified", "position_flat_verified",
+                "protection_terminal_verified", "cleanup_completed", "emergency_stopped",
+                "worker_disabled", "order_lifecycle_verified", "trading_performed",
+            }
+            false_flags = {"live_execution_allowed", "real_funds_used"}
+            if any(report[name] is not True for name in true_flags):
+                raise ValueError("required lifecycle evidence is false")
+            if any(report[name] is not False for name in false_flags):
+                raise ValueError("unsafe lifecycle evidence")
+            if type(report["proxy_configured"]) is not bool:
+                raise ValueError("invalid proxy flag")
+            checked = datetime.fromisoformat(report["checked_at"])
+            if checked.tzinfo is None or not started <= checked <= datetime.now(timezone.utc):
+                raise ValueError("stale report")
+            elapsed = report["elapsed_seconds"]
+            if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)) or not math.isfinite(elapsed) or elapsed < 0:
+                raise ValueError("invalid elapsed time")
+        except (ValueError, TypeError, KeyError, InvalidOperation) as error:
+            raise DeploymentError(
+                "Demo lifecycle smoke returned invalid or incomplete evidence; no report was published."
+            ) from error
         output.parent.mkdir(parents=True, exist_ok=True)
         write_json(output, report)
         print(json.dumps(report, ensure_ascii=True, indent=2))
@@ -707,6 +804,11 @@ def main() -> None:
     private_smoke = commands.add_parser("private-smoke")
     private_smoke.add_argument("--timeout", type=float, default=45)
     private_smoke.add_argument("--allow-live", action="store_true")
+    demo_lifecycle = commands.add_parser("demo-lifecycle-smoke")
+    demo_lifecycle.add_argument("--confirm", required=True)
+    demo_lifecycle.add_argument("--timeout", type=float, default=120)
+    demo_lifecycle.add_argument("--inst-id", default="BTC-USDT-SWAP")
+    demo_lifecycle.add_argument("--side", choices=("long", "short"), default="long")
     proxy_smoke = commands.add_parser("proxy-smoke")
     proxy_smoke.add_argument("--timeout", type=float, default=45)
     proxy_smoke.add_argument("--symbols", default="BTC-USDT-SWAP,ETH-USDT-SWAP")
@@ -733,6 +835,11 @@ def main() -> None:
         with deployment.lock():
             if args.command == "private-smoke":
                 deployment.private_smoke(timeout=args.timeout, allow_live=args.allow_live)
+            elif args.command == "demo-lifecycle-smoke":
+                deployment.demo_lifecycle_smoke(
+                    confirmation=args.confirm, timeout=args.timeout,
+                    inst_id=args.inst_id, side=args.side,
+                )
             elif args.command == "proxy-smoke":
                 deployment.proxy_smoke(timeout=args.timeout, symbols=args.symbols)
             elif args.command == "pushplus-smoke":

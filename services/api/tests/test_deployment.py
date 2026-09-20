@@ -51,6 +51,35 @@ def private_report():
     }
 
 
+def demo_lifecycle_report():
+    return {
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "scope": "okx_demo_order_lifecycle",
+        "instrument": "BTC-USDT-SWAP",
+        "side": "long",
+        "size": "1",
+        "demo": True,
+        "proxy_configured": False,
+        "private_stream_verified": True,
+        "algo_stream_verified": True,
+        "dry_run_verified": True,
+        "exchange_preflight_verified": True,
+        "open_fill_verified": True,
+        "native_protection_verified": True,
+        "close_fill_verified": True,
+        "position_flat_verified": True,
+        "protection_terminal_verified": True,
+        "cleanup_completed": True,
+        "emergency_stopped": True,
+        "worker_disabled": True,
+        "live_execution_allowed": False,
+        "order_lifecycle_verified": True,
+        "trading_performed": True,
+        "real_funds_used": False,
+        "elapsed_seconds": 8.0,
+    }
+
+
 def proxy_report():
     symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
     bars = ["1m", "15m", "1H", "4H"]
@@ -134,6 +163,7 @@ class FakeDeployment(deploy.Deployment):
         shutil.copyfile(ROOT / "services/api/app/database_maintenance.py", helper)
         (root / "infra").mkdir()
         shutil.copyfile(ROOT / "infra/okx-private-smoke.py", root / "infra/okx-private-smoke.py")
+        shutil.copyfile(ROOT / "infra/okx-demo-lifecycle-smoke.py", root / "infra/okx-demo-lifecycle-smoke.py")
         shutil.copyfile(ROOT / "infra/proxy-smoke.py", root / "infra/proxy-smoke.py")
         shutil.copyfile(ROOT / "infra/ai-live-smoke.py", root / "infra/ai-live-smoke.py")
 
@@ -159,6 +189,8 @@ class FakeDeployment(deploy.Deployment):
                 report = proxy_report()
             elif b"tradingagents_real_model_read_only" in self.probe_program:
                 report = ai_live_report()
+            elif b"okx_demo_order_lifecycle" in self.probe_program:
+                report = demo_lifecycle_report()
             else:
                 report = private_report()
             output = json.dumps({**report, **self.probe_changes}).encode()
@@ -702,6 +734,98 @@ class DeploymentCommandTests(unittest.TestCase):
             deploy.main()
         self.assertEqual(self.deployment.probe_timeout, 27)
         self.assertNotIn("--allow-live", self.deployment.calls[-1])
+
+    def test_demo_lifecycle_smoke_is_explicit_demo_only_and_publishes_evidence(self):
+        environment = self.deployment.model["services"]["api"]["environment"]
+        environment.update(
+            EXECUTION_ENABLED="true",
+            OKX_API_KEY="fixture-key",
+            OKX_SECRET_KEY="fixture-secret",
+            OKX_PASSPHRASE="fixture-passphrase",
+        )
+        result = self.deployment.demo_lifecycle_smoke(
+            confirmation=deploy.DEMO_LIFECYCLE_CONFIRMATION,
+            timeout=60,
+            inst_id="BTC-USDT-SWAP",
+            side="long",
+        )
+        self.assertEqual(result["scope"], "okx_demo_order_lifecycle")
+        self.assertEqual(self.deployment.calls[0], ("config", "--format", "json"))
+        self.assertEqual(self.deployment.calls[1], (
+            "exec", "-T", "api", "python", "-",
+            "--origin", "http://127.0.0.1:8000",
+            "--inst-id", "BTC-USDT-SWAP",
+            "--side", "long",
+            "--timeout", "60",
+            "--confirm", deploy.DEMO_LIFECYCLE_CONFIRMATION,
+            "--output", "-",
+        ))
+        self.assertEqual(self.deployment.probe_timeout, 150)
+        self.assertIn(b"okx_demo_order_lifecycle", self.deployment.probe_program)
+        destination = self.root / "outputs/okx-demo-lifecycle-verification.json"
+        self.assertEqual(json.loads(destination.read_text()), result)
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+
+    def test_demo_lifecycle_smoke_rejects_unsafe_config_and_invalid_evidence(self):
+        with self.assertRaisesRegex(deploy.DeploymentError, "Exact OKX Demo"):
+            self.deployment.demo_lifecycle_smoke(confirmation="wrong")
+        self.assertEqual(self.deployment.calls, [])
+        with self.assertRaisesRegex(deploy.DeploymentError, "requires enabled Demo execution"):
+            self.deployment.demo_lifecycle_smoke(
+                confirmation=deploy.DEMO_LIFECYCLE_CONFIRMATION,
+            )
+        environment = self.deployment.model["services"]["api"]["environment"]
+        environment.update(
+            EXECUTION_ENABLED="true",
+            OKX_API_KEY="fixture-key",
+            OKX_SECRET_KEY="fixture-secret",
+            OKX_PASSPHRASE="fixture-passphrase",
+        )
+        destination = self.root / "outputs/okx-demo-lifecycle-verification.json"
+        destination.parent.mkdir(exist_ok=True)
+        for flag in ("true", "invalid", ""):
+            with self.subTest(tradingview=flag):
+                environment["TRADINGVIEW_ENABLED"] = flag
+                with self.assertRaisesRegex(deploy.DeploymentError, "Disable TradingView"):
+                    self.deployment.demo_lifecycle_smoke(
+                        confirmation=deploy.DEMO_LIFECYCLE_CONFIRMATION,
+                    )
+        environment["TRADINGVIEW_ENABLED"] = "false"
+        for changes in (
+            {"demo": False},
+            {"trading_performed": False},
+            {"real_funds_used": True},
+            {"emergency_stopped": False},
+            {"private_stream_verified": False},
+            {"algo_stream_verified": False},
+            {"checked_at": "2000-01-01T00:00:00+00:00"},
+            {"api_key": "fixture-secret-never-log"},
+        ):
+            with self.subTest(changes=changes):
+                self.deployment.probe_changes = changes
+                destination.write_text('{"old":true}')
+                with self.assertRaisesRegex(deploy.DeploymentError, "invalid or incomplete evidence"):
+                    self.deployment.demo_lifecycle_smoke(
+                        confirmation=deploy.DEMO_LIFECYCLE_CONFIRMATION,
+                        timeout=60,
+                    )
+                self.assertFalse(destination.exists())
+        self.assertNotIn("fixture-secret-never-log", self.output.getvalue())
+
+    def test_demo_lifecycle_smoke_cli_routes_explicit_confirmation(self):
+        with patch.object(deploy.sys, "argv", [
+            "deploy", "demo-lifecycle-smoke",
+            "--confirm", deploy.DEMO_LIFECYCLE_CONFIRMATION,
+            "--timeout", "90", "--inst-id", "ETH-USDT-SWAP", "--side", "short",
+        ]), patch.object(deploy, "Deployment", return_value=self.deployment), \
+             patch.object(self.deployment, "demo_lifecycle_smoke", return_value={}) as smoke:
+            deploy.main()
+        smoke.assert_called_once_with(
+            confirmation=deploy.DEMO_LIFECYCLE_CONFIRMATION,
+            timeout=90.0,
+            inst_id="ETH-USDT-SWAP",
+            side="short",
+        )
 
     def test_failed_container_private_probe_removes_previous_report(self):
         destination = self.root / "outputs/okx-private-verification.json"

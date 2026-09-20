@@ -263,6 +263,27 @@ SHA-256 清单；`restore` 先保存旧库，再强制以禁用执行、停用 W
 API 容器的连接配置做只读 REST/私有 WebSocket 验收，输出受保护的连接与记录数量报告。
 此检查不下单，也不等同于真实 Demo 的成交与保护闭环验收。
 
+完成只读验收后，可在单独批准的维护窗口执行一次最小订单生命周期验收：
+
+```bash
+./infra/openperpdesk.sh demo-lifecycle-smoke \
+  --confirm OPENPERPDESK_OKX_DEMO_LIFECYCLE \
+  --inst-id BTC-USDT-SWAP \
+  --side long \
+  --timeout 120
+```
+
+该命令只接受 Demo 模式和容器内回环 API，要求执行开关显式开启、TradingView 信号关闭、
+自动 Worker 关闭且保持 Dry Run 配置。验收期间不得在其他终端操作同一合约。
+它先做交易所数据预检，再发送最小张数开仓，直接核对私有
+WebSocket 中匹配 `clOrdId` 的成交事件、`tradeId`、`fillSz`、`fillPx` 和原生止盈止损
+业务流，随后只减仓平仓、终止残留保护单并再次对账。进入验收后，无论成功或失败都尝试
+停用 Worker 并触发急停；无法验证清理或急停时明确报错，必须人工核对账户。
+成功报告保存在权限为 `600` 的
+`outputs/okx-demo-lifecycle-verification.json`，不包含密钥、余额或订单编号。
+成功后系统仍处于急停，必须人工核对 OKX Demo 账户和本地账本后再决定是否恢复。
+不得使用曾经暴露、带提现权限或未限制出口 IP 的密钥执行此命令。
+
 生产可在 `.env` 中设置
 `OPENPERPDESK_COMPOSE_OVERLAY=docker-compose.release.yml`、
 `OPENPERPDESK_API_IMAGE` 和 `OPENPERPDESK_WEB_IMAGE` 固定已验收的 release

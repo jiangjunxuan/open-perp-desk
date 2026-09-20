@@ -233,6 +233,52 @@ WebSocket 非本机端点必须使用 `wss://` 并校验证书；`ws://` 仅允�
 已安装 API 依赖的 Shell 中运行 `python infra/okx-private-smoke.py --timeout 45`；
 此直接入口不会自动读取 `.env`。不要用 `source .env` 执行未经审核的文件。
 
+只读验收通过后，真实 OKX Demo 的最小订单闭环必须另开维护窗口并单独批准。
+先使用全新的 Demo 专用 API Key，只授予读取和交易权限、禁止提现，并将服务器或
+代理的固定出口 IP 加入白名单。目标合约必须无持仓、无活动委托、无待处理保护事故。
+整个验收窗口内不得在网页、OKX 或其他终端操作同一合约。
+Compose 最终环境必须同时满足：
+
+```dotenv
+TRADING_MODE=demo
+OKX_DEMO=true
+EXECUTION_ENABLED=true
+LIVE_TRADING_ENABLED=false
+AUTO_TRADING_ENABLED=false
+AUTO_TRADING_DRY_RUN=true
+TRADINGVIEW_ENABLED=false
+```
+
+然后执行：
+
+```bash
+./infra/openperpdesk.sh demo-lifecycle-smoke \
+  --confirm OPENPERPDESK_OKX_DEMO_LIFECYCLE \
+  --inst-id BTC-USDT-SWAP \
+  --side long \
+  --timeout 120
+```
+
+命令只连接容器内 `127.0.0.1` API，并通过统一信号、风控和交易所预检链发送一笔
+最小张数 Demo 开仓。它在调用 REST 对账前，必须先从原始私有 WebSocket 找到匹配
+`clOrdId` 的开仓成交，并验证有效 `tradeId`、`fillSz`、`fillPx`；同时要求
+`orders-algo` 流在原生止盈止损创建后推进，并在账本找到与附带保护编号匹配、首次来源
+为 WebSocket 的算法单；REST 先发现的保护单不作为推送证据。之后使用同一风控链提交只减仓平仓，
+再次从私有流确认成交，再以 REST 核对仓位归零并终止残留保护单。
+
+`--timeout` 为 30 至 300 秒的主流程预算，失败后另留 60 秒清理和 20 秒锁定预算。
+下单请求发出前即进入强制清理范围，即使 HTTP 响应丢失也会独立保留清理时间；
+发现已有活动平仓单时先等待和对账，不会直接重复发单。进入验收后，成功或失败都会尝试
+停用 Worker 并触发急停。无法验证清理或急停时明确报错，必须立即人工核对 Demo 账户，
+不能假定网络或服务故障时清理必然完成。成功报告写入
+`outputs/okx-demo-lifecycle-verification.json`，权限为 `600`，不记录密钥、余额或订单编号。
+成功仍不表示可以自动交易：先在 OKX Demo 与本地订单、成交、持仓和保护账本逐项复核，
+再由管理员决定是否解除急停；离开验收窗口前应恢复 `EXECUTION_ENABLED=false` 并重建
+API 容器。该命令严格拒绝实盘模式，不能用于真实资金账户。
+开仓前订单记录超过 480 条时拒绝启动，以预留验收和清理记录空间；查询达到 500 条上限时
+拒绝宣称快照完整。应使用历史较少的隔离 Demo 账户，
+不得为通过验收删除现有账本。此最小闭环不覆盖部分成交、断电或原生保护实际触发。
+
 PushPlus 配置后，服务会对关键运行事件发送通知，包括风控拒绝、订单失败、
 Worker 启停/异常、急停/恢复、成交回报、原生止盈止损状态变化和账户同步异常。
 成交回报按交易所 `tradeId` 去重；没有配置 `PUSHPLUS_TOKEN` 时不会阻塞行情、
