@@ -542,6 +542,10 @@ CI 基线 `b58edbc` 已在 2026-09-13 实际构建镜像、验证图标、在自
 [`DEPLOYMENT_ACCEPTANCE_2026-09-19.md`](DEPLOYMENT_ACCEPTANCE_2026-09-19.md)。
 该验收不包含 OKX 私有 Demo、PushPlus 微信送达、TradingView Alert、实际恢复/回滚切换
 或断电恢复，不能作为实盘批准。
+2026-09-20 已补充生产同镜像重启验收：API 和 Web 容器确实重建，
+研究报告、策略、图表标记和持久急停保留，公网 SSE 恢复，镜像、配置和数据卷未变化。
+证据见 [`DEPLOYMENT_ACCEPTANCE_2026-09-20.md`](DEPLOYMENT_ACCEPTANCE_2026-09-20.md)；
+此项不替代生产备份恢复、旧镜像回滚或断电演练。
 
 ## 7. 最小上线检查
 
