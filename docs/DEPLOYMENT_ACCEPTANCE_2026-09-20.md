@@ -4,6 +4,8 @@
 第 1 至 5 节记录部署脚本 `4c0e2a4` 的真实重启行为：该阶段只更新
 `infra/deploy.py` 和 `infra/okx-demo-lifecycle-smoke.py`，没有构建或替换应用镜像。
 后续镜像切换见第 10 节。所有阶段均未配置私有账户，也没有执行交易。
+第 11 节开始启用只接收模式的 TradingView；前文“未启用”是当时的历史状态。
+第 12 节记录宿主机启动检查及异机备份，不代表已经完成断电恢复。
 
 ## 1. 修复与范围
 
@@ -252,3 +254,91 @@ API 与 Web 的旧镜像切换验收，再自动返回原来的当前镜像。�
 
 该项完成的是无私有交易状态下的生产旧/新镜像切换，不包含真实 Demo 在途交易恢复、
 模型研究重跑、所有旧版页面交互或宿主机断电。执行、Worker 和实盘闸门继续关闭，急停保留。
+
+## 11. TradingView 只接收配置与公网协议验收
+
+2026-09-20 10:50:34 至 10:50:53 UTC，已启用目标服务器的 TradingView 接收器。
+只有下列三项开关和独立 Webhook 密钥发生变更；完整 Compose 配置差异经过核对，
+没有改变 OKX、模型、管理员、代理或其他服务配置。
+
+```dotenv
+TRADINGVIEW_ENABLED=true
+TRADINGVIEW_EXECUTION_ENABLED=false
+TRADINGVIEW_DRY_RUN=true
+```
+
+先归档 `.env` 并生成一致性快照，再原子替换配置和重建 API。API 容器由
+`5091c3c4c781` 变为 `03ff82463fe4`，Web 容器仍为 `4114f0a54dd4`；
+镜像 digest、数据卷和目标宝塔站点配置不变。26 张表的已有记录全部保留，
+配置完成时的快照为 `openperpdesk-20260920T105052Z-6e920e60.sqlite3`，
+SHA-256 为 `05cc182c0dd9ed6c660861e51ae2a3974ee1f24b316a47ed6cf3c8271f61fe72`。
+执行、自动交易和实盘闸门仍关闭，持久急停有效。
+
+11:03:32 UTC 完成从本机到公网 HTTPS 的受控协议检查。测试报文固定
+`action=hold`、`dry_run=true`，编号 `manual-https-check-20260920-88efa0cf1833`。
+这条请求由本机脚本发送，**不是 TradingView 平台发出的真实 Alert**。
+
+| 检查 | 实测结果 |
+| --- | --- |
+| 持久化接收回执 | HTTP 202，约 0.059 秒 |
+| 已认证私有 SSE 告警事件 | 约 0.263 秒收到 `observed` |
+| 完全相同的重复告警 | 幂等回执，收件箱仅一条记录 |
+| 相同 ID、不同内容 | HTTP 409 |
+| 错误 Webhook 密钥 | HTTP 401 |
+| 过期告警 | HTTP 422 |
+| 未认证读取告警收件箱 | HTTP 401 |
+| 密钥保密 | 私有收件箱未包含 Webhook 密钥 |
+| 交易 | 未调用下单，订单数保持 0 |
+
+真实 TradingView 接收测试不依赖 OKX 私有凭据，可以先用 `hold` 验证；
+之后的 OKX Demo 下单、成交和保护才需要单独的账户验收。
+本次新开的 TradingView 页面在告警入口显示注册/登录提示，尚未创建平台 Alert。
+必须观察平台告警日志与服务器同一 ID 的接收记录后，才能将
+`real_tradingview_delivery_verified` 从 `false` 改为 `true`。
+
+证据与受保护模板：
+
+- 服务器配置验收：`/opt/openperpdesk/outputs/tradingview-readonly-setup-20260920.json`。
+- 本机协议验收：`work/deployment/tradingview-https-receiver-20260920.json`。
+- 平台消息模板：服务器 `outputs/tradingview-readonly-template-20260920.json`，
+  本机 `work/deployment/` 也有受保护副本；含独立密钥，权限 `600`，不进入 Git。
+
+以上证明公网接收、持久化、去重、拒绝路径和告警事件推送，不证明 TradingView
+平台实际投递、浏览器本次视觉验收、OKX 交易或微信通知送达。
+
+## 12. 断电前启动检查与异机备份
+
+2026-09-20 11:11:01 UTC 完成目标宿主机只读检查，没有执行宿主机重启或断电：
+
+- Docker 和 `pm2-root` 为 `active`、`enabled`；Docker 配置在网络在线目标之后启动。
+- Nginx 与宝塔为活动的 SysV 生成服务；已核对运行级别 2 至 5 的启动链接。
+- API、Web 均为 `healthy`，重启策略为 `unless-stopped`。
+- API `/data` 为原有可写命名卷；文件系统为 `/dev/vda3`、ext4，
+  当时可用空间为 13,725,691,904 字节。
+- PM2 保存清单与当前进程的名称、状态及所检查的启动参数摘要一致；
+  `xuanzhangge-cn` 仍在线、PID 794007、重启数 0，`konggang-dashboard` 仍停止。
+  没有执行 `pm2 save`、`pm2 resurrect` 或重启无关应用。
+- 同机 HTTP 基线仍为 Wukong 200、touch 403；后者不是健康验收通过。
+
+新一致性快照包含上节的一条 `observed` 告警，另保留 56 份报告、1 套策略、
+3 条图表标记和 120 条审计；订单、持仓、成交均为零：
+
+- 快照：`openperpdesk-20260920T111059Z-cc9b8435.sqlite3`。
+- SHA-256：`6bd259bd8122b4a8b7fc21ff48777c504d8b23f3f0c56fe340b6b55e09e144d5`。
+- 服务器受保护归档：`/opt/openperpdesk/backups/powerloss-preparation-20260920/`。
+- 本机异机副本：`work/deployment/offhost-20260920/powerloss-preparation-20260920/`。
+
+归档包括数据库、原快照清单、`.env`、Compose 主配置与覆盖配置、部署脚本和目标站点
+Nginx 配置，共 8 个文件，另附总清单。异机副本逐文件 SHA-256、文件大小和权限核对通过，
+SQLite `integrity_check=ok`，26 张表记录数与源快照一致。目录权限 `700`、
+文件权限 `600`，全部排除出 Git。此归档不是完整宿主机备份，不含其他项目或完整镜像。
+
+宿主机检查证据为 `outputs/powerloss-preparation-20260920.json`，
+异机核对证据为本机 `work/deployment/offhost-backup-verification-20260920.json`。
+前者生成时尚未复制离机，所以其中 `offhost_copy_verified=false`；
+复制完成后的独立核对记录为 `true`，不改写前一阶段原始证据。
+
+维护时间、影响范围和云控制台开机恢复入口仍需确认。
+执行步骤与停止条件见 [`MAINTENANCE_WINDOW.md`](MAINTENANCE_WINDOW.md)。
+`host_reboot_performed=false`、`host_power_loss_verified=false`，
+不能以启动配置、备份或先前的容器故障演练替代整机断电验收。

@@ -101,6 +101,16 @@ TradingView 官方要求 Webhook 服务在三秒内响应，且只支持 80/443 
 
 ## 回执与处理状态
 
+平台真实接收验收和 OKX 下单验收应分开：前者使用 `action=hold`、
+`dry_run=true`，只需要公网接收器和能创建 Webhook Alert 的 TradingView 账户，
+不需要 OKX API 密钥。必须同时核对平台触发日志及服务器相同 `alert_id` 的回执；
+`curl` 或脚本发送成功不能替代平台投递证据。
+包含独立 Webhook 密钥的模板只能交给已确认的目标账户，不得粘贴到公开代码或截图中。
+
+2026-09-20 目标服务器已启用只接收模式并通过受控外网协议检查，
+真实平台投递仍未验证，详见
+[部署验收记录第 11 节](DEPLOYMENT_ACCEPTANCE_2026-09-20.md#11-tradingview-只接收配置与公网协议验收)。
+
 `202` 的 `accepted=true` 仅表示**告警已持久化接收**，不是订单已获批。
 `execution_accepted` 在排队时为 `null`，完成风控后才有布尔结果。
 通过已认证的 `GET /api/v1/integrations/tradingview/alerts` 或私有 SSE
