@@ -85,6 +85,11 @@ jobs:
           import json, os, time, urllib.request
           from datetime import datetime, timezone
           from app import tradingview
+          for asset in ("/", "/app.js?cache=validate-v1", "/styles.css?cache=validate-v1"):
+              with urllib.request.urlopen("http://web" + asset, timeout=3) as response:
+                  assert response.status == 200
+                  assert "no-cache" in response.headers.get("Cache-Control", "")
+                  assert response.headers.get("ETag")
           expected = {
               "TRADINGVIEW_ENABLED": "true", "TRADINGVIEW_EXECUTION_ENABLED": "false",
               "TRADINGVIEW_DRY_RUN": "true", "TRADINGVIEW_SYMBOLS": "BTC-USDT-SWAP",
