@@ -179,3 +179,29 @@ CI 的 Compose 演练已加入同类 API 子进程终止、自动重启计数与
 
 API job 的上限已调整为 35 分钟，为较慢的共享 runner 留出安装与收尾时间。
 测试命令、用例和断言没有减少；新的 CI 状态仍须按新提交单独核对。
+
+## 9. 旧版与当前 API 镜像的隔离兼容性
+
+2026-09-20 09:18:20 至 09:18:37 UTC，在同一目标服务器完成隔离 API 镜像兼容性检查。
+先生成新的在线快照，再将其复制到独立临时 Docker volume；生产容器没有停止或切换。
+
+- 源快照：`openperpdesk-20260920T091819Z-d79640b5.sqlite3`。
+- SHA-256：`05cc182c0dd9ed6c660861e51ae2a3974ee1f24b316a47ed6cf3c8271f61fe72`。
+- 旧版 API：`openperpdesk-api:release-d3e74eb-tradingagents-v3`，
+  digest 为 `sha256:b6fd9109cc0f3b80d149e69334ef4f2cb5598161bdce308124aa1a570b0a2619`。
+- 当前 API：`openperpdesk-api:release-71fccf3-tradingagents-v4`，
+  digest 为 `sha256:c0d140b3446a1cab78f56d48342337ce6f0c5b832677a5ceed8c3437e8e7ad62`。
+- 两阶段均按 digest 启动，依次挂载同一临时数据卷，使用 `network=none` 且不发布端口。
+  临时容器没有交易、通知、模型或代理密钥；执行关闭，Worker 关闭，Dry Run 开启。
+- 两阶段均通过 API 进程健康、管理员鉴权、历史报告读取和持久安全锁检查。
+  未认证账户接口与私有 SSE 均返回 401。
+- 26 张表（包含审计表和 `sqlite_sequence`）全部记录摘要保持一致，保留 119 条审计和
+  56 份报告。两个阶段导出的快照 SHA-256 也均与源快照一致。
+- 前后生产容器身份、镜像、数据卷、账本、`.env`、宝塔目标站点配置，以及所检查的
+  PM2 进程和同机网站响应保持不变。
+- 临时容器与临时卷已移除，源快照及两阶段验证快照保留。
+  证据为 `/opt/openperpdesk/outputs/image-compatibility-20260920.json`，权限 `600`。
+
+本次只证明这两个 API 镜像对该无私有交易快照的隔离启动与读取兼容性。
+没有切换生产镜像，没有验证旧版 Web、外网行情、模型、真实账户或在途订单；
+`production_image_switch_verified=false`，生产回滚切换和宿主机断电演练仍未完成。
