@@ -163,6 +163,62 @@ jobs:
               'from app.state_store import StateStore; assert StateStore().get_control_flag("ci_roundtrip")'
             python infra/realtime-smoke.py --base-url http://127.0.0.1:8080
           done
+          python - <<'PY'
+          import json, subprocess, time
+          compose = ["docker", "compose"]
+          def inspect(container):
+              return json.loads(subprocess.check_output(["docker", "inspect", container]))[0]
+          container = subprocess.check_output([*compose, "ps", "-q", "api"], text=True).strip()
+          assert container
+          before = inspect(container)
+          assert before["Config"]["Labels"]["com.docker.compose.project"] == "openperpdesk-ci"
+          assert before["HostConfig"]["Init"] is True
+          assert before["HostConfig"]["RestartPolicy"]["Name"] == "unless-stopped"
+          program = """
+          import os, signal
+          from pathlib import Path
+          assert os.environ['EXECUTION_ENABLED'] == 'false'
+          assert os.environ['LIVE_TRADING_ENABLED'] == 'false'
+          assert os.environ['AUTO_TRADING_ENABLED'] == 'false'
+          assert not any(os.environ.get(key) for key in ('OKX_API_KEY','OKX_SECRET_KEY','OKX_PASSPHRASE'))
+          assert Path('/proc/1/comm').read_text().strip() == 'docker-init'
+          candidates = []
+          for entry in Path('/proc').iterdir():
+              if not entry.name.isdigit():
+                  continue
+              try:
+                  args = (entry / 'cmdline').read_bytes().split(bytes([0]))
+                  if b'app.main:app' in args and any(value.endswith(b'/uvicorn') for value in args[:2]):
+                      candidates.append(int(entry.name))
+              except FileNotFoundError:
+                  continue
+          assert len(candidates) == 1 and candidates[0] not in (1, os.getpid())
+          status = Path(f'/proc/{candidates[0]}/status').read_text().splitlines()
+          assert next(line for line in status if line.startswith('PPid:')).split()[1] == '1'
+          os.kill(candidates[0], signal.SIGKILL)
+          """
+          # Kill the app child, not Docker itself or an explicitly stopped container.
+          subprocess.run(["docker", "exec", "--user", "0", "-i", container, "python", "-"],
+                         input=program, text=True, timeout=15, check=False)
+          deadline = time.monotonic() + 90
+          while True:
+              after = inspect(container)
+              if (after["RestartCount"] == before["RestartCount"] + 1
+                      and after["State"]["Running"]
+                      and after["State"].get("Health", {}).get("Status") == "healthy"):
+                  break
+              assert time.monotonic() < deadline, "API did not automatically recover from SIGKILL"
+              time.sleep(1)
+          assert after["State"]["Pid"] != before["State"]["Pid"]
+          assert after["State"]["StartedAt"] != before["State"]["StartedAt"]
+          assert after["Image"] == before["Image"] and after["Mounts"] == before["Mounts"]
+          assert subprocess.check_output([*compose, "ps", "-q", "api"], text=True).strip() == container
+          print("API recovered automatically from SIGKILL; same container/image/volume, new process.")
+          PY
+          docker compose exec -T api python -m app.database_maintenance verify-runtime
+          docker compose exec -T api python -c \
+            'from app.state_store import StateStore; assert StateStore().get_control_flag("ci_roundtrip")'
+          python infra/realtime-smoke.py --base-url http://127.0.0.1:8080
 
   tradingagents-image:
     runs-on: ubuntu-latest
