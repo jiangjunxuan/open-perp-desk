@@ -1,14 +1,18 @@
+import unittest
 from unittest.mock import patch
 
 from app.okx_trade import OkxTradeError
 from app.protection_adjustment import ProtectionAdjustment
+from tests import test_protection_handoff as handoff_fixture
 from tests.fixtures.exchange_server import SYMBOL
-from tests.test_protection_handoff import ProtectionHandoffTests
 
 
-class ProtectionAdjustmentTests(ProtectionHandoffTests):
+class ProtectionAdjustmentTests(unittest.IsolatedAsyncioTestCase):
+    reopen = handoff_fixture.ProtectionHandoffTests.reopen
+    entry = handoff_fixture.ProtectionHandoffTests.entry
+
     async def asyncSetUp(self):
-        await super().asyncSetUp()
+        await handoff_fixture.ProtectionHandoffTests.asyncSetUp(self)
         self.adjustment = ProtectionAdjustment(self.manager, self.market)
 
     async def reduce(self, size):
@@ -110,6 +114,4 @@ class ProtectionAdjustmentTests(ProtectionHandoffTests):
 
 
 if __name__ == "__main__":
-    import unittest
-
     unittest.main()
