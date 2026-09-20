@@ -25,6 +25,7 @@ async function exerciseTradingView() {
     $(".tradingview-setup").open = original.open;
     setTheme(original.theme, false);
     showView(original.view);
+    updateTradingViewSetup(state.status);
     setText("#tradingview-setup-message", "");
     delete window.tvAttack;
     delete window.__restoreTradingViewFixture;
@@ -34,6 +35,25 @@ async function exerciseTradingView() {
   });
   showView("risk");
   $(".tradingview-setup").open = true;
+  const connectionCases = [
+    ["disabled", { enabled: false, configured: true, dry_run: false }, "未启用", "neutral"],
+    ["missingSecret", { enabled: true, configured: false }, "密钥未配置", "neutral"],
+    ["receiveOnly", { enabled: true, configured: true, execution_enabled: false, dry_run: true }, "已接入 · 不下单", "good"],
+    ["riskPreview", { enabled: true, configured: true, execution_enabled: true, dry_run: true }, "已接入 · 不下单", "good"],
+    ["executionGated", { enabled: true, configured: true, execution_enabled: true, dry_run: false }, "执行闸门受控", "warning"],
+    ["executionDisabled", { enabled: true, configured: true, execution_enabled: false, dry_run: false }, "已接入 · 不下单", "good"],
+    ["missingExecutionFlag", { enabled: true, configured: true, dry_run: false }, "状态待确认", "warning"],
+    ["missingPreviewFlag", { enabled: true, configured: true, execution_enabled: true }, "状态待确认", "warning"],
+    ["unknown", {}, "未启用", "neutral"],
+  ];
+  for (const [name, integration, label, tone] of connectionCases) {
+    updateTradingViewSetup({ integrations: { tradingview: integration } });
+    checks[`connection_${name}`] = ["#state-tradingview", "#tradingview-setup-status"].every(selector => {
+      const element = $(selector);
+      return element.textContent === label && element.dataset.tone === tone;
+    });
+  }
+  updateTradingViewSetup(state.status);
   state.token = "";
   renderTradingViewAlerts(sample);
   checks.lockedClearsData = !$("#tradingview-alert-body").textContent.includes("ui-fixture");
@@ -72,6 +92,10 @@ async function exerciseTradingView() {
   state.token = "local-ui-fixture-only";
   state.privateFeedState = "open";
   renderTradingViewAlerts(sample);
+  updateTradingViewSetup({ integrations: { tradingview: {
+    enabled: true, configured: true, execution_enabled: false, dry_run: true,
+    symbols: ["BTC-USDT-SWAP", "ETH-USDT-SWAP"],
+  } } });
   setText("#tradingview-setup-message", "");
   $("#tradingview-webhook-url").blur();
   window.getSelection().removeAllRanges();
@@ -96,9 +120,17 @@ export async function checkTradingView({ evaluate, command, screenshot }) {
           const field = $(".copy-field").getBoundingClientRect();
           const button = $("#copy-tradingview-url").getBoundingClientRect();
           const input = $("#tradingview-webhook-url").getBoundingClientRect();
+          const statusesFit = ["#state-tradingview", "#tradingview-setup-status"].every(selector => {
+            const element = $(selector);
+            const rect = element.getBoundingClientRect();
+            const parent = element.parentElement.getBoundingClientRect();
+            return rect.left >= parent.left - 1 && rect.right <= parent.right + 1
+              && element.scrollWidth <= element.clientWidth + 1;
+          });
           return {
             contained: document.documentElement.scrollWidth <= innerWidth && panel.right <= innerWidth,
             copyControls: input.right + 7 <= button.left && button.right <= field.right + 1 && button.width >= 44,
+            statusesFit,
             tableScrollable: $(".tradingview-alert-table").tabIndex === 0,
             templateScrollable: $("#tradingview-payload-template").tabIndex === 0,
           };

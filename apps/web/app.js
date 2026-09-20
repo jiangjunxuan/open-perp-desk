@@ -2006,11 +2006,16 @@ function updateTradingViewSetup(status) {
   const endpoint = new URL("/api/v1/integrations/tradingview/webhook", window.location.origin).href;
   $("#tradingview-webhook-url").value = endpoint;
   const integration = status?.integrations?.tradingview || {};
-  setState("#tradingview-setup-status",
-    !integration.enabled ? "未启用" : !integration.configured ? "密钥未配置"
-      : integration.dry_run ? "仅预览" : "执行闸门受控",
-    !integration.configured ? "neutral" : integration.dry_run ? "warning" : "good",
-  );
+  const receiving = integration.enabled === true && integration.configured === true;
+  const preview = integration.execution_enabled === false || integration.dry_run === true;
+  const gated = integration.execution_enabled === true && integration.dry_run === false;
+  const label = integration.enabled !== true ? "未启用"
+    : !receiving ? "密钥未配置" : preview ? "已接入 · 不下单"
+      : gated ? "执行闸门受控" : "状态待确认";
+  const tone = !receiving ? "neutral" : preview ? "good" : "warning";
+  for (const selector of ["#state-tradingview", "#tradingview-setup-status"]) {
+    setState(selector, label, tone);
+  }
   setText("#tradingview-symbols", (integration.symbols || []).join(" / ") || "--");
   const local = ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
   setText("#tradingview-endpoint-state", local ? "本地地址 · 外部 Alert 无法访问"
@@ -2141,19 +2146,7 @@ function applyStatus(status) {
   setState("#state-proxy", status.integrations?.outbound_proxy_configured ? "已配置" : "未配置", status.integrations?.outbound_proxy_configured ? "good" : "neutral");
   setState("#state-pushplus", status.integrations?.pushplus_configured ? "已配置" : "未配置", status.integrations?.pushplus_configured ? "good" : "neutral");
   setState("#state-ai", status.integrations?.tradingagents_configured ? "已配置" : "未启用", status.integrations?.tradingagents_configured ? "good" : "neutral");
-  const tradingView = status.integrations?.tradingview || {};
   updateTradingViewSetup(status);
-  setState(
-    "#state-tradingview",
-    !tradingView.enabled
-      ? "未启用"
-      : !tradingView.configured
-        ? "待配置"
-        : tradingView.dry_run ? "模拟信号" : "已启用",
-    !tradingView.enabled || !tradingView.configured
-      ? "neutral"
-      : tradingView.dry_run ? "warning" : "good",
-  );
   const algoStream = status.algo_stream || {};
   const algoStreamReady = algoStream.connected && algoStream.authenticated;
   setState(
