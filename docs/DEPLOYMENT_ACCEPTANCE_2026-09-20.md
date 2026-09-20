@@ -342,3 +342,57 @@ SQLite `integrity_check=ok`，26 张表记录数与源快照一致。目录权�
 执行步骤与停止条件见 [`MAINTENANCE_WINDOW.md`](MAINTENANCE_WINDOW.md)。
 `host_reboot_performed=false`、`host_power_loss_verified=false`，
 不能以启动配置、备份或先前的容器故障演练替代整机断电验收。
+
+## 13. 自动 Worker 安全补丁与维护基线更新
+
+2026-09-20 13:44:33 至 13:44:58 UTC，发布 `e310145` 的自动 Worker 安全补丁。
+`AUTO_TRADING_DRY_RUN` 只有明确为 `false` 才能关闭，空白或拼写错误保持预览；
+每个非预览周期还独立检查 Demo 模式，即使实盘客户端已经人工解锁，
+这个 Demo 自动 Worker 也会在账户同步和策略执行之前拒绝运行。
+
+- 新 API 镜像：`openperpdesk-api:release-e310145-worker-safety`。
+- Digest：`sha256:dab4cbaea81d17c236ca7892c4bd56e03cbafb35b4a9021fa7bb8f0210a43e73`。
+- 保留原 API 镜像全部层和运行配置，只增加 `automation_worker.py` 文件层。
+  Docker legacy builder 的父镜像字段单独核对，其余配置要求完全相同；
+  TradingAgents 运行环境与依赖没有重建。
+- 新 API 容器为 `aa3022c023c3`；Web 容器仍为 `51e751ce5bb5`，
+  镜像仍为 `release-43f98c8`，启动时间及重启计数未变化。
+- `.env` 只修改 API 镜像选择项，完整 Compose 配置差异核对通过。
+  数据卷、重启策略、管理员/模型/代理/Webhook 密钥和目标站点 Nginx 配置保持不变。
+- 发布前确认研究空闲、没有 OKX 私有凭据、订单/成交/持仓为零。
+  发布后执行关闭、Worker 关闭、Dry Run 开启、持久急停有效、实盘闸门关闭；
+  TradingView 继续只接收、不下单。
+- 发布前后 26 张表全部记录摘要一致，仍为 56 份报告、1 套策略、
+  3 条图表标记、120 条审计和 1 条脚本测试告警。未恢复或覆盖数据库。
+- 所检查的 PM2 进程身份、状态、重启数和同机网站响应保持原基线。
+  Wukong 返回 200，touch 仍为 403，后者不记为健康通过。
+
+定向回归 89 项通过，候选镜像在 `network=none`、只读根文件系统、
+无生产密钥的隔离容器中通过 11 项 Worker 测试；发布脚本另有 7 项本地校验，
+覆盖配置范围、父镜像、环境文件往返、并发配置保护及原子替换后的同步失败。
+本次没有触发生产回滚，不把脚本单元测试写成生产故障注入。
+
+发布后的独立检查确认运行文件 SHA-256 与提交一致，公网页面资源与 Web 镜像一致，
+readiness 和管理员鉴权通过。公网系统 SSE 首事件约 0.086 秒、后续心跳约
+5.098 秒；行情首事件约 0.066 秒、后续约 0.328 秒，未认证私有 SSE 返回 401。
+这是 API 容器更新，不是无中断升级或整机电源恢复。
+
+13:45:57 UTC 再次核对宿主机启动配置，并生成新维护备份：
+
+- 快照：`openperpdesk-20260920T134555Z-6547b0d2.sqlite3`。
+- SHA-256：`6bd259bd8122b4a8b7fc21ff48777c504d8b23f3f0c56fe340b6b55e09e144d5`。
+- 服务器归档：`/opt/openperpdesk/backups/powerloss-preparation-e310145-20260920/`。
+- 本机异机副本：`work/deployment/offhost-20260920/powerloss-preparation-e310145-20260920/`。
+- 异机核对 8 个文件的摘要、大小和权限通过，SQLite 完整性和 26 张表记录数通过。
+  该备份包含本次新镜像配置，不再以第 12 节旧配置作为当前维护基线。
+
+发布证据为服务器 `outputs/worker-safety-e310145.json`，启动检查为
+`outputs/powerloss-preparation-e310145-20260920.json`；本机保存两者副本，以及
+`work/deployment/worker-safety-e310145-realtime.json` 和
+`work/deployment/offhost-worker-safety-e310145-verification.json`。
+宿主机 boot ID 前后一致，未执行整机重启或断电。
+
+当前仍缺已登录且具备 Webhook 告警权限的 TradingView 账户、明确批准的整机维护时段，
+以及经确认的阿里云控制台开机入口。收件箱仍只有第 11 节脚本测试告警，
+`real_tradingview_delivery_verified=false`、`host_power_loss_verified=false`。
+实际维护窗口开始前仍须再次核对状态和生成最新备份。
