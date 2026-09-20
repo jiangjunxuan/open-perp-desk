@@ -860,6 +860,8 @@ def main() -> None:
                 arguments = ["up", "-d"]
                 if environment.get("OPENPERPDESK_USE_PREBUILT_IMAGES", "false").lower() != "true":
                     arguments.append("--build")
+                if args.command == "restart":
+                    arguments.append("--force-recreate")
                 arguments.extend(["--wait", "--wait-timeout", "90"])
                 deployment.compose(*arguments, stdout=None, timeout=None)
                 deployment.compose("exec", "-T", "web", "nginx", "-s", "reload")

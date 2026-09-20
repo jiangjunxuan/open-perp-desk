@@ -139,12 +139,30 @@ jobs:
           ./infra/openperpdesk.sh restore "$1"
           docker compose exec -T api python -c \
             'from app.state_store import StateStore; s=StateStore(); assert s.get_control_flag("ci_roundtrip"); assert s.get_control_flag("emergency_stop")'
-          docker compose restart api
-          docker compose up -d --wait --wait-timeout 90 api
-          docker compose exec -T api python -m app.database_maintenance verify-runtime
-          docker compose exec -T api python -c \
-            'from app.state_store import StateStore; assert StateStore().get_control_flag("ci_roundtrip")'
-          python infra/realtime-smoke.py --base-url http://127.0.0.1:8080
+          for mode in source prebuilt; do
+            api_before=$(docker compose ps -q api)
+            web_before=$(docker compose ps -q web)
+            test -n "$api_before"
+            test -n "$web_before"
+            if [ "$mode" = prebuilt ]; then
+              OPENPERPDESK_COMPOSE_OVERLAY=docker-compose.release.yml \
+              OPENPERPDESK_API_IMAGE=openperpdesk-api:latest \
+              OPENPERPDESK_WEB_IMAGE=openperpdesk-web:latest \
+              ./infra/openperpdesk.sh restart
+            else
+              ./infra/openperpdesk.sh restart
+            fi
+            api_after=$(docker compose ps -q api)
+            web_after=$(docker compose ps -q web)
+            test -n "$api_after"
+            test -n "$web_after"
+            test "$api_before" != "$api_after"
+            test "$web_before" != "$web_after"
+            docker compose exec -T api python -m app.database_maintenance verify-runtime
+            docker compose exec -T api python -c \
+              'from app.state_store import StateStore; assert StateStore().get_control_flag("ci_roundtrip")'
+            python infra/realtime-smoke.py --base-url http://127.0.0.1:8080
+          done
 
   tradingagents-image:
     runs-on: ubuntu-latest

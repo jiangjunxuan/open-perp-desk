@@ -405,7 +405,7 @@ class DeploymentCommandTests(unittest.TestCase):
         self.assertEqual(result["OPENPERPDESK_USE_PREBUILT_IMAGES"], "true")
         self.assertIn("prebuilt_images=true", self.output.getvalue())
 
-    def test_prebuilt_restart_does_not_request_a_build(self):
+    def test_prebuilt_restart_recreates_without_requesting_a_build(self):
         environment = self.deployment.model["services"]["api"]["environment"]
         environment["OPENPERPDESK_USE_PREBUILT_IMAGES"] = "true"
         overlay = self.root / "release.yml"
@@ -415,8 +415,69 @@ class DeploymentCommandTests(unittest.TestCase):
              patch.object(deploy, "Deployment", return_value=self.deployment):
             deploy.main()
         up_calls = [call for call in self.deployment.calls if call and call[0] == "up"]
-        self.assertEqual(len(up_calls), 1)
-        self.assertNotIn("--build", up_calls[0])
+        self.assertEqual(up_calls, [
+            ("up", "-d", "--force-recreate", "--wait", "--wait-timeout", "90"),
+        ])
+        self.assertEqual(
+            self.deployment.calls[-1],
+            ("exec", "-T", "web", "nginx", "-s", "reload"),
+        )
+
+    def test_source_restart_builds_and_recreates_even_without_config_changes(self):
+        for _ in range(2):
+            with patch.object(deploy.sys, "argv", ["deploy", "restart"]), \
+                 patch.object(deploy, "Deployment", return_value=self.deployment):
+                deploy.main()
+        up_calls = [call for call in self.deployment.calls if call and call[0] == "up"]
+        self.assertEqual(up_calls, [
+            ("up", "-d", "--build", "--force-recreate", "--wait", "--wait-timeout", "90"),
+        ] * 2)
+        self.assertEqual(self.deployment.calls.count(
+            ("exec", "-T", "web", "nginx", "-s", "reload"),
+        ), 2)
+        self.assertFalse(any(call[0] in {"down", "rm"} for call in self.deployment.calls))
+
+    def test_up_does_not_force_recreate_unchanged_services(self):
+        for prebuilt in (False, True):
+            with self.subTest(prebuilt=prebuilt):
+                self.deployment.calls.clear()
+                self.deployment.model["services"]["api"]["environment"][
+                    "OPENPERPDESK_USE_PREBUILT_IMAGES"
+                ] = str(prebuilt).lower()
+                overlay = self.root / "release.yml"
+                overlay.write_text("services: {}\n", encoding="utf-8")
+                self.deployment.overlay_file = overlay if prebuilt else None
+                with patch.object(deploy.sys, "argv", ["deploy", "up"]), \
+                     patch.object(deploy, "Deployment", return_value=self.deployment):
+                    deploy.main()
+                up_calls = [call for call in self.deployment.calls if call and call[0] == "up"]
+                self.assertEqual(up_calls, [
+                    ("up", "-d", *(("--build",) if not prebuilt else ()), "--wait", "--wait-timeout", "90"),
+                ])
+
+    def test_restart_rejects_unsafe_configuration_before_recreating(self):
+        self.deployment.model["services"]["api"]["environment"]["EXECUTION_ENABLED"] = "true"
+        with patch.object(deploy.sys, "argv", ["deploy", "restart"]), \
+             patch.object(deploy, "Deployment", return_value=self.deployment), \
+             self.assertRaises(deploy.DeploymentError):
+            deploy.main()
+        self.assertEqual(self.deployment.calls, [("config", "--format", "json")])
+
+    def test_restart_does_not_reload_web_after_recreation_failure(self):
+        compose = self.deployment.compose
+
+        def fail_recreation(*args, **kwargs):
+            result = compose(*args, **kwargs)
+            if args[0] == "up":
+                raise deploy.DeploymentError("recreation fixture failure")
+            return result
+
+        with patch.object(deploy.sys, "argv", ["deploy", "restart"]), \
+             patch.object(deploy, "Deployment", return_value=self.deployment), \
+             patch.object(self.deployment, "compose", side_effect=fail_recreation), \
+             self.assertRaisesRegex(deploy.DeploymentError, "recreation fixture failure"):
+            deploy.main()
+        self.assertFalse(any(call[0] == "exec" for call in self.deployment.calls))
 
     def test_preflight_enforces_environment_file_permissions(self):
         self.deployment.env_file.chmod(0o644)
